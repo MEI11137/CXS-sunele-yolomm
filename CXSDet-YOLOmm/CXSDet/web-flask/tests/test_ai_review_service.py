@@ -59,19 +59,126 @@ def test_ai_review_parses_fenced_json_and_updates_same_record():
     assert "possible_false_positive" in database.updated[1]
 
 
-def test_malformed_ai_output_becomes_human_review_instead_of_ground_truth():
+def test_parse_failure_retries_once_then_persists_success():
     from services.ai_review_service import review_detection
 
     class FakeClient:
+        config = {"model": "vision-test"}
+
+        def __init__(self):
+            self.responses = iter([
+                "not-json",
+                '{"status":"consistent","summary":"second attempt worked"}',
+            ])
+            self.calls = 0
+
         def review_detection_structured(self, image_bytes, detections):
-            return "not-json"
+            self.calls += 1
+            return next(self.responses)
+
+    client = FakeClient()
+    database = FakeDatabase(_record())
+    result = review_detection("record-1", client, database, FakeStorage())
+
+    assert client.calls == 2
+    assert result.status == "consistent"
+    assert result.summary == "second attempt worked"
+    assert json.loads(database.updated[1][1])["status"] == "consistent"
+
+
+def test_repeated_parse_failure_persists_fallback_then_raises():
+    import pytest
+    from services.ai_review_service import AIReviewParseError, review_detection
+
+    class FakeClient:
+        config = {"model": "vision-test"}
+
+        def __init__(self):
+            self.calls = 0
+
+        def review_detection_structured(self, image_bytes, detections):
+            self.calls += 1
+            return "still-not-json"
+
+    client = FakeClient()
+    database = FakeDatabase(_record())
+
+    with pytest.raises(AIReviewParseError, match="AI返回格式异常"):
+        review_detection("record-1", client, database, FakeStorage())
+
+    persisted = json.loads(database.updated[1][1])
+    assert client.calls == 2
+    assert persisted["status"] == "needs_human_review"
+    assert persisted["summary"] == "AI返回格式异常，需要人工复核"
+
+
+def test_parser_rejects_non_object_top_level_payload():
+    import pytest
+    from services.ai_review_service import AIReviewParseError, _parse_review_payload
+
+    with pytest.raises(AIReviewParseError, match="JSON对象"):
+        _parse_review_payload('[{"status":"consistent"}]')
+
+
+def test_upstream_failure_persists_fallback_without_retry():
+    import pytest
+    from services.ai_review_service import AIReviewUpstreamError, review_detection
+
+    class UpstreamFailure(RuntimeError):
+        status_code = 503
+        code = "service_unavailable"
+
+    class FakeClient:
+        config = {"model": "vision-test"}
+
+        def __init__(self):
+            self.calls = 0
+
+        def review_detection_structured(self, image_bytes, detections):
+            self.calls += 1
+            raise UpstreamFailure("provider body must stay private")
+
+    client = FakeClient()
+    database = FakeDatabase(_record())
+
+    with pytest.raises(AIReviewUpstreamError, match="AI服务调用失败"):
+        review_detection("record-1", client, database, FakeStorage())
+
+    persisted = json.loads(database.updated[1][1])
+    assert client.calls == 1
+    assert persisted["status"] == "needs_human_review"
+    assert persisted["summary"] == "AI服务调用失败，需要人工复核"
+
+
+def test_parse_failure_logs_metadata_without_sensitive_values(caplog):
+    import logging
+    import pytest
+    from services.ai_review_service import AIReviewParseError, review_detection
+
+    class FakeClient:
+        config = {
+            "model": "vision-test",
+            "api_key": "SECRET-API-KEY",
+        }
+
+        def review_detection_structured(self, image_bytes, detections):
+            assert image_bytes == b"image"
+            return "SECRET-RAW-RESPONSE"
 
     database = FakeDatabase(_record())
-    result = review_detection("record-1", FakeClient(), database, FakeStorage())
+    with caplog.at_level(logging.WARNING, logger="services.ai_review_service"):
+        with pytest.raises(AIReviewParseError):
+            review_detection("record-1", FakeClient(), database, FakeStorage())
 
-    assert result.status == "needs_human_review"
-    assert "无法解析" in result.summary
-    assert "needs_human_review" in database.updated[1]
+    assert "record-1" in caplog.text
+    assert "vision-test" in caplog.text
+    assert "attempt=1" in caplog.text
+    assert "attempt=2" in caplog.text
+    assert "raw_type=str" in caplog.text
+    assert "raw_length=19" in caplog.text
+    assert "SECRET-API-KEY" not in caplog.text
+    assert "SECRET-RAW-RESPONSE" not in caplog.text
+    assert "class_name" not in caplog.text
 
 
 def test_health_check_reports_model_availability_without_secret_values():
