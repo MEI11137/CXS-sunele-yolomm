@@ -1,0 +1,97 @@
+# Operating system and editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local agent and planning artifacts
+.superpowers/
+.tools/
+**/docs/superpowers/
+
+# Python caches, test output, and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.pytest-tmp*/
+.mypy_cache/
+.ruff_cache/
+.ultralytics/
+.matplotlib/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.venv/
+venv/
+env/
+
+# Node.js dependencies and generated frontend output
+node_modules/
+dist/
+.vite/
+coverage/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Runtime databases, logs, temporary files, and backups
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.log
+temp/
+tmp/
+backups/
+
+# Runtime-generated uploads and inference results
+CXSDet-YOLOmm/CXSDet/web-flask/file_store/
+
+# Local datasets and training output
+**/dataset/
+**/datasets/
+**/runs/
+CXSDet-YOLOmm/CXSDet/other/model_train/detect/output/
+
+# Model weights and exported inference engines
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.safetensors
+
+# Large test media, archives, and local installers
+CXSDet-YOLOmm/1环境安装包/
+CXSDet-YOLOmm/4测试包/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.zip
+*.rar
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+*.exe
+*.msi
+
+# Common generated archives and binary dumps
+*.bin
+*.dump
+

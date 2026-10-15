@@ -1,0 +1,274 @@
+======================================================================
+  YOLOMM&RTDETRMM Error Report
+  报错码: ERR-0xb841f546-7557-484d-992a-405cf0097262-6f54a9fa-5879-42d3-b1ce-84e6307c9346-d86f4d8f-9c20-4fda-ad67-b15c8e6ad92f-f8acf384-b129-4aa4-aed3-aba6404812d7-6b966c65-d09f-4506-8c01-b811f454264f
+======================================================================
+  图图多模态项目报错请在多模态项目群中反馈
+  不在项目群请联系汤圆 Q:379116151
+======================================================================
+  时间:   2026-10-14 23:36:18
+  版本:   26.9.3
+  脚本:   verify_multimodal_pipeline.py
+  命令:   scripts\verify_multimodal_pipeline.py --mode train --work-dir C:\Users\A\Desktop\ele-yolomm\tmp\pipeline-train
+======================================================================
+
+[1] 入口脚本内容 (verify_multimodal_pipeline.py)
+----------------------------------------------------------------------
+"""Reproducible smoke verification for the standard YOLO and RGB+X pipeline."""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import shutil
+import sys
+import time
+import zipfile
+from pathlib import Path
+
+import cv2
+import numpy as np
+import yaml
+from PIL import Image
+
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
+from services.ai_review_service import _parse_review_payload
+from services.training_service import MULTIMODAL_BASELINE_YAML
+from services.yolo_runtime import activate_vendored_ultralytics, load_detector
+
+
+def _sample_image(path: Path, shift: int = 0) -> None:
+    canvas = np.full((96, 96, 3), 205, dtype=np.uint8)
+    cv2.rectangle(canvas, (20 + shift, 24), (72 + shift, 70), (55, 55, 55), -1)
+    cv2.line(canvas, (25 + shift, 28), (65 + shift, 65), (245, 245, 245), 3)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), canvas):
+        raise RuntimeError(f"cannot write smoke image: {path}")
+
+
+def _edge(rgb: Path, output: Path) -> None:
+    image = cv2.imread(str(rgb), cv2.IMREAD_GRAYSCALE)
+    edges = cv2.Canny(image, 60, 140)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output), cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR))
+
+
+def _archive(root: Path, output: Path) -> None:
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                archive.write(path, path.relative_to(root).as_posix())
+
+
+def build_tiny_datasets(work_dir) -> dict[str, Path]:
+    """Create non-sensitive, deterministic single and RGB+edge datasets."""
+    work_dir = Path(work_dir).resolve()
+    if work_dir.exists():
+        shutil.rmtree(work_dir)
+    single = work_dir / "single"
+    multi = work_dir / "multimodal"
+    for root, multimodal in ((single, False), (multi, True)):
+        for split in ("train", "val"):
+            for index in range(2):
+                name = f"sample_{split}_{index}.jpg"
+                rgb = root / "images" / split / name
+                _sample_image(rgb, index * 2)
+                label = root / "labels" / split / f"sample_{split}_{index}.txt"
+                label.parent.mkdir(parents=True, exist_ok=True)
+                label.write_text("1 0.479167 0.489583 0.541667 0.479167\n", encoding="utf-8")
+                if multimodal:
+                    _edge(rgb, root / "images_edge" / split / name)
+        data = {
+            "path": str(root),
+            "train": "./images/train",
+            "val": "./images/val",
+            "names": {0: "bird_shit", 1: "crack", 2: "dirt", 3: "panel"},
+        }
+        if multimodal:
+            data.update(
+                {
+                    "modalities": {
+                        "rgb": str(root / "images"),
+                        "edge": str(root / "images_edge"),
+                    },
+                    "modality_used": ["rgb", "edge"],
+                }
+            )
+        (root / "data.yaml").write_text(
+            yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8"
+        )
+    single_zip = work_dir / "single.zip"
+    multimodal_zip = work_dir / "multimodal.zip"
+    _archive(single, single_zip)
+    _archive(multi, multimodal_zip)
+    return {
+        "single_root": single,
+        "multimodal_root": multi,
+        "single_yaml": single / "data.yaml",
+        "multimodal_yaml": multi / "data.yaml",
+        "single_zip": single_zip,
+        "multimodal_zip": multimodal_zip,
+        "rgb_image": multi / "images/train/sample_train_0.jpg",
+        "edge_image": multi / "images_edge/train/sample_train_0.jpg",
+    }
+
+
+def run_inference_smoke(artifacts: dict[str, Path], output_dir: Path) -> dict:
+    activate_vendored_ultralytics()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    result = {}
+    started = time.perf_counter()
+    single = load_detector(str(BACKEND_ROOT / "weights/yolo11n.pt"), "single")
+    prediction = single.predict(
+        source=str(artifacts["rgb_image"]), imgsz=96, device="cpu", verbose=False
+    )
+    result["single"] = {
+        "ok": bool(prediction),
+        "seconds": round(time.perf_counter() - started, 3),
+    }
+    started = time.perf_counter()
+    dual = load_detector(
+        str(MULTIMODAL_BASELINE_YAML), "multimodal", str(MULTIMODAL_BASELINE_YAML)
+    )
+    dual_prediction = dual.predict(
+        rgb_source=str(artifacts["rgb_image"]),
+        x_source=str(artifacts["edge_image"]),
+        imgsz=96,
+        device="cpu",
+        verbose=False,
+    )
+    result["multimodal_uploaded_edge"] = {
+        "ok": bool(dual_prediction),
+        "seconds": round(time.perf_counter() - started, 3),
+    }
+    return result
+
+
+def run_training_smoke(artifacts: dict[str, Path], output_dir: Path) -> dict:
+    activate_vendored_ultralytics()
+    result = {}
+    single = load_detector(str(BACKEND_ROOT / "weights/yolo11n.pt"), "single")
+    started = time.perf_counter()
+    single.train(
+        data=str(artifacts["single_yaml"]),
+        epochs=1,
+        batch=1,
+        imgsz=96,
+        workers=0,
+        device="cpu",
+        cache=False,
+        plots=False,
+        project=str(output_dir),
+        name="single",
+        exist_ok=True,
+    )
+    single_best = output_dir / "single/weights/best.pt"
+    result["single"] = {
+        "ok": single_best.is_file(),
+        "seconds": round(time.perf_counter() - started, 3),
+        "best": str(single_best),
+    }
+
+    dual = load_detector(
+        str(MULTIMODAL_BASELINE_YAML), "multimodal", str(MULTIMODAL_BASELINE_YAML)
+    )
+    started = time.perf_counter()
+    dual.train(
+        data=str(artifacts["multimodal_yaml"]),
+        epochs=1,
+        batch=1,
+        imgsz=96,
+        workers=0,
+        device="cpu",
+        cache=False,
+        plots=False,
+        project=str(output_dir),
+        name="multimodal",
+        exist_ok=True,
+    )
+    dual_best = output_dir / "multimodal/weights/best.pt"
+    result["multimodal"] = {
+        "ok": dual_best.is_file(),
+        "seconds": round(time.perf_counter() - started, 3),
+        "best": str(dual_best),
+    }
+    return result
+
+
+def run_api_smoke(rgb_path: Path) -> dict:
+    from algo.llm.llm_vl_client import LLMVLClient
+
+    started = time.perf_counter()
+    client = LLMVLClient()
+    raw = client.review_detection_structured(rgb_path.read_bytes(), [])
+    parsed = _parse_review_payload(raw)
+    return {
+        "ok": parsed.status in {
+            "consistent",
+            "possible_false_positive",
+            "possible_missed_detection",
+            "needs_human_review",
+        },
+        "seconds": round(time.perf_counter() - started, 3),
+        "status": parsed.status,
+        "model": client.config.get("model"),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=("contract", "inference", "train", "api", "all"), default="contract")
+    parser.add_argument("--work-dir", default=str(BACKEND_ROOT / ".verification"))
+    args = parser.parse_args()
+    work_dir = Path(args.work_dir).resolve()
+    artifacts = build_tiny_datasets(work_dir / "data")
+    report: dict[str, object] = {
+        "python": sys.version.split()[0],
+        "mode": args.mode,
+        "work_dir": str(work_dir),
+        "dataset_contract": {"single": True, "multimodal": True},
+    }
+    if args.mode in {"inference", "all"}:
+        report["inference"] = run_inference_smoke(artifacts, work_dir / "inference")
+    if args.mode in {"train", "all"}:
+        report["training"] = run_training_smoke(artifacts, work_dir / "training")
+    if args.mode in {"api", "all"}:
+        report["api"] = run_api_smoke(artifacts["rgb_image"])
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+----------------------------------------------------------------------
+
+[2] 报错链路 (Traceback)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\A\Desktop\ele-yolomm\完整版-光伏板缺陷检测分析系统(YOLO检测_多模态分析)\photovoltaic-panels-detect-web\web-flask\scripts\verify_multimodal_pipeline.py", line 230, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\Users\A\Desktop\ele-yolomm\完整版-光伏板缺陷检测分析系统(YOLO检测_多模态分析)\photovoltaic-panels-detect-web\web-flask\scripts\verify_multimodal_pipeline.py", line 222, in main
+    report["training"] = run_training_smoke(artifacts, work_dir / "training")
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A\Desktop\ele-yolomm\完整版-光伏板缺陷检测分析系统(YOLO检测_多模态分析)\photovoltaic-panels-detect-web\web-flask\scripts\verify_multimodal_pipeline.py", line 140, in run_training_smoke
+    single.train(
+  File "C:\Users\A\Desktop\ele-yolomm\完整版-光伏板缺陷检测分析系统(YOLO检测_多模态分析)\photovoltaic-panels-detect-web\web-flask\vendor\ultralytics\engine\model.py", line 948, in train
+    self.trainer.train()
+  File "C:\Users\A\Desktop\ele-yolomm\完整版-光伏板缺陷检测分析系统(YOLO检测_多模态分析)\photovoltaic-panels-detect-web\web-flask\vendor\ultralytics\engine\trainer.py", line 256, in train
+    self._do_train(world_size)
+  File "C:\Users\A\Desktop\ele-yolomm\完整版-光伏板缺陷检测分析系统(YOLO检测_多模态分析)\photovoltaic-panels-detect-web\web-flask\vendor\ultralytics\engine\trainer.py", line 551, in _do_train
+    self.save_model()
+  File "C:\Users\A\Desktop\ele-yolomm\完整版-光伏板缺陷检测分析系统(YOLO检测_多模态分析)\photovoltaic-panels-detect-web\web-flask\vendor\ultralytics\engine\trainer.py", line 701, in save_model
+    "train_results": self.read_results_csv(),
+                     ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A\Desktop\ele-yolomm\完整版-光伏板缺陷检测分析系统(YOLO检测_多模态分析)\photovoltaic-panels-detect-web\web-flask\vendor\ultralytics\engine\trainer.py", line 673, in read_results_csv
+    import pandas as pd  # scope for faster 'import ultralytics'
+    ^^^^^^^^^^^^^^^^^^^
+ModuleNotFoundError: No module named 'pandas'
+----------------------------------------------------------------------
+======================================================================

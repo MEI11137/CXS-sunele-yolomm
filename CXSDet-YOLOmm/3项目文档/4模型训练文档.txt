@@ -1,0 +1,72 @@
+
+光伏板缺陷检测系统 - 模型训练
+========================
+
+1. 数据集介绍
+----------
+1.1 光伏板缺陷数据集: other/model_train/detect/dataset/all_dataset
+- 总样本数：3276张光伏板图片
+- 训练集：2620张图片 (用于模型训练)
+- 验证集：328张图片 (用于模型验证和性能调优)
+- 测试集：328张图片 (用于模型最终性能评估)
+
+1.2 缺陷类别: 4类光伏板缺陷检测
+   0: bird_shit - 鸟粪 - 光伏板表面的鸟类粪便污染
+   1: crack - 裂纹 - 光伏板表面的裂纹损伤
+   2: dirt - 污垢 - 光伏板表面的灰尘、污渍等污染物
+   3: panel - 面板 - 光伏板面板区域
+
+2. 模型训练介绍
+----------
+2.1 支持的模型: other/model_train/detect/weights
+- yolov8n.pt - YOLOv8轻量级模型，适合快速部署
+- yolo11n.pt - YOLO11最新版本，性能更优
+- yolo12n.pt - YOLO12最新版本，检测精度最高
+
+2.2 模型训练命令
+- 进入模型训练根目录: cd other/model_train/detect
+- 激活python环境: conda activate py12
+- 执行训练脚本: python code/train.py
+- 执行验证脚本: python code/val.py
+- 执行预测脚本: python code/predict.py
+
+2.3 结果保存路径
+- 训练结果: other/model_train/detect/output/train
+- 测试结果: other/model_train/detect/output/val
+- 预测结果: other/model_train/detect/output/predict
+- 已经训练好的结果: other/model_train/detect/output/已经训练好的模型和测试结果
+
+3. 模型性能评估
+----------
+3.1 整体性能指标
+基于训练好的模型在测试集上的表现：
+- precision (精确率): 0.565
+- recall (召回率): 0.579
+- mAP50 (IoU阈值0.5时的平均精度): 0.539
+- mAP50-95 (IoU阈值0.5-0.95的平均精度): 0.352
+
+3.2 各类别详细性能
+- bird_shit (鸟粪):
+  * mAP50: 0.172, precision: 0.256, recall: 0.263
+  * mAP50-95: 0.077
+  * 检测难度较高，需要进一步优化
+
+- crack (裂纹):
+  * mAP50: 0.773, precision: 0.685, recall: 0.827
+  * mAP50-95: 0.396
+  * 检测效果较好，裂纹识别能力强
+
+- dirt (污垢):
+  * mAP50: 0.428, precision: 0.596, recall: 0.412
+  * mAP50-95: 0.288
+  * 精确率较高，但召回率有待提升
+
+- panel (面板):
+  * mAP50: 0.784, precision: 0.724, recall: 0.813
+  * mAP50-95: 0.647
+  * 表现最佳，面板区域检测准确
+
+3.3 性能分析总结
+- 优势类别: panel(面板)、crack(裂纹)
+- 中等表现: dirt(污垢)
+- 需要改进: bird_shit(鸟粪)的检测精度需要进一步提升
