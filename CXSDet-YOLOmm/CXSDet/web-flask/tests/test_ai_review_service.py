@@ -112,6 +112,33 @@ def test_repeated_parse_failure_persists_fallback_then_raises():
     assert persisted["summary"] == "AI返回格式异常，需要人工复核"
 
 
+def test_malformed_optional_field_retries_then_persists_parse_fallback():
+    import pytest
+    from services.ai_review_service import AIReviewParseError, review_detection
+
+    class FakeClient:
+        config = {"model": "vision-test"}
+
+        def __init__(self):
+            self.calls = 0
+
+        def review_detection_structured(self, image_bytes, detections):
+            self.calls += 1
+            return '{"status":"consistent","possible_false_positives":null}'
+
+    client = FakeClient()
+    database = FakeDatabase(_record())
+
+    with pytest.raises(AIReviewParseError, match="AI返回格式异常") as error:
+        review_detection("record-1", client, database, FakeStorage())
+
+    assert isinstance(error.value.__cause__, AIReviewParseError)
+    assert client.calls == 2
+    persisted = json.loads(database.updated[1][1])
+    assert persisted["status"] == "needs_human_review"
+    assert persisted["summary"] == "AI返回格式异常，需要人工复核"
+
+
 def test_parser_rejects_non_object_top_level_payload():
     import pytest
     from services.ai_review_service import AIReviewParseError, _parse_review_payload
@@ -148,6 +175,39 @@ def test_upstream_failure_persists_fallback_without_retry():
     assert client.calls == 1
     assert persisted["status"] == "needs_human_review"
     assert persisted["summary"] == "AI服务调用失败，需要人工复核"
+
+
+def test_upstream_failure_logs_categories_without_provider_secrets(caplog):
+    import logging
+    import pytest
+    from services.ai_review_service import AIReviewUpstreamError, review_detection
+
+    class ProviderFailure(RuntimeError):
+        status_code = "SECRET-STATUS"
+        code = "SECRET-CODE"
+
+    class FakeClient:
+        config = {"model": "vision-test", "api_key": "SECRET-API-KEY"}
+
+        def review_detection_structured(self, image_bytes, detections):
+            raise ProviderFailure("SECRET-MESSAGE")
+
+    with caplog.at_level(logging.WARNING, logger="services.ai_review_service"):
+        with pytest.raises(AIReviewUpstreamError):
+            review_detection(
+                "record-1", FakeClient(), FakeDatabase(_record()), FakeStorage()
+            )
+
+    assert "ai_review_upstream_failure" in caplog.text
+    assert "record_id=record-1" in caplog.text
+    assert "model=vision-test" in caplog.text
+    assert "exception_type=ProviderFailure" in caplog.text
+    assert "status_code=unknown" in caplog.text
+    assert "error_code=unknown" in caplog.text
+    for secret in (
+        "SECRET-STATUS", "SECRET-CODE", "SECRET-MESSAGE", "SECRET-API-KEY", "class_name"
+    ):
+        assert secret not in caplog.text
 
 
 def test_parse_failure_logs_metadata_without_sensitive_values(caplog):

@@ -79,9 +79,12 @@ def _parse_review_payload(raw: Any) -> AIReviewResult:
     if status not in ALLOWED_STATUSES:
         status = "needs_human_review"
     summary = str(payload.get("summary") or "AI未提供明确说明，需要人工复核")
+    false_positive_values = payload.get("possible_false_positives", [])
+    if not isinstance(false_positive_values, list):
+        raise AIReviewParseError("possible_false_positives必须是JSON数组")
     false_positives = [
         int(value)
-        for value in payload.get("possible_false_positives", [])
+        for value in false_positive_values
         if isinstance(value, (int, float))
     ]
     missed = payload.get("possible_missed_detections", [])
@@ -133,10 +136,12 @@ def _response_metadata(raw: Any) -> tuple[str, int, str]:
 
 
 def _public_exception_field(exc: Exception, field_name: str) -> str:
-    value = getattr(exc, field_name, None)
-    if value is None and field_name == "status_code":
+    if field_name != "status_code":
+        return "unknown"
+    value = getattr(exc, "status_code", None)
+    if value is None:
         value = getattr(getattr(exc, "response", None), "status_code", None)
-    return str(value)[:64] if isinstance(value, (str, int)) else "unknown"
+    return str(value) if type(value) is int and 100 <= value <= 599 else "unknown"
 
 
 def review_detection(record_id: str, client, database, storage_client) -> AIReviewResult:
