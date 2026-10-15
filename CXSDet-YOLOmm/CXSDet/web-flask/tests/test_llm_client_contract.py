@@ -1,6 +1,7 @@
 import io
 
 from PIL import Image
+import pytest
 
 
 def _image_bytes():
@@ -37,8 +38,12 @@ def test_structured_review_requests_image_and_json_contract(monkeypatch):
     class Completions:
         def create(self, **kwargs):
             captured.update(kwargs)
-            message = type("Message", (), {"content": '{"status":"consistent","summary":"ok"}'})()
-            choice = type("Choice", (), {"message": message})()
+            message = type(
+                "Message",
+                (),
+                {"content": '{"status":"consistent","summary":"ok"}', "refusal": None},
+            )()
+            choice = type("Choice", (), {"message": message, "finish_reason": "stop"})()
             return type("Completion", (), {"choices": [choice]})()
 
     class FakeOpenAI:
@@ -53,6 +58,119 @@ def test_structured_review_requests_image_and_json_contract(monkeypatch):
     )
 
     assert '"status":"consistent"' in response
+    assert captured["response_format"] == {"type": "json_object"}
     content = captured["messages"][0]["content"]
     assert any(item["type"] == "image_url" for item in content)
+    assert "JSON" in content[0]["text"]
     assert "possible_false_positive" in content[0]["text"]
+
+
+def _client_with_completion(completion):
+    from algo.llm.llm_vl_client import LLMVLClient
+
+    class Completions:
+        def create(self, **kwargs):
+            return completion
+
+    client = object.__new__(LLMVLClient)
+    client.config = {"model": "vision-test"}
+    client.client = type(
+        "Client",
+        (),
+        {"chat": type("Chat", (), {"completions": Completions()})()},
+    )()
+    return client
+
+
+@pytest.mark.parametrize(
+    ("completion", "reason"),
+    [
+        (type("Completion", (), {"choices": []})(), "没有返回候选结果"),
+        (
+            type(
+                "Completion",
+                (),
+                {
+                    "choices": [
+                        type(
+                            "Choice",
+                            (),
+                            {
+                                "finish_reason": "length",
+                                "message": type("Message", (), {"content": "{}", "refusal": None})(),
+                            },
+                        )()
+                    ]
+                },
+            )(),
+            "响应被截断",
+        ),
+        (
+            type(
+                "Completion",
+                (),
+                {
+                    "choices": [
+                        type(
+                            "Choice",
+                            (),
+                            {
+                                "finish_reason": "content_filter",
+                                "message": type("Message", (), {"content": "{}", "refusal": None})(),
+                            },
+                        )()
+                    ]
+                },
+            )(),
+            "内容过滤",
+        ),
+        (
+            type(
+                "Completion",
+                (),
+                {
+                    "choices": [
+                        type(
+                            "Choice",
+                            (),
+                            {
+                                "finish_reason": "stop",
+                                "message": type(
+                                    "Message",
+                                    (),
+                                    {"content": "{}", "refusal": "cannot comply"},
+                                )(),
+                            },
+                        )()
+                    ]
+                },
+            )(),
+            "拒绝处理",
+        ),
+        (
+            type(
+                "Completion",
+                (),
+                {
+                    "choices": [
+                        type(
+                            "Choice",
+                            (),
+                            {
+                                "finish_reason": "stop",
+                                "message": type("Message", (), {"content": "   ", "refusal": None})(),
+                            },
+                        )()
+                    ]
+                },
+            )(),
+            "空内容",
+        ),
+    ],
+)
+def test_structured_review_rejects_incomplete_responses(completion, reason):
+    from algo.llm.llm_vl_client import LLMResponseError
+
+    client = _client_with_completion(completion)
+    with pytest.raises(LLMResponseError, match=reason):
+        client.review_detection_structured(_image_bytes(), [])

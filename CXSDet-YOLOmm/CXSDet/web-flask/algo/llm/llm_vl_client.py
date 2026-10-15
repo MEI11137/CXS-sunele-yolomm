@@ -21,6 +21,10 @@ from openai import OpenAI
 from algo.llm.config import DEFAULT_VL_MODEL, VL_MODEL_CONFIGS
 
 
+class LLMResponseError(RuntimeError):
+    """Raised when a structured completion cannot safely be consumed."""
+
+
 class LLMVLClient:
     """多模态大语言模型客户端（用于光伏板缺陷检测图片分析）"""
 
@@ -79,6 +83,7 @@ AI只能给出复核建议，不能声称已修改模型或训练标签。
         """.strip()
         completion = self.client.chat.completions.create(
             model=self.config['model'],
+            response_format={"type": "json_object"},
             messages=[{
                 "role": "user",
                 "content": [
@@ -87,7 +92,27 @@ AI只能给出复核建议，不能声称已修改模型或训练标签。
                 ]
             }]
         )
-        return completion.choices[0].message.content
+        choices = getattr(completion, "choices", None) or []
+        if not choices:
+            raise LLMResponseError("模型没有返回候选结果")
+
+        choice = choices[0]
+        finish_reason = getattr(choice, "finish_reason", None)
+        if finish_reason == "length":
+            raise LLMResponseError("模型响应被截断")
+        if finish_reason == "content_filter":
+            raise LLMResponseError("模型响应触发内容过滤")
+
+        message = getattr(choice, "message", None)
+        if message is None:
+            raise LLMResponseError("模型没有返回消息")
+        if getattr(message, "refusal", None):
+            raise LLMResponseError("模型拒绝处理复核请求")
+
+        content = getattr(message, "content", None)
+        if not isinstance(content, str) or not content.strip():
+            raise LLMResponseError("模型返回空内容")
+        return content
 
     def health_check(self) -> dict:
         """Check authentication/model visibility without returning credentials."""
