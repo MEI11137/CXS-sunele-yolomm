@@ -7,7 +7,6 @@ set "ROOT=%~dp0"
 for %%I in ("%ROOT%..\..") do set "WORKSPACE_ROOT=%%~fI"
 set "BACKEND_SCRIPT=%ROOT%start-backend.cmd"
 set "FRONTEND_SCRIPT=%ROOT%start-frontend.cmd"
-set "PYTHON_EXE=D:\Anaconda3\envs\py12\python.exe"
 set "NODE_EXE=%WORKSPACE_ROOT%\.tools\node-v22.2.0-win-x64\node.exe"
 set "NPM_CMD=%WORKSPACE_ROOT%\.tools\node-v22.2.0-win-x64\npm.cmd"
 set "BACKEND_URL=http://127.0.0.1:5020/api/health/health_check"
@@ -17,11 +16,11 @@ call :require_file "%BACKEND_SCRIPT%"
 if errorlevel 1 goto :dependency_error
 call :require_file "%FRONTEND_SCRIPT%"
 if errorlevel 1 goto :dependency_error
-call :require_file "%PYTHON_EXE%"
-if errorlevel 1 goto :dependency_error
 call :require_file "%NODE_EXE%"
 if errorlevel 1 goto :dependency_error
 call :require_file "%NPM_CMD%"
+if errorlevel 1 goto :dependency_error
+call "%BACKEND_SCRIPT%" --check
 if errorlevel 1 goto :dependency_error
 
 if /I "%~1"=="--check" (
