@@ -132,7 +132,7 @@
         <div class="info-content">
           <div class="info-item">
             <span class="info-label">系统版本：</span>
-            <span class="info-value">v1.0.0</span>
+            <span class="info-value">{{ systemInfo.version }}</span>
           </div>
           <div class="info-item">
             <span class="info-label">最后更新：</span>
@@ -152,6 +152,7 @@
 import { ref, onMounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
+import systemInfo from 'virtual:build-info'
 import { 
   Camera, VideoPlay, Monitor, List, MagicStick, 
   Setting, TrendCharts, Clock, Calendar, InfoFilled,
@@ -201,11 +202,6 @@ const recentActivities = ref([
     time: '1天前'
   }
 ])
-
-// 系统信息
-const systemInfo = ref({
-  lastUpdate: '2025-09-03'
-})
 
 // 页面跳转
 const navigateTo = (path: string) => {
@@ -532,4 +528,4 @@ onMounted(async () => {
     font-size: 28px;
   }
 }
-</style> 
+</style>

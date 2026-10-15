@@ -11,4 +11,13 @@
 
 /// <reference types="vite/client" />
 
+declare module 'virtual:build-info' {
+  const buildInfo: {
+    version: string
+    lastUpdate: string
+  }
+
+  export default buildInfo
+}
+
 declare module 'element-plus/dist/locale/zh-cn.mjs'

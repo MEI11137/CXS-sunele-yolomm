@@ -4,10 +4,14 @@ import { resolve } from 'path'
 import AutoImport from 'unplugin-auto-import/vite'
 import Components from 'unplugin-vue-components/vite'
 import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
+import { createBuildInfoPlugin, resolveBuildInfo } from './build-info.mjs'
+
+const buildInfo = resolveBuildInfo({ cwd: __dirname })
 
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [
+    createBuildInfoPlugin(buildInfo),
     vue(),
     AutoImport({
       resolvers: [ElementPlusResolver()],
