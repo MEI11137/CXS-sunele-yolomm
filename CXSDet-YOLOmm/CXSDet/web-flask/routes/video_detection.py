@@ -11,6 +11,7 @@ from utils.db import db
 from utils.jwt_util import token_required
 from utils.models import VideoDetectionRecord, VideoDetectionRecordVO, VIDEO_DETECTION_STATUS
 from utils.security_utils import is_admin
+from utils.tracking_counter import UniqueTrackCounter
 from utils.video_writer import create_browser_video_writer
 from config import TEMP_DIR, YOLO_CLASSES_CONFIG
 
@@ -163,12 +164,15 @@ def run_video_detection_process(record_id, user_id, model_id, model_name, video_
                 'detections_per_frame': [],
                 'summary': {
                     'total_detections': 0,
+                    'unique_detections': 0,
+                    'unique_detections_by_class': {},
                     'avg_detections_per_frame': 0,
                     'classes_detected': set()
                 }
             }
             
             total_detections = 0
+            unique_track_counter = UniqueTrackCounter()
             frame_idx = 0
             processed_frame_count = 0  # 实际处理的帧数
             
@@ -232,8 +236,14 @@ def run_video_detection_process(record_id, user_id, model_id, model_name, video_
                     if should_process_frame:
                         processed_frame_count += 1
                         
-                        # 对当前帧进行推理
-                        results = model(frame, conf=confidence_threshold, verbose=False)
+                        # 使用与实时检测一致的ByteTrack进行持久跟踪
+                        results = model.track(
+                            frame,
+                            conf=confidence_threshold,
+                            persist=True,
+                            tracker="bytetrack.yaml",
+                            verbose=False
+                        )
                         
                         frame_detections = []
                         annotated_frame = frame.copy()
@@ -249,9 +259,12 @@ def run_video_detection_process(record_id, user_id, model_id, model_name, video_
                                 for box in result.boxes:
                                     # 获取边界框坐标
                                     x1, y1, x2, y2 = box.xyxy[0]
-                                    confidence = box.conf[0]
-                                    class_id = int(box.cls[0])
+                                    confidence = float(box.conf[0].cpu().item()) if hasattr(box.conf[0], 'cpu') else float(box.conf[0])
+                                    class_id = int(box.cls[0].cpu().item()) if hasattr(box.cls[0], 'cpu') else int(box.cls[0])
                                     class_name = model.names[class_id]
+                                    track_id = int(box.id[0].cpu().item()) if box.id is not None and hasattr(box.id[0], 'cpu') else (
+                                        int(box.id[0]) if box.id is not None else None
+                                    )
                                     
                                     # 获取类别对应的颜色
                                     color = get_class_color(class_name)
@@ -260,7 +273,10 @@ def run_video_detection_process(record_id, user_id, model_id, model_name, video_
                                     cv2.rectangle(annotated_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
                                     
                                     # 构建显示文本
-                                    text = f'{class_name} {confidence:.2f}'
+                                    if track_id is not None:
+                                        text = f'ID:{track_id} {class_name} {confidence:.2f}'
+                                    else:
+                                        text = f'{class_name} {confidence:.2f}'
                                     
                                     # 在检测框上方显示文本
                                     cv2.putText(annotated_frame, text, 
@@ -269,12 +285,14 @@ def run_video_detection_process(record_id, user_id, model_id, model_name, video_
                                     # 添加到检测数据
                                     detection = {
                                         'bbox': box.xyxy[0].cpu().numpy().tolist() if hasattr(box.xyxy[0], 'cpu') else box.xyxy[0].tolist(),
-                                        'confidence': float(box.conf[0].cpu().numpy()) if hasattr(box.conf[0], 'cpu') else float(box.conf[0]),
-                                        'class': int(box.cls[0].cpu().numpy()) if hasattr(box.cls[0], 'cpu') else int(box.cls[0]),
-                                        'class_name': model.names[int(box.cls[0].cpu().numpy()) if hasattr(box.cls[0], 'cpu') else int(box.cls[0])]
+                                        'confidence': confidence,
+                                        'class': class_id,
+                                        'class_name': class_name,
+                                        'track_id': track_id
                                     }
                                     frame_detections.append(detection)
                                     detection_summary['summary']['classes_detected'].add(detection['class_name'])
+                                    unique_track_counter.register(track_id, class_name)
                                     total_detections += 1
                         
                         # 确保帧的尺寸正确
@@ -421,6 +439,7 @@ def run_video_detection_process(record_id, user_id, model_id, model_name, video_
             print(f"视频处理完成 - 读取帧数: {frame_idx}, 实际处理帧数: {processed_frame_count}")
             
             detection_summary['summary']['total_detections'] = total_detections
+            detection_summary['summary'].update(unique_track_counter.to_summary())
             detection_summary['summary']['avg_detections_per_frame'] = total_detections / max(processed_frame_count, 1)
             detection_summary['summary']['classes_detected'] = list(detection_summary['summary']['classes_detected'])
             detection_summary['summary']['frame_sampling'] = {

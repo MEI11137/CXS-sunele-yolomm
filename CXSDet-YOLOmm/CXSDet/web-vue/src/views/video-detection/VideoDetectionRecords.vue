@@ -312,8 +312,12 @@
           <div class="detection-summary">
             <div class="summary-stats">
               <div class="stat-item">
-                <div class="stat-label">总检测数</div>
-                <div class="stat-value total-detections">{{ getDetectionSummary(currentRecord).total_detections || 0 }}</div>
+                <div class="stat-label">唯一目标数</div>
+                <div class="stat-value total-detections">{{ getUniqueDetectionCount(currentRecord) }}</div>
+              </div>
+              <div class="stat-item">
+                <div class="stat-label">逐帧检测总次数</div>
+                <div class="stat-value">{{ getDetectionSummary(currentRecord).total_detections || 0 }}</div>
               </div>
               <div class="stat-item">
                 <div class="stat-label">平均每帧检测数</div>
@@ -322,17 +326,17 @@
             </div>
             
             <div class="classes-section">
-              <div class="classes-label">检测到的类别</div>
+              <div class="classes-label">各类别唯一目标</div>
               <div class="classes-tags">
                 <el-tag 
-                  v-for="cls in getDetectionSummary(currentRecord).classes_detected" 
-                  :key="cls" 
-                  :style="{ backgroundColor: getClassColor(cls), color: '#fff', borderColor: getClassColor(cls) }"
+                  v-for="item in getUniqueClassCounts(currentRecord)"
+                  :key="item.className"
+                  :style="{ backgroundColor: getClassColor(item.className), color: '#fff', borderColor: getClassColor(item.className) }"
                   class="class-tag"
                 >
-                  {{ getClassDisplayName(cls) }}
+                  {{ getClassDisplayName(item.className) }}<template v-if="item.count !== null">：{{ item.count }}</template>
                 </el-tag>
-                <span v-if="!getDetectionSummary(currentRecord).classes_detected?.length" class="no-classes">无检测类别</span>
+                <span v-if="getUniqueClassCounts(currentRecord).length === 0" class="no-classes">无检测类别</span>
               </div>
             </div>
             
@@ -369,6 +373,7 @@
                           :style="{ backgroundColor: getClassColor(detection.class_name) }"
                         ></span>
                         <span class="class-name">{{ getClassDisplayName(detection.class_name) }}</span>
+                        <span v-if="detection.track_id !== null && detection.track_id !== undefined" class="track-id">ID {{ detection.track_id }}</span>
                         <span class="confidence">{{ (detection.confidence * 100).toFixed(1) }}%</span>
                       </div>
                     </div>
@@ -551,6 +556,30 @@ const getDetectionSummary = (record: VideoDetectionRecord): any => {
   } catch {
     return {}
   }
+}
+
+// 新记录显示ByteTrack唯一目标数；旧记录回退到原有逐帧检测总数
+const getUniqueDetectionCount = (record: VideoDetectionRecord): number => {
+  const summary = getDetectionSummary(record)
+  return summary.unique_detections ?? summary.total_detections ?? 0
+}
+
+// 新记录显示各类别唯一目标数；旧记录仍显示历史类别标签
+const getUniqueClassCounts = (record: VideoDetectionRecord): Array<{ className: string; count: number | null }> => {
+  const summary = getDetectionSummary(record)
+  const counts = summary.unique_detections_by_class
+
+  if (counts && typeof counts === 'object') {
+    return Object.entries(counts).map(([className, count]) => ({
+      className,
+      count: Number(count)
+    }))
+  }
+
+  return (summary.classes_detected || []).map((className: string) => ({
+    className,
+    count: null
+  }))
 }
 
 // 获取帧检测详情
@@ -1240,6 +1269,12 @@ onMounted(() => {
   flex: 1;
   color: #303133;
   font-weight: 500;
+}
+
+.track-id {
+  color: #409eff;
+  font-weight: 600;
+  font-size: 12px;
 }
 
 .confidence {
