@@ -94,3 +94,34 @@ def test_batch_ai_review_route_returns_per_record_summary(monkeypatch):
 
     assert response.status_code == 200
     assert body["data"] == expected
+
+
+def test_record_ai_review_returns_real_http_502_for_typed_failure(monkeypatch):
+    import routes.detection as detection_route
+
+    from services.ai_review_service import AIReviewParseError
+
+    class FakeDb:
+        def query(self, sql, params=(), fetchone=False):
+            return {"id": "r1", "user_id": 3}
+
+    def fail_review(*args, **kwargs):
+        raise AIReviewParseError("private implementation detail")
+
+    monkeypatch.setattr(detection_route, "db", FakeDb())
+    monkeypatch.setattr(detection_route, "is_admin", lambda: False)
+    monkeypatch.setattr(detection_route, "LLMVLClient", lambda: object(), raising=False)
+    monkeypatch.setattr(detection_route, "review_detection", fail_review, raising=False)
+
+    app = Flask(__name__)
+    app.register_blueprint(detection_route.detection_bp)
+    response = app.test_client().post(
+        "/api/detection/records/r1/ai-review",
+        headers={"Authorization": f"Bearer {generate_token(3)}"},
+    )
+    body = response.get_json()
+
+    assert response.status_code == 502
+    assert body["code"] == 502
+    assert body["msg"] == "AI返回格式异常，需要人工复核"
+    assert "private implementation detail" not in response.get_data(as_text=True)

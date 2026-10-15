@@ -16,7 +16,7 @@ from utils.security_utils import is_admin
 from config import TEMP_DIR, YOLO_CLASSES_CONFIG
 from services.detection_service import execute_detection
 from services.yolo_runtime import MissingModalityError
-from services.ai_review_service import check_vl_health, review_detection
+from services.ai_review_service import AIReviewError, check_vl_health, review_detection
 from services.review_service import (
     ReviewConflictError,
     ReviewValidationError,
@@ -516,6 +516,8 @@ def review_detection_record(record_id):
             return error("识别记录不存在或无权访问", 404)
         review = review_detection(record_id, LLMVLClient(), db, file_client)
         return success(review.to_dict(), "AI辅助复核完成，请人工确认")
+    except AIReviewError as exc:
+        return error(exc.public_message, 502), 502
     except Exception as exc:
         return error(f"AI辅助复核失败: {type(exc).__name__}")
 

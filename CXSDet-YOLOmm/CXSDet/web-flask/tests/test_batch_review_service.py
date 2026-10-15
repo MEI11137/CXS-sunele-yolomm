@@ -108,6 +108,43 @@ def test_batch_ai_review_limits_request_size(tmp_path):
         )
 
 
+def test_batch_ai_review_reports_typed_failure_and_continues(tmp_path):
+    from services.ai_review_service import AIReviewUpstreamError
+
+    from services.batch_review_service import run_batch_ai_reviews
+
+    db, _ = _database(tmp_path)
+
+    class Review:
+        def to_dict(self):
+            return {"status": "consistent"}
+
+    def runner(record_id, client, database, storage):
+        if record_id == "r1":
+            raise AIReviewUpstreamError("provider detail must stay private")
+        return Review()
+
+    result = run_batch_ai_reviews(
+        ["r1", "r2"],
+        user_id=7,
+        is_admin_user=False,
+        database=db,
+        storage_client=object(),
+        review_runner=runner,
+        client_factory=lambda: object(),
+    )
+
+    assert result["succeeded"] == 1
+    assert result["failed"] == 1
+    assert result["items"][0] == {
+        "record_id": "r1",
+        "status": "failed",
+        "error": "AI服务调用失败，需要人工复核",
+    }
+    assert result["items"][1]["record_id"] == "r2"
+    assert result["items"][1]["status"] == "success"
+
+
 def test_batch_feedback_uses_each_models_source_dataset_and_is_idempotent(tmp_path):
     from services.batch_review_service import add_batch_confirmed_records
 

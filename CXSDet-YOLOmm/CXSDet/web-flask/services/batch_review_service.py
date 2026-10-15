@@ -6,6 +6,7 @@ import sqlite3
 from collections import OrderedDict
 from typing import Any, Callable
 
+from services.ai_review_service import AIReviewError
 from services.feedback_dataset_service import FeedbackValidationError, add_confirmed_record
 
 
@@ -92,6 +93,14 @@ def run_batch_ai_reviews(
             review = review_runner(record_id, client, database, storage_client)
             items.append(
                 {"record_id": record_id, "status": "success", "result": review.to_dict()}
+            )
+        except AIReviewError as exc:
+            items.append(
+                {
+                    "record_id": record_id,
+                    "status": "failed",
+                    "error": exc.public_message,
+                }
             )
         except Exception as exc:
             items.append(
