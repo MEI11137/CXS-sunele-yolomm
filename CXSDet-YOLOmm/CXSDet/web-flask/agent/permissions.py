@@ -1,0 +1,378 @@
+"""项目工作区与资源索引（B-01）。
+
+同一套 ``require_access`` / ``resolve_resource`` 同时约束原页面与 Agent：
+路由层不自己判断归属，只有通过这里才能拿到可操作的对象与版本。
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Iterable, List, Optional
+
+from agent.errors import AgentError, Code
+from agent.identity import ActorContext
+from agent.store import connect, dumps, loads, new_id, now, query_all, query_one
+
+ORIGIN_USER = "user"
+ORIGIN_LEGACY = "legacy"
+ORIGIN_SYSTEM = "system"
+
+POLICY_PRIVATE = "private"
+POLICY_SHARED_READONLY = "shared_readonly"
+
+READ_OPERATIONS = {"read", "list", "query"}
+WRITE_OPERATIONS = {"write", "update", "execute", "publish", "train", "delete"}
+
+
+# --------------------------------------------------------------------------- #
+# 项目工作区
+# --------------------------------------------------------------------------- #
+def create_project(
+    actor: ActorContext,
+    name: str,
+    description: str = "",
+    *,
+    origin: str = ORIGIN_USER,
+    owner_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    clean = (name or "").strip()
+    if not clean:
+        raise AgentError(Code.VALIDATION, "项目名称不能为空")
+    # owner_id 只允许后台迁移使用；HTTP 入口传入的值会被忽略
+    target_owner = owner_id if actor.source != "http" and owner_id else actor.user_id
+    if actor.source == "http":
+        actor.assert_owner(target_owner)
+
+    conn = connect()
+    try:
+        exists = query_one(
+            conn,
+            "SELECT id FROM agent_project WHERE owner_id = ? AND name = ?",
+            (target_owner, clean),
+        )
+        if exists:
+            raise AgentError(Code.PROJECT_EXISTS, "同名项目已存在", http_status=409)
+        project_id = new_id("prj")
+        stamp = now()
+        conn.execute(
+            "INSERT INTO agent_project "
+            "(id, owner_id, name, description, requirements_json, origin, status, "
+            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+            (project_id, target_owner, clean, description, dumps({}), origin, stamp, stamp),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return get_project(actor, project_id)
+
+
+def get_project(actor: ActorContext, project_id: str) -> Dict[str, Any]:
+    conn = connect()
+    try:
+        row = query_one(conn, "SELECT * FROM agent_project WHERE id = ?", (project_id,))
+    finally:
+        conn.close()
+    if not row:
+        raise AgentError(Code.PROJECT_NOT_FOUND, "项目不存在", http_status=404)
+    if int(row["owner_id"]) != actor.user_id:
+        # 不暴露其他用户的项目是否存在
+        raise AgentError(Code.PROJECT_NOT_FOUND, "项目不存在", http_status=404)
+    return _project_view(row)
+
+
+def list_projects(actor: ActorContext) -> List[Dict[str, Any]]:
+    conn = connect()
+    try:
+        rows = query_all(
+            conn,
+            "SELECT * FROM agent_project WHERE owner_id = ? AND status = 'active' "
+            "ORDER BY updated_at DESC",
+            (actor.user_id,),
+        )
+    finally:
+        conn.close()
+    return [_project_view(row) for row in rows]
+
+
+def update_project(
+    actor: ActorContext,
+    project_id: str,
+    *,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    requirements: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    project = get_project(actor, project_id)
+    updates: List[str] = []
+    params: List[Any] = []
+    if name is not None:
+        clean = name.strip()
+        if not clean:
+            raise AgentError(Code.VALIDATION, "项目名称不能为空")
+        updates.append("name = ?")
+        params.append(clean)
+    if description is not None:
+        updates.append("description = ?")
+        params.append(description)
+    if requirements is not None:
+        _validate_requirements(requirements)
+        updates.append("requirements_json = ?")
+        params.append(dumps(requirements))
+    if not updates:
+        return project
+    updates.append("updated_at = ?")
+    params.append(now())
+    params.append(project_id)
+    conn = connect()
+    try:
+        conn.execute(f"UPDATE agent_project SET {', '.join(updates)} WHERE id = ?", params)
+        conn.commit()
+    finally:
+        conn.close()
+    return get_project(actor, project_id)
+
+
+def _validate_requirements(requirements: Dict[str, Any]) -> None:
+    """项目要求只能细化任务，不能扩权。出现越权声明直接拒绝写入。"""
+    if not isinstance(requirements, dict):
+        raise AgentError(Code.VALIDATION, "项目要求必须是对象")
+    forbidden_keys = {
+        "allow_unconfirmed_writes",
+        "skip_confirmation",
+        "auto_approve",
+        "grant_all_tools",
+        "expand_permissions",
+    }
+    for key in forbidden_keys:
+        if requirements.get(key):
+            raise AgentError(
+                Code.VALIDATION,
+                "项目要求不能扩大权限或跳过人工确认",
+                http_status=400,
+                details={"field": key},
+            )
+    text = str(requirements.get("notes") or "")
+    if "跳过确认" in text or "自动批准" in text:
+        raise AgentError(Code.VALIDATION, "项目要求不能包含跳过确认的说明")
+
+
+def ensure_default_project(actor: ActorContext, name: str = "默认项目") -> Dict[str, Any]:
+    existing = list_projects(actor)
+    if existing:
+        return existing[0]
+    return create_project(actor, name, "系统自动创建，用于承载未归档的会话与资源")
+
+
+def _project_view(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "description": row.get("description") or "",
+        "owner_id": int(row["owner_id"]),
+        "origin": row.get("origin") or ORIGIN_USER,
+        "status": row.get("status") or "active",
+        "requirements": loads(row.get("requirements_json")),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 资源索引
+# --------------------------------------------------------------------------- #
+def register_resource(
+    actor: ActorContext,
+    *,
+    project_id: str,
+    kind: str,
+    display_name: str,
+    source_table: Optional[str] = None,
+    source_id: Optional[str] = None,
+    access_policy: str = POLICY_PRIVATE,
+    modality: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    owner_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """登记业务资源归属。第三人新建数据集/模型/记录后必须调用本函数。"""
+    project = get_project(actor, project_id)  # 顺带校验项目归属
+    target_owner = int(project["owner_id"])
+    if owner_id is not None and actor.source != "http":
+        target_owner = owner_id
+
+    conn = connect()
+    try:
+        if source_table and source_id:
+            existing = query_one(
+                conn,
+                "SELECT * FROM agent_resource WHERE source_table = ? AND source_id = ?",
+                (source_table, source_id),
+            )
+            if existing:
+                return _resource_view(existing)
+        resource_id = new_id("res")
+        stamp = now()
+        conn.execute(
+            "INSERT INTO agent_resource "
+            "(id, kind, project_id, owner_id, display_name, revision, access_policy, "
+            " modality, source_table, source_id, metadata_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                resource_id,
+                kind,
+                project_id,
+                target_owner,
+                display_name,
+                access_policy,
+                modality,
+                source_table,
+                source_id,
+                dumps(metadata or {}),
+                stamp,
+                stamp,
+            ),
+        )
+        conn.commit()
+        row = query_one(conn, "SELECT * FROM agent_resource WHERE id = ?", (resource_id,))
+    finally:
+        conn.close()
+    return _resource_view(row)
+
+
+def bump_revision(conn, resource_id: str) -> int:
+    """资源内容变化时递增版本，使旧确认失效。"""
+    conn.execute(
+        "UPDATE agent_resource SET revision = revision + 1, updated_at = ? WHERE id = ?",
+        (now(), resource_id),
+    )
+    row = query_one(conn, "SELECT revision FROM agent_resource WHERE id = ?", (resource_id,))
+    return int(row["revision"]) if row else 0
+
+
+def list_project_resources(
+    actor: ActorContext,
+    project_id: str,
+    kinds: Optional[Iterable[str]] = None,
+) -> List[Dict[str, Any]]:
+    get_project(actor, project_id)
+    sql = "SELECT * FROM agent_resource WHERE project_id = ?"
+    params: List[Any] = [project_id]
+    kind_list = [k for k in (kinds or []) if k]
+    if kind_list:
+        sql += " AND kind IN (" + ",".join("?" for _ in kind_list) + ")"
+        params.extend(kind_list)
+    sql += " ORDER BY updated_at DESC"
+    conn = connect()
+    try:
+        rows = query_all(conn, sql, params)
+    finally:
+        conn.close()
+    return [_resource_view(row) for row in rows]
+
+
+def resolve_resource(actor: ActorContext, ref: Any) -> Dict[str, Any]:
+    """把模型/前端给的引用解析成真实对象与版本。
+
+    只接受 ID、``{resource_id}``、``{kind,id}``、``{source_table,source_id}`` 这类
+    结构，不接受文件路径或任意字符串拼接，避免路径穿越与越权枚举。
+    """
+    resource_row = None
+    conn = connect()
+    try:
+        if isinstance(ref, str):
+            resource_row = query_one(
+                conn, "SELECT * FROM agent_resource WHERE id = ?", (ref,)
+            )
+            if not resource_row and ref:
+                resource_row = query_one(
+                    conn,
+                    "SELECT * FROM agent_resource WHERE source_table = ? AND source_id = ?",
+                    (str(ref).split(":", 1)[0], str(ref).split(":", 1)[-1]),
+                )
+        elif isinstance(ref, dict):
+            if ref.get("resource_id"):
+                resource_row = query_one(
+                    conn, "SELECT * FROM agent_resource WHERE id = ?", (ref["resource_id"],)
+                )
+            elif ref.get("source_table") and ref.get("source_id"):
+                resource_row = query_one(
+                    conn,
+                    "SELECT * FROM agent_resource WHERE source_table = ? AND source_id = ?",
+                    (ref["source_table"], ref["source_id"]),
+                )
+            elif ref.get("id"):
+                resource_row = query_one(
+                    conn, "SELECT * FROM agent_resource WHERE id = ?", (ref["id"],)
+                )
+                if not resource_row and ref.get("kind"):
+                    resource_row = query_one(
+                        conn,
+                        "SELECT * FROM agent_resource WHERE source_id = ? AND kind = ?",
+                        (ref["id"], ref["kind"]),
+                    )
+        else:
+            raise AgentError(Code.VALIDATION, "资源引用格式不正确")
+    finally:
+        conn.close()
+
+    if not resource_row:
+        raise AgentError(Code.RESOURCE_NOT_FOUND, "引用的资源不存在", http_status=404)
+
+    owner_id = int(resource_row["owner_id"])
+    if owner_id != actor.user_id and resource_row["access_policy"] != POLICY_SHARED_READONLY:
+        # 其他用户的私有资源统一按"不存在"处理，避免探测
+        raise AgentError(Code.RESOURCE_NOT_FOUND, "引用的资源不存在", http_status=404)
+    return _resource_view(resource_row)
+
+
+def require_access(actor: ActorContext, resource: Dict[str, Any], operation: str) -> bool:
+    """统一授权入口：原页面与 Agent 工具都必须先过这一关。"""
+    op = (operation or "read").lower()
+    if op not in READ_OPERATIONS and op not in WRITE_OPERATIONS:
+        raise AgentError(Code.VALIDATION, f"未知的操作类型：{operation}")
+    owner_id = int(resource.get("owner_id") or 0)
+    policy = resource.get("access_policy") or POLICY_PRIVATE
+
+    if owner_id == actor.user_id:
+        return True
+    if policy == POLICY_SHARED_READONLY and op in READ_OPERATIONS:
+        return True
+    # 管理员的跨用户写操作必须走显式管理入口，不在这里放行
+    raise AgentError(
+        Code.RESOURCE_FORBIDDEN,
+        "该资源不在当前账号的授权范围内",
+        http_status=403,
+        details={"resource_id": resource.get("id"), "operation": op},
+    )
+
+
+def allowed_actions(actor: ActorContext, resource: Dict[str, Any]) -> List[str]:
+    actions = ["read"]
+    if int(resource.get("owner_id") or 0) == actor.user_id:
+        actions.extend(["write", "execute"])
+        if resource.get("kind") == "model":
+            actions.append("publish")
+    return actions
+
+
+def _resource_view(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": row["id"],
+        "kind": row["kind"],
+        "project_id": row["project_id"],
+        "owner_id": int(row["owner_id"]),
+        "display_name": row["display_name"],
+        "revision": int(row["revision"]),
+        "access_policy": row["access_policy"],
+        "modality": row.get("modality"),
+        "source_table": row.get("source_table"),
+        "source_id": row.get("source_id"),
+        "metadata": loads(row.get("metadata_json")),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def decorate_with_actions(actor: ActorContext, resource: Dict[str, Any]) -> Dict[str, Any]:
+    """补上第一人任务书约定的 ``allowed_actions`` 字段。"""
+    view = dict(resource)
+    view["allowed_actions"] = allowed_actions(actor, resource)
+    return view
