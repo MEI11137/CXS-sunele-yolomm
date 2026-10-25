@@ -17,6 +17,7 @@ from routes.model import model_bp
 from routes.detection import detection_bp
 from routes.video_detection import video_detection_bp
 from routes.realtime_detection import realtime_detection_bp
+from agent.registry import register_agent
 
 def create_app(config_overrides=None):
     """创建 Flask 应用，并允许测试安全地覆盖运行目录。"""
@@ -40,6 +41,8 @@ def create_app(config_overrides=None):
     flask_app.register_blueprint(detection_bp)
     flask_app.register_blueprint(video_detection_bp)
     flask_app.register_blueprint(realtime_detection_bp)
+    # Agent 后端：公共迁移、内置手册、启动核对与 /api/agent 路由
+    register_agent(flask_app)
     return flask_app
 
 
