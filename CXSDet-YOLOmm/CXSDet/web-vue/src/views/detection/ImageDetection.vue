@@ -11,35 +11,23 @@
 
 <template>
   <div class="image-detection">
-    <!-- 优化的页面头部 -->
-    <div class="page-header">
-      <div class="header-content">
-        <div class="header-left">
-          <div class="title-wrapper">
-            <div class="title-icon">
-              <el-icon><View /></el-icon>
-            </div>
-            <div>
-              <h1 class="page-title">光伏板缺陷识别</h1>
-              <p class="page-subtitle">智能检测光伏板表面缺陷，支持多种模型分析</p>
-            </div>
-          </div>
-        </div>
-        <div class="header-right">
-          <div class="header-stats">
-            <div class="stat-card">
-              <div class="stat-icon">
-                <el-icon><Setting /></el-icon>
-              </div>
-              <div class="stat-content">
-                <span class="stat-number">{{ publishedModels.length }}</span>
-                <span class="stat-label">可用模型</span>
-              </div>
-            </div>
-          </div>
-        </div>
+    <!-- 页面头部 -->
+    <header class="page-head">
+      <div class="head-text">
+        <h1 class="page-title">图片巡检</h1>
+        <p class="page-sub">上传现场影像，系统给出缺陷标注；标注结果需到识别记录中由人确认后才算数。</p>
       </div>
-    </div>
+      <div class="head-side">
+        <span class="head-metric">
+          <span class="hx-mono head-metric-value">{{ publishedModels.length }}</span>
+          <span class="head-metric-label">个已发布模型可选用</span>
+        </span>
+        <el-button @click="$router.push('/detection-records')">
+          <el-icon><Document /></el-icon>
+          查看记录
+        </el-button>
+      </div>
+    </header>
 
     <!-- 优化的主要内容区域 -->
     <div class="main-content">
@@ -138,8 +126,8 @@
                       <el-icon class="upload-icon"><Picture /></el-icon>
                     </div>
                     <div class="upload-content-text">
-                      <h3>批量上传 RGB 图片</h3>
-                      <p class="upload-desc">点击多选或一次拖入多张图片</p>
+                      <h3>批量上传可见光影像</h3>
+                      <p class="upload-desc">点击多选，或一次拖入多张现场照片</p>
                       <div class="upload-formats">
                         <el-tag size="small">JPG</el-tag>
                         <el-tag size="small">PNG</el-tag>
@@ -154,7 +142,7 @@
                 <div v-else class="preview-container">
                   <div class="preview-wrapper">
                     <img :src="imagePreview" alt="预览图" class="preview-image" />
-                    <el-tag class="batch-count-tag" type="success">已选择 {{ selectedImages.length }} 张 RGB</el-tag>
+                    <el-tag class="batch-count-tag" type="success">已选择 {{ selectedImages.length }} 张影像</el-tag>
                     <div class="preview-mask">
                       <div class="preview-actions">
                         <el-button type="danger" size="small" @click="reselectImage" class="remove-btn">
@@ -169,7 +157,7 @@
 
               <div v-if="selectedModel?.model_mode === 'multimodal'" class="secondary-upload">
                 <div class="secondary-title">
-                  X 模态：{{ selectedModel.secondary_modality || 'X' }}
+                  辅助影像（X 模态）：{{ selectedModel.secondary_modality || 'X' }}
                   <el-tag v-if="selectedModel.secondary_modality === 'edge'" size="small" type="success">可由 RGB 自动生成</el-tag>
                   <el-tag v-else size="small" type="warning">必须上传</el-tag>
                 </div>
@@ -446,7 +434,8 @@ import {
   MagicStick, 
   ChatDotRound, 
   Star,
-  Picture
+  Picture,
+  Document
 } from '@element-plus/icons-vue'
 import { detectionApi, type DetectionResponse, type PublishedModel } from '@/api/detection'
 import { modelApi, type YoloClassesConfig, type YoloClassInfo } from '@/api/model'
@@ -813,13 +802,13 @@ const generateDefaultTitle = () => {
   // 生成4位随机数
   const randomNum = Math.floor(Math.random() * 9000) + 1000
   
-  return `光伏板检测_${randomNum}`
+  return `海上风电场检测_${randomNum}`
 }
 
 // 生成默认描述（不超过30个字，包含检测类别）
 const generateDefaultDescription = () => {
   if (!detectionResult.value || !detectionResult.value.detections.length) {
-    return '未检测到缺陷，光伏板状态正常'
+    return '未检测到缺陷，设备状态正常'
   }
   
   // 获取所有检测到的类别
@@ -1062,69 +1051,66 @@ onMounted(() => {
 
 /* 主容器样式 */
 .image-detection {
-  min-height: 100vh;
-  background: #ffffff;
+  min-height: auto;
+  background: transparent;
   padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--hx-gap);
 }
 
 /* 页面头部样式 */
-.page-header {
-  background: #ffffff;
-  padding: 24px 0;
-  margin-bottom: 24px;
-  border-bottom: 1px solid #ebeef5;
-  position: relative;
-}
-
-.header-content {
+.page-head {
   display: flex;
+  align-items: flex-end;
   justify-content: space-between;
-  align-items: center;
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 0 24px;
-  position: relative;
-}
-
-.header-left {
-  flex: 1;
-}
-
-.title-wrapper {
-  display: flex;
-  align-items: center;
-  gap: 20px;
-}
-
-.title-icon {
-  width: 48px;
-  height: 48px;
-  background: #f5f7fa;
-  border-radius: 8px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.title-icon .el-icon {
-  font-size: 20px;
-  color: #409eff;
+  gap: 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--hx-line);
 }
 
 .page-title {
-  margin: 0 0 8px 0;
-  font-size: 24px;
-  color: #303133;
-  font-weight: 500;
-  letter-spacing: -0.3px;
+  margin: 0;
+  font-size: 20px;
+  line-height: 1.2;
+  font-weight: 600;
+  color: var(--hx-text);
+  padding-left: 10px;
+  border-left: 3px solid var(--hx-sea);
 }
 
-.page-subtitle {
-  font-size: 14px;
-  color: #909399;
-  margin: 0;
-  line-height: 1.5;
-  font-weight: 400;
+.page-sub {
+  margin: 6px 0 0 13px;
+  max-width: 640px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--hx-text-2);
+}
+
+.head-side {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-shrink: 0;
+}
+
+.head-metric {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding-right: 14px;
+  border-right: 1px solid var(--hx-line);
+}
+
+.head-metric-value {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--hx-text);
+}
+
+.head-metric-label {
+  font-size: 12px;
+  color: var(--hx-text-3);
 }
 
 .header-right {
@@ -2379,5 +2365,26 @@ onMounted(() => {
     width: 100%;
     justify-content: flex-start;
   }
+}
+
+/* —— 卡片头部统一 —— */
+:deep(.el-card__header) {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--hx-line);
+}
+
+:deep(.el-card) {
+  border-color: var(--hx-line);
+  border-radius: var(--hx-radius);
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--hx-text);
 }
 </style>

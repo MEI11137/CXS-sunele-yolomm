@@ -15,8 +15,8 @@
     <div class="page-header">
       <div class="header-content">
         <div class="header-left">
-          <h1 class="page-title">视频识别</h1>
-          <p class="page-subtitle">上传光伏板视频，使用AI模型进行缺陷检测分析</p>
+          <h1 class="page-title">视频巡检</h1>
+          <p class="page-subtitle">上传海上风电场巡检视频，使用 AI 模型进行缺陷检测分析</p>
         </div>
         <div class="header-right">
           <div class="header-stats">
@@ -213,6 +213,83 @@
               </el-upload>
             </el-form-item>
           </div>
+
+          <div v-if="userStore.isAdmin()" class="form-row dataset-switch-row">
+            <el-form-item label="同时生成数据集" class="form-item-full">
+              <el-switch v-model="datasetForm.enabled" active-text="开启" inactive-text="关闭" />
+              <span class="dataset-help">抽取原始帧并生成自动标注，之后可在待划分数据集中人工检查和分配。</span>
+            </el-form-item>
+          </div>
+
+          <div v-if="userStore.isAdmin() && datasetForm.enabled" class="dataset-options">
+            <el-alert
+              title="生成的数据集先保存为待划分草稿，不会自动拆分或直接用于训练。"
+              type="info"
+              :closable="false"
+              show-icon
+            />
+            <div class="form-row form-row-double">
+              <el-form-item label="数据集名称" required class="form-item-half">
+                <el-input v-model="datasetForm.name" maxlength="100" show-word-limit placeholder="请输入唯一的数据集名称" />
+              </el-form-item>
+              <el-form-item label="数据集模式" class="form-item-half">
+                <el-radio-group v-model="datasetForm.mode" @change="handleDatasetModeChange">
+                  <el-radio-button label="single">单模态</el-radio-button>
+                  <el-radio-button label="multimodal">RGB + X</el-radio-button>
+                </el-radio-group>
+              </el-form-item>
+            </div>
+            <div class="form-row form-row-double">
+              <el-form-item label="抽帧间隔" class="form-item-half">
+                <el-input-number v-model="datasetForm.frameInterval" :min="1" :max="10000" :step="1" />
+                <span class="dataset-help">每隔 N 帧取一帧；N=2 时取第 1、3、5…帧</span>
+              </el-form-item>
+              <el-form-item label="自动标注模型" class="form-item-half">
+                <el-select v-model="datasetForm.annotationModelId" placeholder="选择与数据集模式兼容的已发布模型">
+                  <el-option
+                    v-for="model in compatibleAnnotationModels"
+                    :key="model.id"
+                    :label="formatAnnotationModelLabel(model)"
+                    :value="model.id"
+                  />
+                </el-select>
+                <span v-if="!compatibleAnnotationModels.length" class="dataset-warning">当前模式暂无兼容的已发布模型</span>
+              </el-form-item>
+            </div>
+            <div class="form-row form-row-double">
+              <el-form-item label="标注置信度" class="form-item-half">
+                <el-slider v-model="datasetForm.confidence" :min="0.05" :max="1" :step="0.05" show-input />
+              </el-form-item>
+              <el-form-item label="数据集说明" class="form-item-half">
+                <el-input v-model="datasetForm.description" placeholder="可选" maxlength="300" />
+              </el-form-item>
+            </div>
+            <template v-if="datasetForm.mode === 'multimodal'">
+              <div class="form-row form-row-double">
+                <el-form-item label="第二模态" class="form-item-half">
+                  <el-select v-model="datasetForm.secondaryModality" placeholder="请选择" @change="refreshAnnotationModelDefault">
+                    <el-option v-for="modality in availableSecondaryModalities" :key="modality" :label="modality" :value="modality" />
+                  </el-select>
+                </el-form-item>
+                <el-form-item label="时间偏移（秒）" class="form-item-half">
+                  <el-input-number v-model="datasetForm.secondaryTimeOffset" :step="0.05" :precision="3" />
+                  <span class="dataset-help">正值表示第二路视频相对 RGB 时间轴后移</span>
+                </el-form-item>
+              </div>
+              <div class="form-row">
+                <el-form-item label="第二路视频" class="form-item-full">
+                  <el-upload :auto-upload="false" :show-file-list="false" accept="video/*" :on-change="handleSecondaryVideoChange">
+                    <el-button>选择第二路视频</el-button>
+                  </el-upload>
+                  <span v-if="datasetForm.secondaryVideo" class="dataset-file-name">{{ datasetForm.secondaryVideo.name }}</span>
+                  <el-button v-if="datasetForm.secondaryVideo" link type="danger" @click="datasetForm.secondaryVideo = null">移除</el-button>
+                </el-form-item>
+              </div>
+            </template>
+            <div class="dataset-estimate">
+              预计生成样本：{{ estimatedDatasetSampleCount ?? '选择视频后估算' }} 张
+            </div>
+          </div>
           
           <div class="form-row">
             <el-form-item class="form-item-full">
@@ -289,6 +366,41 @@
                 </span>
               </el-descriptions-item>
             </el-descriptions>
+            <div
+              v-if="userStore.isAdmin() && taskProgress.dataset_generation_status && taskProgress.dataset_generation_status !== 'not_requested'"
+              class="dataset-progress"
+            >
+              <el-alert
+                v-if="taskProgress.dataset_generation_status === 'failed' && taskProgress.status === VIDEO_DETECTION_STATUS.COMPLETED"
+                title="视频识别已完成，但待划分数据集生成失败；原视频结果不受影响。"
+                :description="taskProgress.dataset_statistics?.error || '可在数据集管理页重试。'"
+                type="warning"
+                :closable="false"
+                show-icon
+              />
+              <el-descriptions :column="3" border>
+                <el-descriptions-item label="数据集生成状态">
+                  {{ getDatasetGenerationStatusText(taskProgress.dataset_generation_status) }}
+                </el-descriptions-item>
+                <el-descriptions-item label="已抽取帧数">
+                  {{ taskProgress.dataset_statistics?.extracted ?? 0 }}
+                </el-descriptions-item>
+                <el-descriptions-item label="第二模态已配对">
+                  {{ taskProgress.dataset_statistics?.paired ?? 0 }}
+                </el-descriptions-item>
+                <el-descriptions-item label="缺少第二模态">
+                  {{ taskProgress.dataset_statistics?.missing_secondary ?? 0 }}
+                </el-descriptions-item>
+                <el-descriptions-item label="最大配对误差">
+                  {{ taskProgress.dataset_statistics?.max_pairing_error_ms == null ? '-' : `${taskProgress.dataset_statistics.max_pairing_error_ms.toFixed(1)} ms` }}
+                </el-descriptions-item>
+                <el-descriptions-item v-if="taskProgress.dataset_draft_id" label="待划分数据集">
+                  <el-link type="primary" @click="openDatasetDraft(taskProgress.dataset_draft_id)">
+                    {{ taskProgress.dataset_draft_id }}（打开划分页）
+                  </el-link>
+                </el-descriptions-item>
+              </el-descriptions>
+            </div>
           </div>
           
           <!-- 进度条 -->
@@ -353,7 +465,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, reactive, onUnmounted } from 'vue'
+import { ref, onMounted, reactive, onUnmounted, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElForm } from 'element-plus'
 import { 
@@ -368,24 +480,32 @@ import {
   Star
 } from '@element-plus/icons-vue'
 import { detectionApi } from '@/api/detection'
+import type { PublishedModel } from '@/api/detection'
+import { useUserStore } from '@/stores/user'
 import { 
   videoDetectionApi, 
   type VideoDetectionProgress,
+  getCompatibleAnnotationModels,
+  getDefaultAnnotationModelId,
+  appendVideoDatasetFields,
   VIDEO_DETECTION_STATUS,
   getVideoStatusText,
   getVideoStatusType
 } from '@/api/video_detection'
 
 const router = useRouter()
+const userStore = useUserStore()
 
 // 响应式数据
 const detecting = ref(false)
 const selectedVideo = ref<File | null>(null)
 const videoPreview = ref<string>('')
-const publishedModels = ref<any[]>([])
+const publishedModels = ref<PublishedModel[]>([])
 const currentTaskId = ref<string>('')
 const videoFrameRate = ref<number | null>(null)
+const videoDuration = ref(0)
 const frameRateDetecting = ref(false) // 帧率检测状态
+const videoCompletionNotified = ref(false)
 const taskProgress = ref<VideoDetectionProgress>({
   status: 0,
   progress: 0
@@ -397,12 +517,12 @@ let progressTimer: NodeJS.Timeout | null = null
 // 生成默认标题
 const generateDefaultTitle = (): string => {
   const randomNum = Math.floor(Math.random() * 10000)
-  return `光伏板视频检测_${randomNum}`
+  return `海上风电场视频检测_${randomNum}`
 }
 
 // 生成默认描述
 const generateDefaultDescription = (): string => {
-  return '使用AI模型对光伏板视频进行缺陷检测分析，自动识别光伏板表面的各类缺陷问题'
+  return '使用 AI 模型对海上风电场巡检视频进行缺陷检测，自动识别设备表面的裂纹、污垢、鸟粪等缺陷'
 }
 
 // 表单数据
@@ -414,6 +534,65 @@ const detectionForm = reactive({
   frame_rate: 5,
   video: null as File | null
 })
+
+const datasetForm = reactive({
+  enabled: false,
+  name: '',
+  description: '',
+  mode: 'single' as 'single' | 'multimodal',
+  frameInterval: 1,
+  annotationModelId: '',
+  confidence: 0.5,
+  secondaryModality: '',
+  secondaryTimeOffset: 0,
+  secondaryVideo: null as File | null,
+})
+
+const availableSecondaryModalities = computed(() =>
+  [...new Set(
+    publishedModels.value
+      .filter(model => model.model_mode === 'multimodal' && model.secondary_modality)
+      .map(model => model.secondary_modality as string)
+  )]
+)
+
+const compatibleAnnotationModels = computed(() =>
+  getCompatibleAnnotationModels(
+    publishedModels.value,
+    datasetForm.mode,
+    datasetForm.secondaryModality
+  )
+)
+
+const estimatedDatasetSampleCount = computed(() => {
+  if (!selectedVideo.value || !videoFrameRate.value || !videoDuration.value) return null
+  const totalFrames = Math.round(videoFrameRate.value * videoDuration.value)
+  return Math.ceil(totalFrames / Math.max(1, datasetForm.frameInterval))
+})
+
+const refreshAnnotationModelDefault = () => {
+  if (compatibleAnnotationModels.value.some(model => model.id === datasetForm.annotationModelId)) return
+  const selectedModel = publishedModels.value.find(model => model.id === detectionForm.model_id)
+  datasetForm.annotationModelId = getDefaultAnnotationModelId(
+    selectedModel,
+    datasetForm.mode,
+    datasetForm.secondaryModality
+  )
+}
+
+watch(
+  () => [datasetForm.enabled, datasetForm.mode, datasetForm.secondaryModality, detectionForm.model_id],
+  () => {
+    if (datasetForm.mode === 'single') {
+      datasetForm.secondaryModality = ''
+      datasetForm.secondaryTimeOffset = 0
+      datasetForm.secondaryVideo = null
+    } else if (!availableSecondaryModalities.value.includes(datasetForm.secondaryModality)) {
+      datasetForm.secondaryModality = availableSecondaryModalities.value[0] || ''
+    }
+    refreshAnnotationModelDefault()
+  }
+)
 
 // 表单引用
 const detectionFormRef = ref<InstanceType<typeof ElForm>>()
@@ -522,9 +701,8 @@ const fetchPublishedModels = async () => {
     
     // 默认选择最新的模型（按ID降序排列，取第一个）
     if (publishedModels.value.length > 0) {
-      // 按ID降序排序，获取最新的模型
-      const sortedModels = [...publishedModels.value].sort((a, b) => b.id - a.id)
-      detectionForm.model_id = sortedModels[0].id
+      // API 已按发布时间倒序返回。
+      detectionForm.model_id = publishedModels.value[0].id
     }
   } catch (error) {
     ElMessage.error('获取模型列表失败')
@@ -568,6 +746,7 @@ const handleFileChange = async (file: any) => {
     await new Promise((resolve) => {
       video.addEventListener('loadedmetadata', resolve)
     })
+    videoDuration.value = Number.isFinite(video.duration) ? video.duration : 0
 
     // 尝试获取视频真实帧率
     let detectedFPS = 25 // 默认值，改为更合理的25fps
@@ -683,6 +862,50 @@ const handleFileChange = async (file: any) => {
   }
 }
 
+const formatAnnotationModelLabel = (model: PublishedModel) =>
+  `${model.name}（${model.model_mode === 'multimodal' ? `RGB + ${model.secondary_modality || 'X'}` : '单模态'}）`
+
+const handleDatasetModeChange = (mode: string | number | boolean | undefined) => {
+  if (mode === 'single') {
+    datasetForm.secondaryModality = ''
+    datasetForm.secondaryTimeOffset = 0
+    datasetForm.secondaryVideo = null
+  } else {
+    datasetForm.secondaryModality = availableSecondaryModalities.value[0] || ''
+  }
+  refreshAnnotationModelDefault()
+}
+
+const handleSecondaryVideoChange = (uploadFile: any) => {
+  const file = uploadFile.raw as File | undefined
+  if (!file) return
+  if (file.size > 500 * 1024 * 1024) {
+    ElMessage.error('第二路视频不能超过500MB')
+    return
+  }
+  const extension = file.name.split('.').pop()?.toLowerCase()
+  if (!extension || !['mp4', 'avi', 'mov', 'mkv', 'flv', 'wmv'].includes(extension)) {
+    ElMessage.error('请上传支持的视频格式（MP4、AVI、MOV、MKV、FLV、WMV）')
+    return
+  }
+  datasetForm.secondaryVideo = file
+}
+
+const getDatasetGenerationStatusText = (status: NonNullable<VideoDetectionProgress['dataset_generation_status']>) => {
+  const labels = {
+    not_requested: '未开启',
+    pending: '等待中',
+    generating: '抽帧与标注中',
+    completed: '已生成待人工划分',
+    failed: '生成失败',
+  }
+  return labels[status]
+}
+
+const openDatasetDraft = (draftId: string) => {
+  router.push({ name: 'DatasetDraftSplit', params: { draftId } })
+}
+
 // 移除视频
 const removeVideo = (e: Event) => {
   e.stopPropagation()
@@ -693,6 +916,7 @@ const removeVideo = (e: Event) => {
   detectionForm.video = null
   videoPreview.value = ''
   videoFrameRate.value = null
+  videoDuration.value = 0
   frameRateDetecting.value = false // 重置帧率检测状态
   uploadRef.value?.clearFiles()
 
@@ -703,6 +927,7 @@ const removeVideo = (e: Event) => {
   }
   currentTaskId.value = ''
   taskProgress.value = { status: 0, progress: 0 }
+  datasetForm.secondaryVideo = null
 }
 
 // 执行视频识别
@@ -715,6 +940,20 @@ const handleDetect = async () => {
   if (!selectedVideo.value) {
     ElMessage.error('请选择视频')
     return
+  }
+  if (datasetForm.enabled) {
+    if (!datasetForm.name.trim()) {
+      ElMessage.error('请输入待划分数据集名称')
+      return
+    }
+    if (!datasetForm.annotationModelId) {
+      ElMessage.error('请选择兼容的自动标注模型')
+      return
+    }
+    if (datasetForm.mode === 'multimodal' && (!datasetForm.secondaryModality || !datasetForm.secondaryVideo)) {
+      ElMessage.error('多模态数据集需要选择第二模态并上传第二路视频')
+      return
+    }
   }
   
   try {
@@ -730,6 +969,7 @@ const handleDetect = async () => {
     // 使用实际的处理帧率
     const actualFrameRate = getActualFrameRate()
     formData.append('frame_rate', actualFrameRate.toString())
+    appendVideoDatasetFields(formData, datasetForm)
     
     // 如果实际帧率与设置不同，给出最终确认提示
     if (actualFrameRate !== detectionForm.frame_rate) {
@@ -738,6 +978,7 @@ const handleDetect = async () => {
     
     const response = await videoDetectionApi.detectVideo(formData)
     currentTaskId.value = response.id
+    videoCompletionNotified.value = false
     
     ElMessage.success(response.message || '视频识别任务创建成功')
     
@@ -774,19 +1015,24 @@ const startProgressPolling = () => {
       })
       
       taskProgress.value = progress
-      
-      // 如果已完成或失败，停止轮询
-      if (progress.status === VIDEO_DETECTION_STATUS.COMPLETED || 
-          progress.status === VIDEO_DETECTION_STATUS.FAILED) {
+
+      const videoFinished = progress.status === VIDEO_DETECTION_STATUS.COMPLETED ||
+        progress.status === VIDEO_DETECTION_STATUS.FAILED
+      const datasetStatus = progress.dataset_generation_status || 'not_requested'
+      const datasetFinished = ['not_requested', 'completed', 'failed'].includes(datasetStatus)
+      if (videoFinished && !videoCompletionNotified.value) {
+        videoCompletionNotified.value = true
+        if (progress.status === VIDEO_DETECTION_STATUS.COMPLETED) {
+          ElMessage.success('视频识别完成')
+        } else {
+          ElMessage.error('视频识别失败')
+        }
+      }
+      // 视频与数据集状态独立；视频完成后继续轮询，直到抽帧/标注结束。
+      if (videoFinished && datasetFinished) {
         if (progressTimer) {
           clearInterval(progressTimer)
           progressTimer = null
-        }
-        
-        if (progress.status === VIDEO_DETECTION_STATUS.COMPLETED) {
-          ElMessage.success('视频识别完成')
-        } else if (progress.status === VIDEO_DETECTION_STATUS.FAILED) {
-          ElMessage.error('视频识别失败')
         }
       }
     } catch (error) {
@@ -1492,6 +1738,44 @@ onMounted(() => {
   color: #909399;
 }
 
+.dataset-options {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin: 8px 0 22px 140px;
+  padding: 18px;
+  border: 1px solid #dce8f5;
+  border-radius: 8px;
+  background: #f8fbff;
+}
+
+.dataset-switch-row .dataset-help,
+.dataset-help,
+.dataset-file-name {
+  margin-left: 12px;
+  color: #7a8492;
+  font-size: 12px;
+}
+
+.dataset-warning {
+  display: block;
+  margin-top: 6px;
+  color: #e6a23c;
+  font-size: 12px;
+}
+
+.dataset-estimate {
+  color: #52657b;
+  font-size: 13px;
+}
+
+.dataset-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 16px;
+}
+
 @media (max-width: 768px) {
   .header-content {
     flex-direction: column;
@@ -1515,6 +1799,10 @@ onMounted(() => {
   
   .form-item-half {
     width: 100%;
+  }
+
+  .dataset-options {
+    margin-left: 0;
   }
 
   .video-preview {

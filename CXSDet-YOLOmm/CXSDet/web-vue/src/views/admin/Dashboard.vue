@@ -12,50 +12,36 @@
 
 <template>
   <div class="dashboard">
-    <!-- 统计概览区域 -->
-    <div class="stats-overview">
-      <div class="stats-grid">
-        <div class="stat-card">
-          <div class="stat-icon user-icon">
-            <el-icon><User /></el-icon>
-          </div>
-          <div class="stat-content">
-            <h3 class="stat-number">{{ stats.totalUsers }}</h3>
-            <p class="stat-label">总用户数</p>
-          </div>
-        </div>
-        
-        <div class="stat-card">
-          <div class="stat-icon dataset-icon">
-            <el-icon><Document /></el-icon>
-          </div>
-          <div class="stat-content">
-            <h3 class="stat-number">{{ stats.totalDatasets }}</h3>
-            <p class="stat-label">数据集数量</p>
-          </div>
-        </div>
-        
-        <div class="stat-card">
-          <div class="stat-icon model-icon">
-            <el-icon><DataLine /></el-icon>
-          </div>
-          <div class="stat-content">
-            <h3 class="stat-number">{{ stats.totalModels }}</h3>
-            <p class="stat-label">模型数量</p>
-          </div>
-        </div>
-        
-        <div class="stat-card">
-          <div class="stat-icon detection-icon">
-            <el-icon><Monitor /></el-icon>
-          </div>
-          <div class="stat-content">
-            <h3 class="stat-number">{{ stats.totalDetections }}</h3>
-            <p class="stat-label">总检测次数</p>
-          </div>
-        </div>
+    <header class="page-head">
+      <div>
+        <h1 class="page-title">管理控制台</h1>
+        <p class="page-sub">全系统的巡检规模与模型迭代概况。这里只统计已经发生的操作，不含预测值。</p>
       </div>
-    </div>
+    </header>
+
+    <!-- 统计概览区域 -->
+    <section class="metric-strip hx-panel">
+      <div class="metric">
+        <span class="metric-label">账号</span>
+        <span class="metric-value hx-mono">{{ stats.totalUsers }}</span>
+        <span class="metric-note">可登录的用户</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">数据集</span>
+        <span class="metric-value hx-mono">{{ stats.totalDatasets }}</span>
+        <span class="metric-note">含反馈版本</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">模型</span>
+        <span class="metric-value hx-mono">{{ stats.totalModels }}</span>
+        <span class="metric-note">含未发布版本</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">检测记录</span>
+        <span class="metric-value hx-mono">{{ stats.totalDetections }}</span>
+        <span class="metric-note">图片检测累计</span>
+      </div>
+    </section>
 
     <!-- 图表区域 -->
     <div class="charts-section">
@@ -208,8 +194,8 @@ const stats = ref({
 })
 
 // 时间范围选择
-const detectionTimeRange = ref('7')
-const userActivityRange = ref('7')
+const detectionTimeRange = ref('30')
+const userActivityRange = ref('30')
 
 // 检测记录相关
 const activeDetectionTab = ref('image')
@@ -1025,6 +1011,108 @@ onBeforeUnmount(() => {
   
   .stat-number {
     font-size: 28px;
+  }
+}
+
+/* —— 新版页头与指标条 —— */
+.dashboard {
+  padding: 0;
+  background: transparent;
+  min-height: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--hx-gap);
+}
+
+.page-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--hx-line);
+}
+
+.page-title {
+  margin: 0;
+  font-size: 20px;
+  line-height: 1.2;
+  font-weight: 600;
+  color: var(--hx-text);
+  padding-left: 10px;
+  border-left: 3px solid var(--hx-sea);
+}
+
+.page-sub {
+  margin: 6px 0 0 13px;
+  font-size: 12.5px;
+  color: var(--hx-text-2);
+}
+
+.metric-strip {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+}
+
+.metric {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 16px 18px;
+  border-right: 1px solid var(--hx-line);
+}
+
+.metric:last-child {
+  border-right: none;
+}
+
+.metric-label {
+  font-size: 12px;
+  color: var(--hx-text-3);
+}
+
+.metric-value {
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.15;
+  color: var(--hx-text);
+}
+
+.metric-note {
+  font-size: 11px;
+  color: var(--hx-text-3);
+}
+
+/* 图表卡片收敛为仪器面板 */
+.chart-card {
+  background: var(--hx-paper);
+  border: 1px solid var(--hx-line);
+  border-radius: var(--hx-radius);
+  padding: 0 0 12px;
+  box-shadow: var(--hx-shadow-panel);
+}
+
+.chart-header {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--hx-line);
+}
+
+.chart-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--hx-text);
+}
+
+.chart-container {
+  padding: 8px 12px 0;
+}
+
+@media (max-width: 900px) {
+  .metric-strip {
+    grid-template-columns: 1fr 1fr;
+  }
+  .metric {
+    border-bottom: 1px solid var(--hx-line);
   }
 }
 </style> 

@@ -47,6 +47,7 @@ pnpm-debug.log*
 .env.*
 !.env.example
 !.env.sample
+**/config.local.json
 
 # Runtime databases, logs, temporary files, and backups
 *.db
@@ -57,6 +58,7 @@ pnpm-debug.log*
 temp/
 tmp/
 backups/
+src.backup*/
 
 # Runtime-generated uploads and inference results
 CXSDet-YOLOmm/CXSDet/web-flask/file_store/

@@ -39,7 +39,7 @@ const routes: RouteRecordRaw[] = [
         name: 'Dashboard',
         component: () => import('@/views/Dashboard.vue'),
         meta: {
-          title: '首页',
+          title: '巡检工作台',
           requiresAuth: true
         }
       },
@@ -57,7 +57,7 @@ const routes: RouteRecordRaw[] = [
         name: 'ImageDetection',
         component: () => import('@/views/detection/ImageDetection.vue'),
         meta: {
-          title: '图片识别',
+          title: '图片巡检',
           requiresAuth: true
         }
       },
@@ -75,7 +75,7 @@ const routes: RouteRecordRaw[] = [
         name: 'VideoDetection',
         component: () => import('@/views/video-detection/VideoDetection.vue'),
         meta: {
-          title: '视频识别',
+          title: '视频巡检',
           requiresAuth: true
         }
       },
@@ -84,7 +84,7 @@ const routes: RouteRecordRaw[] = [
         name: 'VideoDetectionRecords',
         component: () => import('@/views/video-detection/VideoDetectionRecords.vue'),
         meta: {
-          title: '视频识别记录',
+          title: '视频记录',
           requiresAuth: true
         }
       },
@@ -93,7 +93,7 @@ const routes: RouteRecordRaw[] = [
         name: 'RealtimeDetection',
         component: () => import('@/views/realtime-detection/RealtimeDetection.vue'),
         meta: {
-          title: '实时检测',
+          title: '实时巡检',
           requiresAuth: true
         }
       },
@@ -102,7 +102,7 @@ const routes: RouteRecordRaw[] = [
         name: 'RealtimeDetectionRecords',
         component: () => import('@/views/realtime-detection/RealtimeDetectionRecords.vue'),
         meta: {
-          title: '实时检测记录',
+          title: '实时记录',
           requiresAuth: true
         }
       }
@@ -147,6 +147,16 @@ const routes: RouteRecordRaw[] = [
         }
       },
       {
+        path: 'datasets/:draftId/split',
+        name: 'DatasetDraftSplit',
+        component: () => import('@/views/admin/DatasetDraftSplit.vue'),
+        meta: {
+          title: '待划分数据集',
+          requiresAuth: true,
+          requiresAdmin: true
+        }
+      },
+      {
         path: 'models',
         name: 'ModelManagement',
         component: () => import('@/views/admin/ModelManagement.vue'),
@@ -172,7 +182,7 @@ router.beforeEach((to, from, next) => {
   const requiresAdmin = to.matched.some(record => record.meta.requiresAdmin)
 
   // 设置页面标题
-  document.title = `${to.meta.title} - 光伏板缺陷检测分析系统`
+  document.title = `${to.meta.title} · 海上风电场检测系统`
 
   if (requiresAuth) {
     if (!userStore.isLoggedIn()) {
@@ -189,4 +199,4 @@ router.beforeEach((to, from, next) => {
   next()
 })
 
-export default router 
+export default router

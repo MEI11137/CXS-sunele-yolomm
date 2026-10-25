@@ -9,65 +9,81 @@
 <template>
   <div class="detection-records">
     <!-- 页面头部 -->
-    <div class="page-header">
-      <div class="header-content">
-        <div class="header-left">
-          <h1 class="page-title">图片识别记录</h1>
-          <p class="page-subtitle">查看和管理所有图片识别历史记录</p>
-        </div>
-        <div class="header-right">
-          <el-button type="primary" @click="$router.push('/detection')" class="new-btn">
-            <el-icon><Plus /></el-icon>
-            新建识别
-          </el-button>
-        </div>
+    <header class="page-head">
+      <div class="head-text">
+        <h1 class="page-title">识别记录</h1>
+        <p class="page-sub">
+          每条记录都要走完三步：模型检测给证据，AI 辅助核查指疑点，最后必须由人确认。
+          <strong>未经人工确认的记录不会进入训练数据。</strong>
+        </p>
       </div>
-    </div>
+      <div class="head-actions">
+        <el-button type="primary" @click="$router.push('/detection')">
+          <el-icon><Plus /></el-icon>
+          新建巡检
+        </el-button>
+      </div>
+    </header>
 
     <!-- 主要内容区域 -->
     <div class="main-content">
-      <!-- 搜索和统计区域 -->
-      <el-card class="search-card" shadow="never">
-        <div class="search-section">
-          <div class="search-left">
-            <el-input
-              v-model="searchQuery"
-              placeholder="搜索标题、描述或模型名称"
-              class="search-input"
-              @input="handleSearch"
-              @keyup.enter="handleSearch"
-              clearable
+      <!-- 筛选条 -->
+      <section class="filter-bar hx-panel">
+        <div class="filter-row">
+          <el-input
+            v-model="searchQuery"
+            placeholder="搜索标题、描述或模型名称"
+            class="filter-search"
+            @input="handleSearch"
+            @keyup.enter="handleSearch"
+            clearable
+          >
+            <template #prefix>
+              <el-icon><Search /></el-icon>
+            </template>
+          </el-input>
+
+          <div class="filter-group" role="group" aria-label="按人工确认状态筛选">
+            <span class="filter-label">人工确认</span>
+            <button
+              v-for="opt in humanFilterOptions"
+              :key="opt.value"
+              type="button"
+              class="chip"
+              :class="{ 'is-active': humanFilter === opt.value }"
+              @click="setHumanFilter(opt.value)"
             >
-              <template #prefix>
-                <el-icon><Search /></el-icon>
-              </template>
-            </el-input>
-            <div class="search-buttons">
-              <el-button 
-                type="primary" 
-                @click="handleSearch"
-                :loading="loading"
-                class="search-btn"
-              >
-                <el-icon><Search /></el-icon>
-                搜索
-              </el-button>
-              <el-button 
-                @click="handleClear"
-                class="clear-btn"
-              >
-                <el-icon><RefreshLeft /></el-icon>
-                清空
-              </el-button>
-            </div>
+              {{ opt.label }}
+              <span class="chip-num hx-mono">{{ opt.count }}</span>
+            </button>
           </div>
-          <div class="search-right">
-            <div class="stats-info">
-              <span class="stats-text">共 {{ total }} 条记录</span>
-            </div>
+
+          <div class="filter-group">
+            <span class="filter-label">AI 核查</span>
+            <el-select
+              v-model="aiFilter"
+              size="small"
+              class="filter-select"
+              @change="onFilterChange"
+            >
+              <el-option
+                v-for="opt in aiFilterOptions"
+                :key="opt.value"
+                :label="opt.label"
+                :value="opt.value"
+              />
+            </el-select>
+          </div>
+
+          <div class="filter-tail">
+            <el-button v-if="hasFilter" link type="primary" @click="resetFilters">清除筛选</el-button>
+            <span class="filter-count">
+              <template v-if="hasFilter">{{ filteredRecords.length }} / {{ allRecords.length }} 条</template>
+              <template v-else>共 {{ allRecords.length }} 条</template>
+            </span>
           </div>
         </div>
-      </el-card>
+      </section>
 
       <!-- 记录列表 -->
       <el-card class="records-card" shadow="never">
@@ -111,110 +127,120 @@
           </template>
         </el-alert>
         <el-table
-          :data="recordList"
+          :data="pagedRecords"
           v-loading="loading"
           class="records-table"
-          border
-          stripe
+          row-key="id"
           @selection-change="handleSelectionChange"
         >
-          <el-table-column type="selection" width="50" align="center" />
-          <el-table-column prop="title" label="标题" width="160" show-overflow-tooltip align="center">
+          <el-table-column type="selection" width="44" align="center" />
+
+          <el-table-column label="记录" min-width="210">
             <template #default="scope">
-              <div class="title-cell">
-                <span class="title-text">{{ scope.row.title }}</span>
+              <div class="record-cell">
+                <button type="button" class="record-title" @click="viewRecord(scope.row)">
+                  {{ scope.row.title }}
+                </button>
+                <div class="record-meta">
+                  <span class="hx-mono">{{ shortId(scope.row.id) }}</span>
+                  <span class="sep" />
+                  <span class="truncate">{{ scope.row.model_name }}</span>
+                </div>
               </div>
             </template>
           </el-table-column>
-          
-          <el-table-column prop="model_name" label="使用模型" width="180" align="center">
+
+          <el-table-column label="模型检测" width="112" align="center">
             <template #default="scope">
-              <el-tag type="primary" size="small">{{ scope.row.model_name }}</el-tag>
+              <span v-if="getDetectionCount(scope.row) > 0" class="count-cell">
+                <span class="hx-mono count-num">{{ getDetectionCount(scope.row) }}</span>
+                <span class="count-unit">处</span>
+              </span>
+              <span v-else class="count-empty">未见缺陷</span>
             </template>
           </el-table-column>
 
-          <el-table-column prop="source_dataset_name" label="原训练数据集" width="180" align="center" show-overflow-tooltip>
+          <el-table-column label="AI 辅助核查" width="148" align="center">
             <template #default="scope">
-              <el-tag v-if="scope.row.source_dataset_name" type="success" size="small">
-                {{ scope.row.source_dataset_name }}
-              </el-tag>
-              <el-tag v-else type="danger" size="small">未关联</el-tag>
+              <StatusPill :meta="aiStatusOf(scope.row.ai_review_status)" size="sm" />
             </template>
           </el-table-column>
 
-          <el-table-column label="X 模态" width="120" align="center">
+          <el-table-column label="人工确认" width="126" align="center">
             <template #default="scope">
-              <el-tag v-if="scope.row.secondary_image_url" type="warning" size="small">
-                {{ scope.row.secondary_image_origin === 'generated' ? '自动生成' : '已上传' }}
-              </el-tag>
-              <span v-else>-</span>
+              <StatusPill :meta="humanStatusOf(scope.row.human_review_status)" size="sm" />
             </template>
           </el-table-column>
 
-          <el-table-column label="复核状态" width="130" align="center">
+          <el-table-column v-if="userStore.isAdmin()" label="提交人" width="92" align="center">
             <template #default="scope">
-              <el-tag type="info" size="small">{{ scope.row.human_review_status || 'pending' }}</el-tag>
+              <span class="muted">{{ scope.row.user_name || '—' }}</span>
             </template>
           </el-table-column>
-          
-          <el-table-column v-if="userStore.isAdmin()" prop="user_name" label="用户" width="120" align="center">
+
+          <el-table-column label="时间" width="112" align="center">
             <template #default="scope">
-              <el-tag type="info" size="small">{{ scope.row.user_name }}</el-tag>
+              <span class="muted hx-mono" :title="formatDateTime(scope.row.create_time)">
+                {{ formatShortTime(scope.row.create_time) }}
+              </span>
             </template>
           </el-table-column>
-          
-          <el-table-column label="检测结果" width="140" align="center">
+
+          <el-table-column label="操作" width="196" align="center" fixed="right">
             <template #default="scope">
-              <div class="detection-result">
-                <el-tag v-if="getDetectionCount(scope.row) > 0" type="success" size="small">
-                  <el-icon><Check /></el-icon>
-                  {{ getDetectionCount(scope.row) }} 个对象
-                </el-tag>
-                <el-tag v-else type="info" size="small">
-                  <el-icon><Close /></el-icon>
-                  无检测结果
-                </el-tag>
-              </div>
-            </template>
-          </el-table-column>
-          
-          <el-table-column prop="description" label="描述" show-overflow-tooltip>
-            <template #default="scope">
-              <span class="description-text">{{ scope.row.description || '-' }}</span>
-            </template>
-          </el-table-column>
-          
-          <el-table-column label="操作" width="330" align="center" fixed="right">
-            <template #default="scope">
-              <div class="action-buttons">
-                <el-button size="small" @click="viewRecord(scope.row)" class="action-btn view-btn">
-                  <el-icon><View /></el-icon>
-                  查看
-                </el-button>
-                <el-button size="small" @click="editRecord(scope.row)" class="action-btn edit-btn">
-                  <el-icon><Edit /></el-icon>
-                  编辑
-                </el-button>
+              <div class="row-actions">
+                <el-button
+                  v-if="scope.row.human_review_status === 'pending'"
+                  size="small"
+                  type="primary"
+                  @click="viewRecord(scope.row)"
+                >核对</el-button>
+                <el-button v-else size="small" @click="viewRecord(scope.row)">查看</el-button>
                 <el-button
                   size="small"
-                  type="warning"
+                  text
                   :loading="aiReviewLoading === scope.row.id"
                   @click="reviewWithAI(scope.row)"
+                >AI 核查</el-button>
+                <el-dropdown
+                  trigger="click"
+                  @command="(command: string) => handleRowCommand(command, scope.row as DetectionRecord)"
                 >
-                  AI复核
-                </el-button>
-                <el-button 
-                  size="small" 
-                  type="danger" 
-                  @click="deleteRecord(scope.row.id, scope.row.title)"
-                  class="action-btn delete-btn"
-                >
-                  <el-icon><Delete /></el-icon>
-                  删除
-                </el-button>
+                  <el-button size="small" text class="more-btn">
+                    更多
+                    <el-icon class="more-icon"><ArrowDown /></el-icon>
+                  </el-button>
+                  <template #dropdown>
+                    <el-dropdown-menu>
+                      <el-dropdown-item command="edit">编辑标题与描述</el-dropdown-item>
+                      <el-dropdown-item command="delete" divided>删除这条记录</el-dropdown-item>
+                    </el-dropdown-menu>
+                  </template>
+                </el-dropdown>
               </div>
             </template>
           </el-table-column>
+
+          <template #empty>
+            <EmptyState
+              v-if="hasFilter"
+              title="没有符合筛选条件的记录"
+              description="换一个状态条件，或清除筛选查看全部记录。"
+            >
+              <template #action>
+                <el-button size="small" @click="resetFilters">清除筛选</el-button>
+              </template>
+            </EmptyState>
+            <EmptyState
+              v-else
+              title="还没有巡检记录"
+              description="上传第一张现场影像，系统会生成一条记录，等你核对标注。"
+            >
+              <template #action>
+                <el-button size="small" type="primary" @click="$router.push('/detection')">去上传影像</el-button>
+              </template>
+            </EmptyState>
+          </template>
         </el-table>
 
         <!-- 分页器 -->
@@ -223,7 +249,7 @@
             v-model:current-page="currentPage"
             v-model:page-size="pageSize"
             :page-sizes="[10, 20, 50, 100]"
-            :total="total"
+            :total="filteredRecords.length"
             layout="total, sizes, prev, pager, next, jumper"
             @size-change="handleSizeChange"
             @current-change="handleCurrentChange"
@@ -231,6 +257,7 @@
           />
         </div>
       </el-card>
+
     </div>
 
     <!-- 查看记录对话框 -->
@@ -243,6 +270,25 @@
       :style="{ 'max-width': '1400px' }"
     >
       <div v-if="currentRecord" class="record-detail">
+        <!-- 三级状态摘要：机器给了什么，人还没判 -->
+        <div class="status-strip">
+          <div class="status-cell">
+            <span class="status-label">模型检测</span>
+            <StatusPill :meta="recordStatusOf(currentRecord.record_status)" size="sm" />
+            <span class="status-note">{{ getDetectionCount(currentRecord) }} 处标注待核</span>
+          </div>
+          <div class="status-cell">
+            <span class="status-label">AI 辅助核查</span>
+            <StatusPill :meta="aiStatusOf(currentRecord.ai_review_status)" size="sm" />
+            <span class="status-note">{{ aiStatusOf(currentRecord.ai_review_status).meaning }}</span>
+          </div>
+          <div class="status-cell">
+            <span class="status-label">人工确认</span>
+            <StatusPill :meta="humanStatusOf(currentRecord.human_review_status)" size="sm" />
+            <span class="status-note">{{ humanStatusOf(currentRecord.human_review_status).meaning }}</span>
+          </div>
+        </div>
+
         <!-- 基本信息 -->
         <div class="detail-section">
           <div class="section-header">
@@ -257,7 +303,7 @@
 
             <div v-if="currentRecord.secondary_image_url" class="image-container">
               <div class="image-header">
-                <h4>X 模态图片</h4>
+                <h4>辅助影像（第二模态）</h4>
                 <el-tag type="warning" size="small">
                   {{ currentRecord.secondary_image_origin === 'generated' ? '自动生成' : '上传' }}
                 </el-tag>
@@ -265,7 +311,7 @@
               <div class="image-wrapper">
                 <el-image
                   :src="currentRecord.secondary_image_url"
-                  alt="X模态图片"
+                  alt="辅助影像"
                   class="result-image"
                   fit="contain"
                   :preview-src-list="getPreviewImages(currentRecord)"
@@ -307,13 +353,13 @@
         <div class="detail-section">
           <div class="section-header">
             <el-icon class="section-icon"><Picture /></el-icon>
-            <h3 class="section-title">图片对比</h3>
+            <h3 class="section-title">证据对照：原图与检测结果</h3>
           </div>
           
           <div class="result-images">
             <div class="image-container">
               <div class="image-header">
-                <h4>原始图片</h4>
+                <h4>现场影像</h4>
                 <el-tag type="info" size="small">输入</el-tag>
               </div>
               <div class="image-wrapper">
@@ -338,7 +384,7 @@
             
             <div v-if="currentRecord.result_image_url" class="image-container">
               <div class="image-header">
-                <h4>识别结果图片</h4>
+                <h4>标注结果</h4>
                 <el-tag type="success" size="small">输出</el-tag>
               </div>
               <div class="image-wrapper">
@@ -363,7 +409,7 @@
             
             <div v-if="currentRecord.enhanced_image_url" class="image-container">
               <div class="image-header">
-                <h4>图像增强结果</h4>
+                <h4>增强处理结果</h4>
                 <el-tag type="warning" size="small">增强</el-tag>
               </div>
               <div class="image-wrapper">
@@ -392,7 +438,7 @@
         <div v-if="getDetections(currentRecord).length > 0" class="detail-section">
           <div class="section-header">
             <el-icon class="section-icon"><List /></el-icon>
-            <h3 class="section-title">检测详情</h3>
+            <h3 class="section-title">模型给出的标注</h3>
           </div>
           
           <div class="detections-container">
@@ -435,7 +481,7 @@
         <div class="detail-section human-review-panel">
           <div class="section-header">
             <el-icon class="section-icon"><Edit /></el-icon>
-            <h3 class="section-title">人工标注确认</h3>
+            <h3 class="section-title">人工确认标注</h3>
             <el-tag type="info">版本 {{ currentRecord.review_version || 0 }}</el-tag>
           </div>
           <el-alert
@@ -556,12 +602,12 @@
               <template #default="scope">
                 <el-select v-model="scope.row.class_name" @change="syncClassId(scope.row)">
                   <el-option
-                    v-for="(value, key, index) in yoloClasses"
-                    :key="key"
-                    :label="value.chinese_name"
-                    :value="key"
+                    v-for="(name, index) in reviewClassNames"
+                    :key="index"
+                    :label="getClassDisplayName(name)"
+                    :value="name"
                   >
-                    <span>{{ index }} - {{ value.chinese_name }}</span>
+                    <span>{{ index }} - {{ getClassDisplayName(name) }}</span>
                   </el-option>
                 </el-select>
               </template>
@@ -609,7 +655,7 @@
         <div v-if="currentRecord.analysis_result" class="detail-section">
           <div class="section-header">
             <el-icon class="section-icon"><ChatDotRound /></el-icon>
-            <h3 class="section-title">大模型缺陷分析结果</h3>
+            <h3 class="section-title">多模态分析描述</h3>
             <el-tooltip content="支持 Markdown 格式" placement="top">
               <el-icon class="info-icon"><InfoFilled /></el-icon>
             </el-tooltip>
@@ -626,7 +672,7 @@
         <div v-if="currentRecord.ai_review_result" class="detail-section">
           <div class="section-header">
             <el-icon class="section-icon"><ChatDotRound /></el-icon>
-            <h3 class="section-title">AI辅助复核（需人工确认）</h3>
+            <h3 class="section-title">AI 辅助核查结论（仅作线索）</h3>
           </div>
           <el-alert
             :title="parseAIReview(currentRecord.ai_review_result).summary"
@@ -695,7 +741,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, reactive } from 'vue'
+import { ref, onMounted, reactive, computed } from 'vue'
 import { ElMessage, ElMessageBox, ElForm } from 'element-plus'
 import { 
   Plus, 
@@ -711,7 +757,8 @@ import {
   MagicStick, 
   ChatDotRound, 
   Star,
-  RefreshLeft
+  RefreshLeft,
+  ArrowDown
 } from '@element-plus/icons-vue'
 import {
   detectionApi,
@@ -724,10 +771,15 @@ import {
 import { modelApi, type YoloClassesConfig } from '@/api/model'
 import { datasetApi } from '@/api/dataset'
 import { useUserStore } from '@/stores/user'
+import { useRoute } from 'vue-router'
 import { marked } from 'marked'
+import { aiStatusOf, humanStatusOf, recordStatusOf } from '@/constants/review'
+import StatusPill from '@/components/StatusPill.vue'
+import EmptyState from '@/components/EmptyState.vue'
 
 // 使用用户store
 const userStore = useUserStore()
+const route = useRoute()
 
 // 响应式数据
 const loading = ref(false)
@@ -755,6 +807,85 @@ const pageSize = ref(10)
 const searchQuery = ref('')
 const yoloClasses = ref<YoloClassesConfig>({})
 
+/**
+ * 状态筛选。
+ * 后端 /detection/records 目前只支持 page/page_size/search，没有状态参数，
+ * 因此这里一次性取回最多 200 条记录，在本地做筛选与分页。
+ * 记录量超过这个规模时，应改为后端参数并从 SQL 层过滤。
+ */
+const humanFilter = ref<'all' | 'pending' | 'confirmed' | 'rejected'>('all')
+const aiFilter = ref<string>('all')
+
+const allRecords = computed(() => recordList.value)
+
+const filteredRecords = computed(() =>
+  recordList.value.filter((record) => {
+    if (humanFilter.value !== 'all' && record.human_review_status !== humanFilter.value) return false
+    if (aiFilter.value !== 'all' && record.ai_review_status !== aiFilter.value) return false
+    return true
+  })
+)
+
+const pagedRecords = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value
+  return filteredRecords.value.slice(start, start + pageSize.value)
+})
+
+const hasFilter = computed(() => humanFilter.value !== 'all' || aiFilter.value !== 'all')
+
+const humanFilterOptions = computed(() => {
+  const count = (status: string) =>
+    recordList.value.filter((record) => record.human_review_status === status).length
+  return [
+    { value: 'all' as const, label: '全部', count: recordList.value.length },
+    { value: 'pending' as const, label: '待确认', count: count('pending') },
+    { value: 'confirmed' as const, label: '已确认', count: count('confirmed') },
+    { value: 'rejected' as const, label: '已驳回', count: count('rejected') }
+  ]
+})
+
+const aiFilterOptions = computed(() => {
+  const count = (status: string) =>
+    recordList.value.filter((record) => record.ai_review_status === status).length
+  return [
+    { value: 'all', label: '全部' },
+    { value: 'not_requested', label: `未核查（${count('not_requested')}）` },
+    { value: 'possible_false_positive', label: `疑有误报（${count('possible_false_positive')}）` },
+    { value: 'possible_missed_detection', label: `疑有漏检（${count('possible_missed_detection')}）` },
+    { value: 'needs_human_review', label: `需人工研判（${count('needs_human_review')}）` },
+    { value: 'consistent', label: `未见疑点（${count('consistent')}）` }
+  ]
+})
+
+const setHumanFilter = (value: 'all' | 'pending' | 'confirmed' | 'rejected') => {
+  humanFilter.value = value
+  currentPage.value = 1
+}
+
+const onFilterChange = () => {
+  currentPage.value = 1
+}
+
+const resetFilters = () => {
+  humanFilter.value = 'all'
+  aiFilter.value = 'all'
+  currentPage.value = 1
+}
+
+const shortId = (id: string) => (id ? id.slice(0, 8) : '—')
+
+/** 行尾"更多"菜单：编辑与删除不常点，收起来避免误触 */
+const handleRowCommand = (command: string, record: DetectionRecord) => {
+  if (command === 'edit') {
+    editRecord(record)
+    return
+  }
+  if (command === 'delete') {
+    deleteRecord(record.id, record.title)
+  }
+}
+
+
 // 对话框显示状态
 const showViewDialog = ref(false)
 const showEditDialog = ref(false)
@@ -773,6 +904,7 @@ const editLoading = ref(false)
 
 // 当前操作的记录
 const currentRecord = ref<DetectionRecord | null>(null)
+const reviewClassNames = computed(() => currentRecord.value?.class_names || [])
 
 const normalizeReviewAnnotations = async (record: DetectionRecord) => {
   const dimensions = await new Promise<{ width: number; height: number }>((resolve) => {
@@ -795,13 +927,14 @@ const normalizeReviewAnnotations = async (record: DetectionRecord) => {
     }
   }
   const detections = getDetections(record)
-  const classNames = Object.keys(yoloClasses.value)
+  const classNames = reviewClassNames.value
   reviewAnnotations.value = detections.map((item: any, index: number) => {
     const raw = (item.bbox || [0, 0, 1, 1]).map(Number)
     const normalized = raw.every((value: number) => value >= 0 && value <= 1)
       ? raw
       : [raw[0] / dimensions.width, raw[1] / dimensions.height, raw[2] / dimensions.width, raw[3] / dimensions.height]
-    const className = item.class_name || classNames[Number(item.class)] || classNames[0]
+    const classId = Number(item.class_id ?? item.class)
+    const className = classNames[classId] ?? item.class_name ?? ''
     return {
       class_name: className,
       class_id: classNames.indexOf(className),
@@ -813,7 +946,7 @@ const normalizeReviewAnnotations = async (record: DetectionRecord) => {
 }
 
 const syncClassId = (annotation: any) => {
-  annotation.class_id = Object.keys(yoloClasses.value).indexOf(annotation.class_name)
+  annotation.class_id = reviewClassNames.value.indexOf(annotation.class_name)
 }
 
 const annotationBoxStyle = (bbox: number[]) => ({
@@ -875,7 +1008,11 @@ const finishDrawing = (event: PointerEvent) => {
     drawingPreview.value = null
     return
   }
-  const className = Object.keys(yoloClasses.value)[0] || ''
+  const className = reviewClassNames.value[0]
+  if (!className) {
+    ElMessage.warning('当前记录没有可用的数据集类别，请重新打开记录')
+    return
+  }
   reviewAnnotations.value.push({ class_name: className, class_id: 0, bbox: [...bbox] })
   selectedAnnotationIndex.value = reviewAnnotations.value.length - 1
   drawingStart.value = null
@@ -917,6 +1054,12 @@ const handleNoDefectChange = (checked: boolean | string | number) => {
 
 const submitHumanReview = async () => {
   if (!currentRecord.value) return
+  if (!reviewNoDefect.value && reviewAnnotations.value.some(annotation =>
+    reviewClassNames.value[annotation.class_id] !== annotation.class_name
+  )) {
+    ElMessage.warning('存在与当前数据集不一致的类别，请为这些标注重新选择类别后再提交')
+    return
+  }
   try {
     humanReviewLoading.value = true
     const result = await detectionApi.submitHumanReview(currentRecord.value.id, {
@@ -1014,12 +1157,20 @@ const normalizeSuggestedBox = (rawBox: number[]): [number, number, number, numbe
 }
 
 const resolveSuggestedClass = (suggestedName: string) => {
-  const classNames = Object.keys(yoloClasses.value)
+  const classNames = reviewClassNames.value
   const directIndex = classNames.indexOf(suggestedName)
   if (directIndex >= 0) return { class_name: classNames[directIndex], class_id: directIndex }
   const chineseIndex = classNames.findIndex(name => yoloClasses.value[name]?.chinese_name === suggestedName)
-  const index = chineseIndex >= 0 ? chineseIndex : 0
-  return { class_name: classNames[index] || '', class_id: index }
+  if (chineseIndex >= 0) return { class_name: classNames[chineseIndex], class_id: chineseIndex }
+  // The weight file may use English aliases while the dataset names are Chinese.
+  try {
+    const detected = currentRecord.value ? JSON.parse(currentRecord.value.detection_result || '[]') : []
+    const matched = Array.isArray(detected) ? detected.find(item => item.class_name === suggestedName) : null
+    const index = matched ? Number(matched.class_id ?? matched.class) : -1
+    return classNames[index] ? { class_name: classNames[index], class_id: index } : null
+  } catch {
+    return null
+  }
 }
 
 const addMissedDetection = (suggestion: { class_name: string; bbox: number[]; reason: string }) => {
@@ -1030,6 +1181,11 @@ const addMissedDetection = (suggestion: { class_name: string; bbox: number[]; re
     return
   }
   const classInfo = resolveSuggestedClass(suggestion.class_name)
+  if (!classInfo) {
+    ElMessage.warning('AI 建议的类别不属于当前数据集，请绘制标注框并人工选择类别')
+    drawMode.value = true
+    return
+  }
   const duplicated = reviewAnnotations.value.some(annotation =>
     annotation.class_name === classInfo.class_name
     && annotation.bbox.every((value, index) => Math.abs(value - bbox[index]) < 0.005)
@@ -1189,12 +1345,20 @@ const fetchYoloClasses = async () => {
 }
 
 // 获取记录列表
+// 紧凑时间：表格里只需要判断先后，完整时间放在悬停提示里
+const formatShortTime = (dateTime: string): string => {
+  const d = new Date(dateTime)
+  if (Number.isNaN(d.getTime())) return dateTime
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
 const fetchRecords = async () => {
   try {
     loading.value = true
     const response = await detectionApi.getRecords({
-      page: currentPage.value,
-      page_size: pageSize.value,
+      page: 1,
+      page_size: 200,
       search: searchQuery.value
     })
     recordList.value = response.records
@@ -1236,7 +1400,10 @@ const getDetectionCount = (record: any): number => {
 const getDetections = (record: any): any[] => {
   try {
     const detections = JSON.parse(record.detection_result)
-    return Array.isArray(detections) ? detections : []
+    return Array.isArray(detections) ? detections.map(item => ({
+      ...item,
+      class_name: record.class_names?.[Number(item.class_id ?? item.class)] ?? item.class_name
+    })) : []
   } catch {
     return []
   }
@@ -1300,19 +1467,18 @@ const handleSearch = () => {
 const handleClear = () => {
   searchQuery.value = ''
   currentPage.value = 1
+  resetFilters()
   fetchRecords()
 }
 
-// 分页处理
+// 分页处理（在已加载的记录内分页）
 const handleSizeChange = (size: number) => {
   pageSize.value = size
   currentPage.value = 1
-  fetchRecords()
 }
 
 const handleCurrentChange = (page: number) => {
   currentPage.value = page
-  fetchRecords()
 }
 
 // 查看记录
@@ -1419,6 +1585,16 @@ onMounted(async () => {
     fetchRecords(),
     fetchYoloClasses()
   ])
+  // 从工作台点"去确认"会带上记录编号，直接打开对应记录
+  const recordId = typeof route.query.record === 'string' ? route.query.record : ''
+  if (recordId) {
+    const target = recordList.value.find((item) => item.id === recordId)
+    if (target) {
+      await viewRecord(target)
+    } else {
+      ElMessage.warning('未找到指定的记录，请刷新列表后重试')
+    }
+  }
 })
 </script>
 
@@ -1620,54 +1796,264 @@ onMounted(async () => {
 }
 
 .detection-records {
-  padding: 20px;
-}
-
-.page-header {
-  background-color: #fff;
-  padding: 20px 0;
-  margin-bottom: 20px;
-  box-shadow: 0 2px 12px 0 rgba(0, 0, 0, 0.1);
-  border-radius: 8px;
-}
-
-.header-content {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 0 20px;
+  flex-direction: column;
+  gap: var(--hx-gap);
 }
 
-.header-left {
-  flex: 1;
+.page-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--hx-line);
 }
 
 .page-title {
-  margin: 0 0 8px 0;
-  font-size: 28px;
-  color: #303133;
-  font-weight: bold;
+  margin: 0;
+  font-size: 20px;
+  line-height: 1.2;
+  font-weight: 600;
+  color: var(--hx-text);
+  padding-left: 10px;
+  border-left: 3px solid var(--hx-sea);
 }
 
-.page-subtitle {
-  font-size: 16px;
-  color: #606266;
-  margin-bottom: 10px;
+.page-sub {
+  margin: 6px 0 0 13px;
+  max-width: 760px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--hx-text-2);
 }
 
-.new-btn {
-  margin-left: 20px;
+.page-sub strong {
+  color: var(--hx-text);
+  font-weight: 600;
+}
+
+.head-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
 }
 
 .main-content {
-  max-width: 1200px;
-  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--hx-gap);
 }
 
-.search-card {
-  margin-bottom: 20px;
+/* —— 筛选条 —— */
+.filter-bar {
+  padding: 12px 16px;
+}
+
+.filter-row {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+
+.filter-search {
+  width: 260px;
+  flex-shrink: 0;
+}
+
+.filter-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.filter-label {
+  font-size: 12px;
+  color: var(--hx-text-3);
+  margin-right: 2px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--hx-line);
+  border-radius: 2px;
+  background: var(--hx-paper);
+  color: var(--hx-text-2);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.14s ease;
+}
+
+.chip:hover {
+  border-color: var(--hx-sea-line);
+  color: var(--hx-sea);
+}
+
+.chip.is-active {
+  border-color: var(--hx-sea);
+  background: var(--hx-sea-soft);
+  color: var(--hx-sea);
+  font-weight: 500;
+}
+
+.chip-num {
+  font-size: 11px;
+  color: var(--hx-text-3);
+}
+
+.chip.is-active .chip-num {
+  color: var(--hx-sea);
+}
+
+.filter-select {
+  width: 148px;
+}
+
+.filter-tail {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+
+.filter-count {
+  font-size: 12px;
+  color: var(--hx-text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+/* —— 表格单元 —— */
+.record-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.record-title {
+  border: none;
+  background: none;
+  padding: 0;
+  text-align: left;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--hx-text);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.record-title:hover {
+  color: var(--hx-sea);
+  text-decoration: underline;
+}
+
+.record-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--hx-text-3);
+  min-width: 0;
+}
+
+.record-meta .sep {
+  width: 1px;
+  height: 9px;
+  background: var(--hx-line-strong);
+  flex-shrink: 0;
+}
+
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.count-cell {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+}
+
+.count-num {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--hx-text);
+}
+
+.count-unit {
+  font-size: 11px;
+  color: var(--hx-text-3);
+}
+
+.count-empty {
+  font-size: 12px;
+  color: var(--hx-text-3);
+}
+
+.muted {
+  font-size: 12px;
+  color: var(--hx-text-2);
+}
+
+.row-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  flex-wrap: nowrap;
+}
+
+/* —— 详情状态条 —— */
+.status-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--hx-line);
+  border: 1px solid var(--hx-line);
+  border-radius: 2px;
+  margin-bottom: 18px;
+}
+
+.status-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 12px 14px;
+  background: var(--hx-paper);
+  min-width: 0;
+}
+
+.status-label {
+  font-size: 11px;
+  color: var(--hx-text-3);
+  letter-spacing: 0.02em;
+}
+
+.status-note {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--hx-text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 1100px) {
+  .status-strip {
+    grid-template-columns: 1fr;
+  }
+  .status-note {
+    white-space: normal;
+  }
 }
 
 .search-section {
@@ -2393,5 +2779,14 @@ onMounted(async () => {
   font-weight: 500;
   font-size: 15px;
   line-height: 1.4;
+}
+
+.more-btn {
+  padding: 5px 4px;
+}
+
+.more-icon {
+  margin-left: 2px;
+  font-size: 11px;
 }
 </style>

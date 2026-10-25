@@ -1,0 +1,223 @@
+/**
+ * 海巡智检 · 设计令牌
+ *
+ * 视觉母题取自海图本身：等深线栅格（细网格）+ 巡检准星（十字标线）。
+ * 因此界面用直角/微圆角面板、1px 冷灰分隔线、等宽数字，而不用通用 SaaS 的
+ * 大圆角卡片配柔和投影。
+ *
+ * 配色语义：
+ *   ink   舰桥深墨 —— 导航与标题等结构面
+ *   sea   海水青   —— 主操作色，代表"在巡检中"
+ *   beacon 航标橙 —— 仅用于"需要人来做的事"，不用于普通强调
+ *   defect 缺陷赤 —— 仅用于缺陷本身与破坏性操作
+ */
+
+:root {
+  /* —— 色板 —— */
+  --hx-ink: #0c2029;
+  --hx-ink-2: #16333e;
+  --hx-ink-3: #24485a;
+  --hx-sea: #0f6b6e;
+  --hx-sea-hover: #0b585b;
+  --hx-sea-soft: #e4efee;
+  --hx-sea-line: #bcd5d4;
+  --hx-beacon: #b8791c;
+  --hx-beacon-soft: #fbf2e2;
+  --hx-defect: #a63d33;
+  --hx-defect-soft: #f7e9e7;
+  --hx-ok: #2f6b4f;
+  --hx-ok-soft: #e7f0ea;
+  --hx-mist: #edf1f0;
+  --hx-paper: #ffffff;
+  --hx-line: #d9e0df;
+  --hx-line-strong: #c3cccb;
+  --hx-text: #1c2b31;
+  --hx-text-2: #4d5f66;
+  --hx-text-3: #7b8b90;
+
+  /* —— 字体 —— */
+  --hx-font-sans: 'PingFang SC', 'HarmonyOS Sans SC', 'Microsoft YaHei', 'Source Han Sans SC',
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --hx-font-mono: 'Cascadia Mono', 'JetBrains Mono', Consolas, 'SFMono-Regular', ui-monospace,
+    'Courier New', monospace;
+
+  /* —— 形状与层次 —— */
+  --hx-radius: 3px;
+  --hx-radius-lg: 6px;
+  --hx-shadow-panel: 0 1px 2px rgba(12, 32, 41, 0.06);
+  --hx-shadow-float: 0 10px 30px rgba(12, 32, 41, 0.14);
+
+  /* —— 间距 —— */
+  --hx-gap: 16px;
+  --hx-gap-lg: 24px;
+
+  /* —— Element Plus 覆盖 —— */
+  --el-color-primary: #0f6b6e;
+  --el-color-primary-light-3: #4a9395;
+  --el-color-primary-light-5: #87b6b7;
+  --el-color-primary-light-7: #c0d9da;
+  --el-color-primary-light-8: #d9e7e8;
+  --el-color-primary-light-9: #f0f6f6;
+  --el-color-primary-dark-2: #0a565a;
+
+  --el-color-success: #2f6b4f;
+  --el-color-warning: #b8791c;
+  --el-color-danger: #a63d33;
+  --el-color-error: #a63d33;
+  --el-color-info: #5a6b70;
+
+  --el-text-color-primary: #1c2b31;
+  --el-text-color-regular: #4d5f66;
+  --el-text-color-secondary: #7b8b90;
+  --el-text-color-placeholder: #a4b0b3;
+
+  --el-border-color: #d9e0df;
+  --el-border-color-light: #e4e9e8;
+  --el-border-color-lighter: #edf1f0;
+  --el-fill-color-blank: #ffffff;
+  --el-fill-color-light: #f4f7f6;
+
+  --el-border-radius-base: 3px;
+  --el-border-radius-small: 2px;
+  --el-font-family: var(--hx-font-sans);
+
+  --el-box-shadow-light: 0 1px 2px rgba(12, 32, 41, 0.06);
+}
+
+html,
+body {
+  font-family: var(--hx-font-sans);
+  color: var(--hx-text);
+  background: var(--hx-mist);
+}
+
+/* 数字一律等宽对齐，便于纵向比较置信度和编号 */
+.hx-num,
+.el-table td .cell .hx-num,
+.el-table .cell {
+  font-variant-numeric: tabular-nums;
+}
+
+.hx-mono {
+  font-family: var(--hx-font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+/* —— 面板：仪器面板而非电商卡片 —— */
+.hx-panel {
+  background: var(--hx-paper);
+  border: 1px solid var(--hx-line);
+  border-radius: var(--hx-radius);
+  box-shadow: var(--hx-shadow-panel);
+}
+
+.hx-panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--hx-line);
+}
+
+.hx-panel__title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--hx-text);
+}
+
+.hx-panel__body {
+  padding: 16px;
+}
+
+/* 组件栅格纹理：仅用于深色结构面 */
+.hx-grid-texture {
+  background-image: linear-gradient(to right, rgba(255, 255, 255, 0.045) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.045) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+
+/* 准星角标：标注"这是确切的位置/证据" */
+.hx-corner-mark {
+  position: relative;
+}
+
+.hx-corner-mark::before,
+.hx-corner-mark::after {
+  content: '';
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  border-color: var(--hx-sea);
+  border-style: solid;
+  pointer-events: none;
+}
+
+.hx-corner-mark::before {
+  top: 0;
+  left: 0;
+  border-width: 1px 0 0 1px;
+}
+
+.hx-corner-mark::after {
+  right: 0;
+  bottom: 0;
+  border-width: 0 1px 1px 0;
+}
+
+/* —— 状态点 —— */
+.hx-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+/* —— 可访问性 —— */
+:focus-visible {
+  outline: 2px solid var(--hx-sea);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* —— Element Plus 细节收敛 —— */
+.el-button {
+  font-weight: 500;
+}
+
+.el-card {
+  border-radius: var(--hx-radius);
+  border-color: var(--hx-line);
+}
+
+.el-table th.el-table__cell {
+  background: #f4f7f6;
+  font-weight: 600;
+  color: var(--hx-text-2);
+}
+
+.el-table {
+  font-size: 13px;
+}
+
+.el-dialog {
+  border-radius: var(--hx-radius-lg);
+}
+
+.el-tag {
+  border-radius: 2px;
+}

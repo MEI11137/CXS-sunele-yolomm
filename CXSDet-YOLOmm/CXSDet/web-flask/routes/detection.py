@@ -471,7 +471,8 @@ def get_detection_records():
         data_sql = f'''
             SELECT dr.*, u.real_name as user_name,
                    m.dataset_id as source_dataset_id,
-                   d.name as source_dataset_name
+                   d.name as source_dataset_name,
+                   d.structure_info as source_dataset_structure_info
             FROM detection_records dr
             LEFT JOIN user u ON dr.user_id = u.id
             LEFT JOIN models m ON dr.model_id = m.id
@@ -550,6 +551,8 @@ def llm_health():
     """验证当前用户配置的大模型和模型可见性，不返回凭据。"""
     try:
         return success(check_vl_health(LLMVLClient()))
+    except AIReviewError as exc:
+        return error(exc.public_message, 502), 502
     except Exception as exc:
         return error(f"大模型连接检查失败: {type(exc).__name__}")
 
@@ -646,7 +649,8 @@ def get_detection_record(record_id):
         record_data = db.query(f'''
             SELECT dr.*, u.real_name as user_name,
                    m.dataset_id as source_dataset_id,
-                   d.name as source_dataset_name
+                   d.name as source_dataset_name,
+                   d.structure_info as source_dataset_structure_info
             FROM detection_records dr
             LEFT JOIN user u ON dr.user_id = u.id
             LEFT JOIN models m ON dr.model_id = m.id

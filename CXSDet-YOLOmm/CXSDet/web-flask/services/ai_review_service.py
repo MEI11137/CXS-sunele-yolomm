@@ -32,6 +32,10 @@ class AIReviewUpstreamError(AIReviewError):
 
     public_message = UPSTREAM_FAILURE_SUMMARY
 
+    def __init__(self, message=UPSTREAM_FAILURE_SUMMARY):
+        super().__init__(message)
+        self.public_message = message
+
 
 ALLOWED_STATUSES = {
     "consistent",
@@ -144,6 +148,12 @@ def _public_exception_field(exc: Exception, field_name: str) -> str:
     return str(value) if type(value) is int and 100 <= value <= 599 else "unknown"
 
 
+def _upstream_failure_message(exc: Exception) -> str:
+    if _public_exception_field(exc, "status_code") == "401":
+        return "大模型 API 认证失败（401），请检查 API Key 与服务商地址是否匹配、密钥是否有效"
+    return UPSTREAM_FAILURE_SUMMARY
+
+
 def review_detection(record_id: str, client, database, storage_client) -> AIReviewResult:
     record = database.query(
         """
@@ -177,9 +187,10 @@ def review_detection(record_id: str, client, database, storage_client) -> AIRevi
                 _public_exception_field(exc, "status_code"),
                 _public_exception_field(exc, "code"),
             )
-            fallback = AIReviewResult("needs_human_review", UPSTREAM_FAILURE_SUMMARY)
+            message = _upstream_failure_message(exc)
+            fallback = AIReviewResult("needs_human_review", message)
             _persist_review(database, record_id, fallback)
-            raise AIReviewUpstreamError(UPSTREAM_FAILURE_SUMMARY) from exc
+            raise AIReviewUpstreamError(message) from exc
 
         try:
             result = _parse_review_payload(raw)
@@ -208,7 +219,10 @@ def review_detection(record_id: str, client, database, storage_client) -> AIRevi
 
 
 def check_vl_health(client) -> dict[str, Any]:
-    result = client.health_check()
+    try:
+        result = client.health_check()
+    except Exception as exc:
+        raise AIReviewUpstreamError(_upstream_failure_message(exc)) from exc
     return {
         "ok": bool(result.get("ok")),
         "model": result.get("model"),

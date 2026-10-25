@@ -17,25 +17,29 @@
       <div class="background-overlay"></div>
       <div class="content-wrapper">
         <div class="logo-section">
-          <h1 class="system-title">光伏板缺陷检测系统</h1>
+          <h1 class="system-title">海上风电场检测系统</h1>
         </div>
         <div class="intro-section">
           <p class="intro-description">
-            基于深度学习的光伏板缺陷检测系统，支持实时检测、批量处理、智能分析等功能。
-            提供高精度、高效率的缺陷识别服务，助力光伏电站运维效率提升。
+            面向海上风电场的巡检影像检测系统，支持图片、视频与实时检测，
+            并由人工确认结果回流训练，持续迭代模型。
           </p>
           <div class="feature-list">
             <div class="feature-item">
               <el-icon class="feature-icon"><Camera /></el-icon>
-              <span>实时检测</span>
+              <span>影像检测</span>
             </div>
             <div class="feature-item">
               <el-icon class="feature-icon"><DataAnalysis /></el-icon>
-              <span>智能分析</span>
+              <span>AI 辅助核查</span>
+            </div>
+            <div class="feature-item">
+              <el-icon class="feature-icon"><User /></el-icon>
+              <span>人工确认</span>
             </div>
             <div class="feature-item">
               <el-icon class="feature-icon"><TrendCharts /></el-icon>
-              <span>数据统计</span>
+              <span>样本回流后迭代模型</span>
             </div>
           </div>
         </div>
@@ -48,7 +52,7 @@
         <div class="login-header">
           <img src="@/assets/images/logo.png" alt="Logo" class="header-logo" />
           <h2 class="login-title">用户登录</h2>
-          <p class="login-subtitle">欢迎使用光伏板缺陷检测系统</p>
+          <p class="login-subtitle">欢迎使用海上风电场检测系统</p>
         </div>
         
         <el-form
@@ -104,7 +108,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import type { FormInstance } from 'element-plus'
-import { Camera, DataAnalysis, TrendCharts } from '@element-plus/icons-vue'
+import { Camera, DataAnalysis, TrendCharts, User } from '@element-plus/icons-vue'
 import { useUserStore } from '@/stores/user'
 import { useRoute, useRouter } from 'vue-router'
 
@@ -165,41 +169,65 @@ const handleLogin = async () => {
 .left-section {
   flex: 1;
   position: relative;
-  background: url('@/assets/images/login-bg.jpg') no-repeat center center;
-  background-size: cover;
+  background-color: var(--hx-ink);
+  background-image: linear-gradient(135deg, #0c2029 0%, #123642 55%, #0f4a4d 100%);
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
+  overflow: hidden;
+}
+
+/* 等深线栅格：与主系统一致的结构纹理 */
+.left-section::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image: linear-gradient(to right, rgba(255, 255, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.05) 1px, transparent 1px);
+  background-size: 28px 28px;
+  pointer-events: none;
+}
+
+/* 一道巡检扫描线 */
+.left-section::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 38%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(99, 194, 189, 0.55), transparent);
+  pointer-events: none;
 }
 
 .background-overlay {
   position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: rgba(0, 0, 0, 0.2);
+  inset: 0;
+  background: radial-gradient(circle at 78% 18%, rgba(63, 168, 164, 0.18), transparent 58%);
 }
 
 .content-wrapper {
   position: relative;
   z-index: 2;
-  text-align: center;
-  color: white;
-  max-width: 500px;
-  padding: 40px;
+  text-align: left;
+  color: #e8f1f0;
+  max-width: 560px;
+  padding: 0 64px;
 }
 
 .logo-section {
-  margin-bottom: 40px;
-  text-align: center;
+  margin-bottom: 34px;
 }
 
 .system-title {
-  font-size: 36px;
-  font-weight: 700;
+  font-size: 34px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
   margin: 0;
-  text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
+  color: #f2f8f7;
+  padding-left: 16px;
+  border-left: 3px solid #3fa8a4;
+  line-height: 1.25;
 }
 
 .intro-section {
@@ -207,32 +235,38 @@ const handleLogin = async () => {
 }
 
 .intro-title {
-  font-size: 24px;
+  font-size: 22px;
   font-weight: 600;
-  margin: 0 0 20px 0;
-  text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.5);
+  margin: 0 0 18px 0;
 }
 
 .intro-description {
-  font-size: 16px;
-  line-height: 1.6;
+  font-size: 14px;
+  line-height: 1.85;
   margin: 0 0 30px 0;
-  opacity: 0.9;
-  text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.3);
+  max-width: 460px;
+  color: #a9c2c6;
 }
 
 .feature-list {
   display: flex;
-  flex-direction: column;
-  gap: 15px;
+  flex-wrap: wrap;
+  gap: 10px 26px;
+  padding-top: 20px;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
 }
 
 .feature-item {
   display: flex;
   align-items: center;
-  gap: 12px;
-  font-size: 16px;
-  font-weight: 500;
+  gap: 8px;
+  font-size: 13px;
+  color: #cfe0de;
+}
+
+.feature-icon {
+  color: #63c2bd;
+  font-size: 14px;
 }
 
 .feature-icon {
@@ -288,28 +322,33 @@ const handleLogin = async () => {
 }
 
 .login-input :deep(.el-input__wrapper) {
-  border-radius: 8px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px var(--hx-line) inset;
 }
 
 .login-input :deep(.el-input__wrapper:hover) {
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  box-shadow: 0 0 0 1px var(--hx-sea-line) inset;
+}
+
+.login-input :deep(.el-input__wrapper.is-focus) {
+  box-shadow: 0 0 0 1px var(--hx-sea) inset;
 }
 
 .login-button {
   width: 100%;
-  height: 50px;
-  font-size: 16px;
-  font-weight: 600;
-  border-radius: 8px;
-  background: linear-gradient(135deg, #409EFF 0%, #66b1ff 100%);
+  height: 46px;
+  font-size: 15px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  border-radius: 2px;
+  background: var(--hx-sea);
   border: none;
-  box-shadow: 0 4px 12px rgba(64, 158, 255, 0.3);
+  box-shadow: none;
 }
 
 .login-button:hover {
-  background: linear-gradient(135deg, #66b1ff 0%, #409EFF 100%);
-  box-shadow: 0 6px 16px rgba(64, 158, 255, 0.4);
+  background: var(--hx-sea-hover);
+  box-shadow: none;
   transform: translateY(-2px);
 }
 

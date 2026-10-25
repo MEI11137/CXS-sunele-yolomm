@@ -1,18 +1,21 @@
+"""Visual-language model configuration; credentials stay on the local machine."""
+
+import json
+import os
+from pathlib import Path
 
 
-"""
-LLM配置文件
-"""
+_local_path = Path(__file__).with_name('config.local.json')
+_local = json.loads(_local_path.read_text(encoding='utf-8-sig')) if _local_path.is_file() else {}
 
-# 文字视觉多模态大语言模型
 VL_MODEL_CONFIGS = {
     'OpenAI-Plus-17634e': {
-        'name': 'gpt-5.6-sol',
-        'api_url': 'https://beeapi.ai/v1',
-        'api_key': 'sk-7ee6b23ee981f9f2df5acab52db1df3717c16664a08003551a33195800f0dc30',
-        'model': 'gpt-5.6-sol'
+        'name': 'DeepSeek Flash',
+        'api_url': os.environ.get('VL_API_URL', _local.get('api_url', 'https://api.deepseek.com')),
+        'api_key': os.environ.get('VL_API_KEY', _local.get('api_key', '')),
+        'model': os.environ.get('VL_MODEL', _local.get('model', 'deepseek-flash')),
     }
 }
 
-# 默认模型
-DEFAULT_VL_MODEL = 'gpt-5.6-sol'
+# A stable configuration ID keeps selection valid when the upstream model changes.
+DEFAULT_VL_MODEL = 'OpenAI-Plus-17634e'

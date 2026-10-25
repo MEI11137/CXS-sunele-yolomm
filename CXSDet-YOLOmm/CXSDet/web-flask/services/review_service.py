@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from config import YOLO_CLASSES_CONFIG
+from utils.dataset_classes import dataset_class_names
 
 
 class ReviewValidationError(ValueError):
@@ -34,17 +34,16 @@ class ReviewResult:
         return asdict(self)
 
 
-def _validate_annotations(annotations: Any) -> list[dict[str, Any]]:
+def _validate_annotations(annotations: Any, class_names: list[str]) -> list[dict[str, Any]]:
     if not isinstance(annotations, list):
         raise ReviewValidationError("annotations 必须是数组")
-    class_names = list(YOLO_CLASSES_CONFIG)
     normalized: list[dict[str, Any]] = []
     for index, item in enumerate(annotations):
         if not isinstance(item, dict):
             raise ReviewValidationError(f"第 {index + 1} 个标注格式错误")
         class_name = str(item.get("class_name") or "")
         class_id = item.get("class_id", item.get("class"))
-        if class_name not in YOLO_CLASSES_CONFIG:
+        if class_name not in class_names:
             raise ReviewValidationError(f"未知类别: {class_name}")
         if not isinstance(class_id, int) or class_id != class_names.index(class_name):
             raise ReviewValidationError(f"类别编号与类别名称不匹配: {class_name}")
@@ -80,11 +79,6 @@ def submit_human_review(
 ) -> ReviewResult:
     if decision not in {"confirmed", "no_defect", "rejected"}:
         raise ReviewValidationError("decision 必须是 confirmed、no_defect 或 rejected")
-    clean = _validate_annotations(annotations)
-    if decision == "confirmed" and not clean:
-        raise ReviewValidationError("空标注请明确选择 no_defect")
-    if decision == "no_defect" and clean:
-        raise ReviewValidationError("no_defect 不能同时包含标注框")
     try:
         expected_version = int(expected_version)
     except (TypeError, ValueError) as exc:
@@ -93,15 +87,29 @@ def submit_human_review(
     conn = database.get_connection()
     conn.row_factory = sqlite3.Row
     now = datetime.now(timezone.utc).isoformat()
-    annotations_json = json.dumps(clean, ensure_ascii=False, sort_keys=True)
     status = "confirmed" if decision in {"confirmed", "no_defect"} else "rejected"
     try:
         conn.execute("BEGIN IMMEDIATE")
         record = conn.execute(
-            "SELECT review_version FROM detection_records WHERE id = ?", (record_id,)
+            "SELECT * FROM detection_records WHERE id = ?", (record_id,)
         ).fetchone()
         if record is None:
             raise ReviewValidationError("识别记录不存在")
+        source = None
+        if "model_id" in record.keys() and record["model_id"]:
+            source = conn.execute(
+                "SELECT d.structure_info FROM models m "
+                "LEFT JOIN datasets d ON d.id = m.dataset_id WHERE m.id = ?",
+                (record["model_id"],),
+            ).fetchone()
+        clean = _validate_annotations(
+            annotations, dataset_class_names(source["structure_info"] if source else None)
+        )
+        if decision == "confirmed" and not clean:
+            raise ReviewValidationError("空标注请明确选择 no_defect")
+        if decision == "no_defect" and clean:
+            raise ReviewValidationError("no_defect 不能同时包含标注框")
+        annotations_json = json.dumps(clean, ensure_ascii=False, sort_keys=True)
         current_version = int(record["review_version"] or 0)
         if current_version != expected_version:
             raise ReviewConflictError(

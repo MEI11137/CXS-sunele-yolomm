@@ -10,6 +10,59 @@
  */
 
 import { request } from './request'
+import type { PublishedModel } from './detection'
+
+export interface VideoDatasetFormOptions {
+  enabled: boolean
+  name: string
+  description: string
+  mode: 'single' | 'multimodal'
+  frameInterval: number
+  annotationModelId: string
+  confidence: number
+  secondaryModality: string
+  secondaryTimeOffset: number
+  secondaryVideo: File | null
+}
+
+export function getCompatibleAnnotationModels(
+  models: PublishedModel[],
+  mode: 'single' | 'multimodal',
+  secondaryModality: string
+): PublishedModel[] {
+  return models.filter((model) =>
+    model.model_mode === mode &&
+    (mode === 'single' || model.secondary_modality === secondaryModality)
+  )
+}
+
+export function getDefaultAnnotationModelId(
+  detectionModel: PublishedModel | undefined,
+  mode: 'single' | 'multimodal',
+  secondaryModality: string
+): string {
+  if (!detectionModel || detectionModel.model_mode !== mode) return ''
+  if (mode === 'multimodal' && detectionModel.secondary_modality !== secondaryModality) return ''
+  return detectionModel.id
+}
+
+export function appendVideoDatasetFields(formData: FormData, options: VideoDatasetFormOptions): void {
+  if (!options.enabled) return
+  formData.append('generate_dataset', 'true')
+  formData.append('dataset_name', options.name.trim())
+  formData.append('dataset_description', options.description.trim())
+  formData.append('dataset_mode', options.mode)
+  formData.append('frame_interval', String(options.frameInterval))
+  formData.append('annotation_model_id', options.annotationModelId)
+  formData.append('annotation_confidence', String(options.confidence))
+  if (options.mode === 'multimodal') {
+    formData.append('secondary_modality', options.secondaryModality)
+    formData.append('secondary_time_offset', String(options.secondaryTimeOffset))
+    if (options.secondaryVideo) {
+      formData.append('secondary_video', options.secondaryVideo)
+    }
+  }
+}
 
 // 视频识别相关类型定义
 export interface VideoDetectionProgress {
@@ -23,6 +76,15 @@ export interface VideoDetectionProgress {
   frame_rate?: number               // 设置的帧率
   start_time?: string
   complete_time?: string
+  dataset_generation_status?: 'not_requested' | 'pending' | 'generating' | 'completed' | 'failed'
+  dataset_draft_id?: string | null
+  dataset_statistics?: {
+    extracted?: number
+    paired?: number
+    missing_secondary?: number
+    max_pairing_error_ms?: number | null
+    error?: string
+  }
 }
 
 export interface VideoDetectionRecord {
@@ -46,6 +108,9 @@ export interface VideoDetectionRecord {
   status: number
   title: string
   description?: string
+  dataset_generation_status?: VideoDetectionProgress['dataset_generation_status']
+  dataset_draft_id?: string | null
+  dataset_statistics?: VideoDetectionProgress['dataset_statistics']
 }
 
 export interface VideoDetectionRecordsResponse {
@@ -62,6 +127,16 @@ export interface CreateVideoDetectionRequest {
   confidence_threshold: number
   frame_rate: number
   video: File
+  generate_dataset?: boolean
+  dataset_name?: string
+  dataset_description?: string
+  dataset_mode?: 'single' | 'multimodal'
+  frame_interval?: number
+  annotation_model_id?: string
+  annotation_confidence?: number
+  secondary_modality?: string
+  secondary_time_offset?: number
+  secondary_video?: File
 }
 
 export interface UpdateVideoDetectionRequest {
@@ -103,7 +178,7 @@ export const getVideoStatusType = (status: number) => {
 export const videoDetectionApi = {
   // 提交视频识别任务
   detectVideo(formData: FormData) {
-    return request.post<{ id: string; message: string }>('/video-detection/detect', formData, {
+    return request.post<{ id: string; dataset_draft_id?: string | null; message: string }>('/video-detection/detect', formData, {
       headers: {
         'Content-Type': 'multipart/form-data'
       }

@@ -14,6 +14,9 @@ def test_legacy_schema_is_upgraded_idempotently_without_data_loss(tmp_path):
         """
         CREATE TABLE datasets (id TEXT PRIMARY KEY, name TEXT NOT NULL);
         CREATE TABLE models (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+        CREATE TABLE video_detection_records (
+            id TEXT PRIMARY KEY, user_id INTEGER, model_id TEXT
+        );
         CREATE TABLE detection_records (
             id TEXT PRIMARY KEY,
             user_id INTEGER NOT NULL,
@@ -70,6 +73,11 @@ def test_legacy_schema_is_upgraded_idempotently_without_data_loss(tmp_path):
         "feedback_dataset_id",
         "review_version",
     } <= _columns(conn, "detection_records")
+    assert {
+        "dataset_generation_status",
+        "dataset_draft_id",
+        "dataset_statistics",
+    } <= _columns(conn, "video_detection_records")
 
     tables = {
         row[0]
@@ -78,10 +86,63 @@ def test_legacy_schema_is_upgraded_idempotently_without_data_loss(tmp_path):
     assert "detection_record_reviews" in tables
     assert "feedback_samples" in tables
     assert "model_publish_audit" in tables
+    assert "dataset_drafts" in tables
+    assert "dataset_draft_samples" in tables
+
+    assert {
+        "id",
+        "name",
+        "creator_id",
+        "source_type",
+        "source_dataset_id",
+        "video_detection_record_id",
+        "dataset_mode",
+        "primary_modality",
+        "secondary_modality",
+        "workflow_status",
+        "metadata_json",
+        "error_message",
+        "create_time",
+        "update_time",
+        "finalized_at",
+    } <= _columns(conn, "dataset_drafts")
+    assert {
+        "id",
+        "draft_id",
+        "sample_key",
+        "split",
+        "rgb_bucket",
+        "rgb_object_key",
+        "secondary_image_bucket",
+        "secondary_image_object_key",
+        "label_bucket",
+        "label_object_key",
+        "annotations_json",
+        "frame_index",
+        "primary_timestamp",
+        "secondary_frame_index",
+        "secondary_timestamp",
+        "pairing_error_ms",
+        "pairing_state",
+        "create_time",
+        "update_time",
+    } <= _columns(conn, "dataset_draft_samples")
 
     indexes = {
         row[1]
         for row in conn.execute("PRAGMA index_list(feedback_samples)")
     }
     assert "uq_feedback_record_annotation" in indexes
+
+    draft_indexes = {
+        row[1] for row in conn.execute("PRAGMA index_list(dataset_drafts)")
+    }
+    assert "uq_dataset_draft_name" in draft_indexes
+
+    sample_indexes = {
+        row[1]
+        for row in conn.execute("PRAGMA index_list(dataset_draft_samples)")
+    }
+    assert "uq_dataset_draft_sample_key" in sample_indexes
+    assert "ix_dataset_draft_sample_split" in sample_indexes
     conn.close()

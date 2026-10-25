@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import stat
+import math
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
@@ -108,6 +109,58 @@ def _sample_keys(members: set[str], directory: str, split: str, extensions: set[
         if relative.suffix.lower() in extensions:
             keys.add(str(relative.with_suffix("")))
     return keys
+
+
+def _validate_yolo_labels(zip_path: str, archive_root: str, class_names: list[str]) -> None:
+    prefix = f"{archive_root}/" if archive_root else ""
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                normalized = _normalized_member(info.filename)
+                if not normalized.startswith(prefix):
+                    continue
+                relative = normalized[len(prefix):]
+                path = PurePosixPath(relative)
+                if len(path.parts) < 3 or path.parts[0] != "labels" or path.suffix.lower() != ".txt":
+                    continue
+                try:
+                    content = archive.read(info).decode("utf-8-sig")
+                except UnicodeDecodeError as exc:
+                    raise DatasetValidationError(f"YOLO标签不是UTF-8文本: {relative}") from exc
+                for line_number, line in enumerate(content.splitlines(), start=1):
+                    values = line.split()
+                    if not values:
+                        continue
+                    if len(values) != 5:
+                        raise DatasetValidationError(
+                            f"YOLO标签字段数量错误: {relative}:{line_number}"
+                        )
+                    try:
+                        class_id = int(values[0])
+                        x_center, y_center, width, height = map(float, values[1:])
+                    except ValueError as exc:
+                        raise DatasetValidationError(
+                            f"YOLO标签包含无效数字: {relative}:{line_number}"
+                        ) from exc
+                    coordinates = (x_center, y_center, width, height)
+                    if (
+                        class_id < 0
+                        or class_id >= len(class_names)
+                        or not all(math.isfinite(value) for value in coordinates)
+                        or not (0 <= x_center <= 1 and 0 <= y_center <= 1)
+                        or not (0 < width <= 1 and 0 < height <= 1)
+                        or x_center - width / 2 < 0
+                        or x_center + width / 2 > 1
+                        or y_center - height / 2 < 0
+                        or y_center + height / 2 > 1
+                    ):
+                        raise DatasetValidationError(
+                            f"YOLO标签类别或归一化坐标超出范围: {relative}:{line_number}"
+                        )
+    except zipfile.BadZipFile as exc:
+        raise DatasetValidationError("文件不是有效的ZIP归档") from exc
 
 
 def validate_dataset_archive(
@@ -216,6 +269,8 @@ def validate_dataset_archive(
         if len(missing) > 20:
             preview += f" 等{len(missing)}项"
         raise DatasetValidationError(f"数据集文件或配对缺失: {preview}")
+
+    _validate_yolo_labels(zip_path, archive_root, names)
 
     runtime_mapping = {
         "rgb_directory": rgb_directory,

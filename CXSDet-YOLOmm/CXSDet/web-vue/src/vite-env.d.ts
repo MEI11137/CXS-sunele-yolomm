@@ -21,3 +21,14 @@ declare module 'virtual:build-info' {
 }
 
 declare module 'element-plus/dist/locale/zh-cn.mjs'
+
+interface ImportMetaEnv {
+  /** 后端接口基址，例如 http://localhost:5020/api */
+  readonly VITE_API_URL: string
+  /** WorkBuddy 智能体分享链接；留空表示尚未接入 */
+  readonly VITE_AGENT_URL?: string
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv
+}

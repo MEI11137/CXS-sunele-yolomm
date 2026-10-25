@@ -17,7 +17,7 @@
         <div class="title-section">
           <h1 class="page-title">
             <el-icon class="title-icon"><VideoCamera /></el-icon>
-            实时光伏板缺陷检测
+            实时巡检
           </h1>
           <p class="page-subtitle">基于YOLO模型的实时图像检测与跟踪</p>
           <div class="resource-tip-inline">

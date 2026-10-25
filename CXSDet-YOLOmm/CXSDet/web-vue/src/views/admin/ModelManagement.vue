@@ -11,8 +11,11 @@
 
 <template>
   <div class="model-management">
-    <div class="header">
-      <h2>模型管理</h2>
+    <div class="header page-head">
+      <div>
+        <h2 class="page-title">模型管理</h2>
+        <p class="page-sub">训练、增量训练、父子对比和发布都在这一页。只有发布后的模型才会出现在巡检的可选列表中。</p>
+      </div>
       <div class="header-actions">
         <el-button @click="handleRefresh" :loading="refreshLoading" :disabled="loading">
           <el-icon><Refresh /></el-icon>
@@ -742,7 +745,7 @@ const handleRefresh = async () => {
 // 获取数据集选项
 const fetchDatasetOptions = async () => {
   try {
-    const response = await datasetApi.list({ page_size: 1000 })
+    const response = await datasetApi.list({ page_size: 200 })
     datasetOptions.value = response.datasets.filter(dataset => dataset.status === 1) // 只显示验证通过的数据集
   } catch (error) {
     console.error('Error fetching dataset options:', error)
@@ -1379,5 +1382,34 @@ onMounted(() => {
     gap: 16px;
     text-align: center;
   }
+}
+
+/* —— 统一页头 —— */
+.page-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--hx-line);
+  margin-bottom: var(--hx-gap);
+}
+
+.page-title {
+  margin: 0;
+  font-size: 20px;
+  line-height: 1.2;
+  font-weight: 600;
+  color: var(--hx-text);
+  padding-left: 10px;
+  border-left: 3px solid var(--hx-sea);
+}
+
+.page-sub {
+  margin: 6px 0 0 13px;
+  max-width: 720px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--hx-text-2);
 }
 </style>

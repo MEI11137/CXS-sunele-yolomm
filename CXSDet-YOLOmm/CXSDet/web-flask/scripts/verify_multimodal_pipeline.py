@@ -125,6 +125,28 @@ def _create_loop_database(path: Path) -> _SmokeDatabase:
           id TEXT PRIMARY KEY, record_id TEXT, dataset_id TEXT,
           annotation_hash TEXT, export_status TEXT, create_time TEXT
         );
+        CREATE TABLE dataset_drafts (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT,
+          creator_id INTEGER, source_type TEXT NOT NULL, source_dataset_id TEXT,
+          video_detection_record_id TEXT, dataset_mode TEXT NOT NULL,
+          primary_modality TEXT NOT NULL, secondary_modality TEXT,
+          workflow_status TEXT NOT NULL, metadata_json TEXT NOT NULL,
+          error_message TEXT, create_time TEXT NOT NULL, update_time TEXT NOT NULL,
+          finalized_at TEXT
+        );
+        CREATE TABLE dataset_draft_samples (
+          id TEXT PRIMARY KEY, draft_id TEXT NOT NULL, sample_key TEXT NOT NULL,
+          split TEXT NOT NULL, rgb_bucket TEXT, rgb_object_key TEXT,
+          secondary_image_bucket TEXT, secondary_image_object_key TEXT,
+          label_bucket TEXT, label_object_key TEXT, annotations_json TEXT NOT NULL,
+          frame_index INTEGER, primary_timestamp REAL,
+          secondary_frame_index INTEGER, secondary_timestamp REAL,
+          pairing_error_ms REAL, pairing_state TEXT NOT NULL,
+          create_time TEXT NOT NULL, update_time TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX uq_dataset_draft_name ON dataset_drafts(name);
+        CREATE UNIQUE INDEX uq_dataset_draft_sample_key
+          ON dataset_draft_samples(draft_id, sample_key);
         CREATE UNIQUE INDEX uq_feedback_record_annotation
           ON feedback_samples(record_id, annotation_hash);
         CREATE TABLE model_publish_audit (
@@ -149,8 +171,10 @@ def run_learning_loop_smoke(
     from services.detection_service import execute_detection
     from services.feedback_dataset_service import (
         add_confirmed_record,
-        create_feedback_dataset_version,
+        create_feedback_dataset_draft,
     )
+    from services.dataset_draft_service import assign_draft_samples
+    from services.dataset_finalization_service import finalize_draft
     from services.model_registry_service import compare_models, start_incremental_training
     from services.review_service import submit_human_review
 
@@ -210,11 +234,42 @@ def run_learning_loop_smoke(
     ai = review_detection(detected.record_id, FakeAI(), db, storage)
     human = submit_human_review(detected.record_id, 1, 0, [], "no_defect", db)
     sample = add_confirmed_record(detected.record_id, "feedback", db)
-    version = create_feedback_dataset_version(
-        "feedback", output_dir / "feedback-version", db, storage
+
+    second_rgb = output_dir / "second-rgb.png"
+    _sample_image(second_rgb, 5)
+    second_detected = execute_detection(
+        user_id=1,
+        model_meta={
+            "id": "parent",
+            "name": "smoke-parent",
+            "model_bucket": stored_weight["bucket"],
+            "model_object_key": stored_weight["objectKey"],
+            "model_mode": "multimodal",
+            "primary_modality": "rgb",
+            "secondary_modality": "edge",
+            "model_yaml": str(MULTIMODAL_BASELINE_YAML),
+        },
+        rgb_path=str(second_rgb),
+        x_path=None,
+        confidence=0.25,
+        work_dir=str(output_dir / "detect-second"),
+        storage_client=storage,
+        database=db,
     )
+    second_human = submit_human_review(second_detected.record_id, 1, 0, [], "no_defect", db)
+    second_sample = add_confirmed_record(second_detected.record_id, "feedback", db)
+    draft = create_feedback_dataset_draft(
+        "feedback", output_dir / "feedback-draft", 1, db, storage
+    )
+    draft_samples = db.query(
+        "SELECT id FROM dataset_draft_samples WHERE draft_id = ? ORDER BY sample_key",
+        (draft.id,),
+    )
+    assign_draft_samples(draft.id, [draft_samples[0]["id"]], "train", db)
+    assign_draft_samples(draft.id, [draft_samples[1]["id"]], "val", db)
+    finalized = finalize_draft(draft.id, output_dir / "feedback-final", db, storage)
     child = start_incremental_training(
-        "parent", version.dataset_id, {"epochs": 1, "batch_size": 1}, db
+        "parent", finalized.dataset_id, {"epochs": 1, "batch_size": 1}, db
     )
     comparison = compare_models("parent", child.model_id, db)
     record = db.query(
@@ -229,7 +284,10 @@ def run_learning_loop_smoke(
         "ai_review_status": ai.status,
         "human_review_status": human.status,
         "feedback_sample_created": sample.created,
-        "feedback_dataset_version": bool(version.dataset_id),
+        "second_feedback_review_status": second_human.status,
+        "second_feedback_sample_created": second_sample.created,
+        "feedback_dataset_draft": bool(draft.id),
+        "feedback_dataset_finalized": bool(finalized.dataset_id),
         "child_model_created": bool(child.model_id),
         "comparison_unknown_preserved": comparison.metrics["precision"]["status"] == "unknown",
     }

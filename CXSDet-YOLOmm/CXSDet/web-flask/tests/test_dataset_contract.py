@@ -163,6 +163,29 @@ def test_requested_mode_must_match_yaml(tmp_path):
         validate_dataset_archive(str(archive), "single")
 
 
+def test_archive_rejects_yolo_label_outside_class_mapping(tmp_path):
+    from services.dataset_contract import DatasetValidationError, validate_dataset_archive
+
+    files = _single_files()
+    files["labels/train/a.txt"] = "1 0.5 0.5 0.2 0.2"
+    archive = _write_zip(tmp_path / "bad-class.zip", files)
+
+    with pytest.raises(DatasetValidationError):
+        validate_dataset_archive(str(archive), "single")
+
+
+def test_archive_accepts_empty_label_as_background_sample(tmp_path):
+    from services.dataset_contract import validate_dataset_archive
+
+    files = _single_files()
+    files["labels/train/a.txt"] = ""
+    archive = _write_zip(tmp_path / "background.zip", files)
+
+    result = validate_dataset_archive(str(archive), "single")
+
+    assert result.split_counts["train"] == 1
+
+
 def test_safe_extract_rejects_path_traversal(tmp_path):
     from services.dataset_contract import DatasetValidationError, safe_extract_dataset
 

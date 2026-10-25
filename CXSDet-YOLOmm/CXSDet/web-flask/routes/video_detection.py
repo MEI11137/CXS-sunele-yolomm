@@ -11,6 +11,13 @@ from utils.db import db
 from utils.jwt_util import token_required
 from utils.models import VideoDetectionRecord, VideoDetectionRecordVO, VIDEO_DETECTION_STATUS
 from utils.security_utils import is_admin
+from services.dataset_draft_service import (
+    DraftValidationError,
+    create_draft,
+    ensure_dataset_name_available,
+    mark_draft_failed,
+)
+from services.video_dataset_service import VideoDatasetConfig, generate_video_dataset
 from utils.tracking_counter import UniqueTrackCounter
 from utils.video_writer import create_browser_video_writer
 from config import TEMP_DIR, YOLO_CLASSES_CONFIG
@@ -44,7 +51,10 @@ def get_class_color(class_name):
         # 默认颜色（绿色）
         return (0, 255, 0)
 
-def run_video_detection_process(record_id, user_id, model_id, model_name, video_path, confidence_threshold, frame_rate):
+def run_video_detection_process(
+    record_id, user_id, model_id, model_name, video_path, confidence_threshold, frame_rate,
+    dataset_config=None, dataset_model_meta=None, secondary_video_path=None,
+):
     """在后台进程中运行视频识别"""
     # 预先定义temp_dir，确保在finally块中能够访问
     temp_dir = os.path.join(TEMP_DIR, f"video_detection_{record_id}_{uuid.uuid4().hex[:8]}")
@@ -57,9 +67,13 @@ def run_video_detection_process(record_id, user_id, model_id, model_name, video_
         # 更新状态为处理中
         process_db.execute('''
             UPDATE video_detection_records 
-            SET status = ?, start_time = ?
+            SET status = ?, start_time = ?, dataset_generation_status = ?
             WHERE id = ?
-        ''', (VIDEO_DETECTION_STATUS['PROCESSING'], datetime.now().isoformat(), record_id))
+        ''', (
+            VIDEO_DETECTION_STATUS['PROCESSING'], datetime.now().isoformat(),
+            'generating' if dataset_config and dataset_config.get('enabled') else 'not_requested',
+            record_id,
+        ))
         
         # 获取模型信息
         model_data = process_db.query('''
@@ -486,6 +500,39 @@ def run_video_detection_process(record_id, user_id, model_id, model_name, video_
             ))
             
             print(f"视频处理任务完成，记录ID: {record_id}")
+
+            # Dataset generation is deliberately isolated: a dataset failure must not
+            # overwrite a successful video-detection status/result.
+            if dataset_config and dataset_config.get('enabled'):
+                try:
+                    dataset_summary = generate_video_dataset(
+                        dataset_config['draft_id'],
+                        VideoDatasetConfig(**dataset_config['config']),
+                        {
+                            'primary_video': video_path,
+                            'secondary_video': secondary_video_path,
+                            'work_dir': os.path.join(temp_dir, 'dataset'),
+                            'model_meta': dataset_model_meta,
+                        },
+                        process_db,
+                        file_client,
+                    )
+                    process_db.execute('''
+                        UPDATE video_detection_records
+                        SET dataset_generation_status = ?, dataset_statistics = ?
+                        WHERE id = ?
+                    ''', ('completed', json.dumps(dataset_summary, ensure_ascii=False), record_id))
+                except Exception as dataset_error:
+                    print(f"视频检测已完成，但数据集生成失败: {dataset_error}")
+                    try:
+                        mark_draft_failed(dataset_config['draft_id'], str(dataset_error), process_db)
+                    except Exception as mark_error:
+                        print(f"记录数据集失败状态时出错: {mark_error}")
+                    process_db.execute('''
+                        UPDATE video_detection_records
+                        SET dataset_generation_status = ?, dataset_statistics = ?
+                        WHERE id = ?
+                    ''', ('failed', json.dumps({'error': str(dataset_error)}, ensure_ascii=False), record_id))
             
         finally:
             # 清理临时目录
@@ -528,6 +575,16 @@ def run_video_detection_process(record_id, user_id, model_id, model_name, video_
             json.dumps(error_result),
             record_id
         ))
+        if dataset_config and dataset_config.get('enabled'):
+            try:
+                mark_draft_failed(dataset_config['draft_id'], str(e), process_db)
+            except Exception as mark_error:
+                print(f"记录数据集失败状态时出错: {mark_error}")
+            process_db.execute('''
+                UPDATE video_detection_records
+                SET dataset_generation_status = ?, dataset_statistics = ?
+                WHERE id = ?
+            ''', ('failed', json.dumps({'error': str(e)}, ensure_ascii=False), record_id))
         
         # 清理临时文件
         import shutil
@@ -539,8 +596,9 @@ def run_video_detection_process(record_id, user_id, model_id, model_name, video_
             
         # 清理上传的视频文件
         try:
-            if os.path.exists(video_path):
-                os.remove(video_path)
+            for path in (video_path, secondary_video_path):
+                if path and os.path.exists(path):
+                    os.remove(path)
             upload_dir = os.path.dirname(video_path)
             if os.path.exists(upload_dir) and not os.listdir(upload_dir):
                 os.rmdir(upload_dir)
@@ -553,8 +611,9 @@ def run_video_detection_process(record_id, user_id, model_id, model_name, video_
         
         # 最终清理：确保所有临时文件都被删除
         try:
-            if 'video_path' in locals() and os.path.exists(video_path):
-                os.remove(video_path)
+            for path in (locals().get('video_path'), locals().get('secondary_video_path')):
+                if path and os.path.exists(path):
+                    os.remove(path)
             # 清理上传目录
             if 'video_path' in locals():
                 upload_dir = os.path.dirname(video_path)
@@ -574,6 +633,10 @@ def detect_video():
         frame_rate = int(request.form.get('frame_rate', 30))
         title = request.form.get('title', '').strip()
         description = request.form.get('description', '').strip()
+        dataset_config = VideoDatasetConfig.from_form(request.form)
+
+        if dataset_config.enabled and not is_admin():
+            return error("仅管理员可以同时生成待划分数据集", 403)
         
         if not model_id:
             return error("请选择识别模型")
@@ -597,12 +660,56 @@ def detect_video():
         
         # 检查模型是否存在且已发布
         model_data = db.query('''
-            SELECT id, name FROM models 
+            SELECT id, name, model_mode, secondary_modality FROM models
             WHERE id = ? AND status = 3
         ''', (model_id,), fetchone=True)
         
         if not model_data:
             return error("选择的模型不存在或未发布")
+
+        annotation_model = None
+        draft_id = None
+        secondary_file = request.files.get('secondary_video')
+        if dataset_config.enabled:
+            try:
+                ensure_dataset_name_available(dataset_config.name, db)
+            except DraftValidationError as exc:
+                return error(str(exc), 400)
+
+            requested_mode = dataset_config.mode
+            if requested_mode == 'single' and secondary_file and secondary_file.filename:
+                return error("单模态数据集不能上传第二路视频", 400)
+            if requested_mode == 'multimodal':
+                if not secondary_file or not secondary_file.filename:
+                    return error("多模态数据集必须上传第二路视频", 400)
+                if not dataset_config.secondary_modality:
+                    return error("多模态数据集必须选择第二模态", 400)
+
+            requested_model_id = dataset_config.annotation_model_id
+            if not requested_model_id:
+                if (model_data.get('model_mode') or 'single') == requested_mode and (
+                    requested_mode == 'single'
+                    or (model_data.get('secondary_modality') or '').lower() == dataset_config.secondary_modality
+                ):
+                    requested_model_id = model_id
+                else:
+                    return error("当前检测模型与数据集模式不兼容，请选择标注模型", 400)
+            annotation_model = db.query('''
+                SELECT id, name, model_bucket, model_object_key, model_mode,
+                       primary_modality, secondary_modality, model_yaml
+                FROM models WHERE id = ? AND status = 3
+            ''', (requested_model_id,), fetchone=True)
+            if not annotation_model:
+                return error("标注模型不存在或未发布", 400)
+            annotation_mode = annotation_model.get('model_mode') or 'single'
+            if annotation_mode != requested_mode or (
+                requested_mode == 'multimodal'
+                and (annotation_model.get('secondary_modality') or '').lower() != dataset_config.secondary_modality
+            ):
+                return error("标注模型与所选数据集模式或模态不兼容", 400)
+            dataset_config = VideoDatasetConfig(
+                **{**dataset_config.__dict__, 'annotation_model_id': requested_model_id}
+            )
         
         # 创建临时目录保存上传的视频
         temp_id = uuid.uuid4().hex[:8]
@@ -628,52 +735,139 @@ def detect_video():
             
             if file_size == 0:
                 raise Exception("上传的视频文件为空")
+
+            import cv2
+            secondary_video_path = None
+            secondary_video_upload = None
+            if dataset_config.enabled and dataset_config.mode == 'multimodal':
+                secondary_extension = secondary_file.filename.rsplit('.', 1)[1].lower() if '.' in secondary_file.filename else ''
+                if secondary_extension not in allowed_extensions:
+                    raise Exception("第二路视频格式不受支持")
+                secondary_video_path = os.path.join(temp_dir, f"secondary_{uuid.uuid4().hex[:8]}.{secondary_extension}")
+                secondary_file.save(secondary_video_path)
+                secondary_cap = cv2.VideoCapture(secondary_video_path)
+                if not secondary_cap.isOpened():
+                    secondary_cap.release()
+                    raise Exception("第二路上传文件不是有效的视频格式")
+                secondary_cap.release()
             
             # 初步验证视频文件
-            import cv2
             test_cap = cv2.VideoCapture(temp_video_path)
             if not test_cap.isOpened():
                 test_cap.release()
                 raise Exception("上传的文件不是有效的视频格式")
             test_cap.release()
+
+            if secondary_video_path:
+                secondary_video_upload = file_client.upload('video_detection_original', secondary_video_path)
             
             # 上传原视频到文件服务
             original_upload_result = file_client.upload('video_detection_original', temp_video_path)
             
             # 创建视频识别记录
             record_id = str(uuid.uuid4())
-            
+
             affected_rows = db.execute('''
                 INSERT INTO video_detection_records (
                     id, user_id, model_id, model_name,
                     original_video_bucket, original_video_object_key,
-                    confidence_threshold, frame_rate, create_time, title, description, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    confidence_threshold, frame_rate, create_time, title, description, status,
+                    dataset_generation_status, dataset_draft_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 record_id, g.user_id, model_id, model_data['name'],
                 original_upload_result['bucket'], original_upload_result['objectKey'],
                 confidence_threshold, frame_rate, datetime.now().isoformat(), 
-                title, description, VIDEO_DETECTION_STATUS['PENDING']
+                title, description, VIDEO_DETECTION_STATUS['PENDING'],
+                'pending' if dataset_config.enabled else 'not_requested', None,
             ))
+
+            if affected_rows > 0 and dataset_config.enabled:
+                try:
+                    draft = create_draft({
+                        'id': str(uuid.uuid4()),
+                        'name': dataset_config.name,
+                        'description': dataset_config.description,
+                        'creator_id': g.user_id,
+                        'source_type': 'video',
+                        'video_detection_record_id': record_id,
+                        'dataset_mode': dataset_config.mode,
+                        'primary_modality': 'rgb',
+                        'secondary_modality': dataset_config.secondary_modality,
+                        'metadata': {
+                            'annotation_model_id': dataset_config.annotation_model_id,
+                            'annotation_model_name': annotation_model.get('name'),
+                            'annotation_confidence': dataset_config.confidence,
+                            'frame_interval': dataset_config.frame_interval,
+                            'dataset_mode': dataset_config.mode,
+                            'secondary_modality': dataset_config.secondary_modality,
+                            'secondary_time_offset': dataset_config.secondary_time_offset,
+                            'secondary_video_ref': (
+                                {
+                                    'bucket': secondary_video_upload['bucket'],
+                                    'objectKey': secondary_video_upload['objectKey'],
+                                } if secondary_video_upload else None
+                            ),
+                        },
+                    }, db)
+                except Exception:
+                    db.execute("DELETE FROM video_detection_records WHERE id = ?", (record_id,))
+                    for uploaded in (original_upload_result, secondary_video_upload):
+                        if uploaded:
+                            try:
+                                file_client.delete(uploaded['bucket'], uploaded['objectKey'])
+                            except Exception:
+                                pass
+                    raise
+                draft_id = draft.id
+                db.execute(
+                    'UPDATE video_detection_records SET dataset_draft_id = ? WHERE id = ?',
+                    (draft_id, record_id),
+                )
             
             if affected_rows > 0:
                 # 创建并启动视频处理进程
                 processing_process = multiprocessing.Process(
                     target=run_video_detection_process,
                     args=(record_id, g.user_id, model_id, model_data['name'], 
-                          temp_video_path, confidence_threshold, frame_rate)
+                          temp_video_path, confidence_threshold, frame_rate,
+                          ({'enabled': True, 'draft_id': draft_id, 'config': dataset_config.__dict__}
+                           if dataset_config.enabled else None),
+                          annotation_model if dataset_config.enabled else None,
+                          secondary_video_path)
                 )
                 processing_process.daemon = True
                 video_processing[record_id] = processing_process
-                processing_process.start()
+                try:
+                    processing_process.start()
+                except Exception as start_error:
+                    video_processing.pop(record_id, None)
+                    if draft_id:
+                        mark_draft_failed(draft_id, str(start_error), db)
+                    db.execute('''
+                        UPDATE video_detection_records
+                        SET status = ?, complete_time = ?, dataset_generation_status = ?
+                        WHERE id = ?
+                    ''', (
+                        VIDEO_DETECTION_STATUS['FAILED'], datetime.now().isoformat(),
+                        'failed' if draft_id else 'not_requested', record_id,
+                    ))
+                    raise
                 
                 return success({
                     'id': record_id,
+                    'dataset_draft_id': draft_id,
                     'message': '视频上传成功，开始处理识别任务'
                 }, "视频识别任务创建成功")
             else:
                 # 如果创建任务失败，清理上传的文件
                 try:
+                    for uploaded in (original_upload_result, secondary_video_upload):
+                        if uploaded:
+                            try:
+                                file_client.delete(uploaded['bucket'], uploaded['objectKey'])
+                            except Exception:
+                                pass
                     if os.path.exists(temp_video_path):
                         os.remove(temp_video_path)
                     if os.path.exists(temp_dir) and not os.listdir(temp_dir):
@@ -713,7 +907,8 @@ def get_progress(record_id):
         
         record_data = db.query(f'''
             SELECT status, total_frames, processed_frames, target_frames, actual_processed_frames,
-                   start_time, complete_time, detection_result, frame_rate
+                   start_time, complete_time, detection_result, frame_rate,
+                   dataset_generation_status, dataset_draft_id, dataset_statistics
             FROM video_detection_records{where_clause}
         ''', tuple(params), fetchone=True)
         
@@ -771,6 +966,9 @@ def get_progress(record_id):
             'frame_rate': frame_rate,               # 设置的帧率
             'start_time': record_data['start_time'],
             'complete_time': record_data['complete_time']
+            , 'dataset_generation_status': record_data.get('dataset_generation_status', 'not_requested')
+            , 'dataset_draft_id': record_data.get('dataset_draft_id')
+            , 'dataset_statistics': json.loads(record_data.get('dataset_statistics') or '{}')
         }
         
         return success(result)

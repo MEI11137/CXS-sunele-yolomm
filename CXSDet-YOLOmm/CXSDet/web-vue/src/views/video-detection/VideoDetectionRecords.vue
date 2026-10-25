@@ -15,7 +15,7 @@
     <div class="page-header">
       <div class="header-content">
         <div class="header-left">
-          <h1 class="page-title">视频识别记录</h1>
+          <h1 class="page-title">视频记录</h1>
           <p class="page-subtitle">查看和管理所有视频识别历史记录</p>
         </div>
         <div class="header-right">

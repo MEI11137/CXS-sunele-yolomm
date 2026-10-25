@@ -1,531 +1,739 @@
-<!-- MD5: 5c21a63b9a3c28af3971c86f37a56b71 -->
-<!-- 仪表盘页面 -->
 <!--
-版权所有©2025 羊羊小栈(GJQ)
+  巡检工作台
 
-作者:羊羊小栈
-时间:2025-09-06 23:44:27
+  这里不摆装饰性指标。链条上的每个数字都来自检测记录接口的真实字段：
+  检测 → AI 辅助核查 → 人工确认 → 回流。哪一个环节积压，页面就直接指出来。
+-->
+<!--
+版权所有 © 2025 羊羊小栈 (GJQ)
+
+作者: 羊羊小栈
+时间: 2025-09-06 23:44:27
 
 本系统为原创作品,禁止二次销售!禁止将系统对应的视频、文档进行二次发布!
 违者需立即停止侵权行为,并按照【羊羊小栈系统版权声明及保护条款】中规定数额进行赔偿,并承担相应法律责任。
 -->
 
 <template>
-  <div class="dashboard">
-    <!-- 欢迎区域 -->
-    <div class="welcome-section">
-      <div class="welcome-content">
-        <div class="welcome-text">
-          <h1 class="welcome-title">欢迎回来，{{ userInfo?.realName || userInfo?.username || '用户' }}！</h1>
-          <p class="welcome-subtitle">{{ currentDate }}</p>
-        </div>
-        <div class="welcome-avatar">
-          <el-avatar :size="80" :src="userInfo?.avatarUrl" class="user-avatar">
-            {{ userInfo?.realName?.charAt(0) || userInfo?.username?.charAt(0) || 'U' }}
-          </el-avatar>
-        </div>
+  <div class="workbench">
+    <header class="page-head">
+      <div class="head-text">
+        <h1 class="page-title">巡检工作台</h1>
+        <p class="page-sub">
+          {{ greeting }}。共 {{ stats.total }} 条巡检记录，其中
+          <strong class="hl">{{ stats.pending }}</strong> 条等待人工确认。
+        </p>
       </div>
-    </div>
-
-
-
-    <!-- 主要内容区域 -->
-    <div class="main-content">
-      <div class="content-grid">
-        <!-- 快捷操作区域 -->
-        <div class="quick-actions">
-          <div class="section-header">
-            <h2 class="section-title">
-              <el-icon><MagicStick /></el-icon>
-              快捷操作
-            </h2>
-          </div>
-          <div class="actions-grid">
-            <div class="action-card" @click="navigateTo('/detection')">
-              <div class="action-icon">
-                <el-icon><Camera /></el-icon>
-              </div>
-              <h3 class="action-title">图片检测</h3>
-              <p class="action-desc">上传光伏板图片进行缺陷检测</p>
-            </div>
-            
-            <div class="action-card" @click="navigateTo('/video-detection')">
-              <div class="action-icon">
-                <el-icon><VideoPlay /></el-icon>
-              </div>
-              <h3 class="action-title">视频检测</h3>
-              <p class="action-desc">处理视频流进行实时检测</p>
-            </div>
-            
-            <div class="action-card" @click="navigateTo('/realtime-detection')">
-              <div class="action-icon">
-                <el-icon><Monitor /></el-icon>
-              </div>
-              <h3 class="action-title">实时检测</h3>
-              <p class="action-desc">连接摄像头进行实时监控</p>
-            </div>
-            
-            <div class="action-card" @click="navigateTo('/detection-records')">
-              <div class="action-icon">
-                <el-icon><Picture /></el-icon>
-              </div>
-              <h3 class="action-title">图片记录</h3>
-              <p class="action-desc">查看图片检测历史记录</p>
-            </div>
-            
-            <div class="action-card" @click="navigateTo('/video-detection-records')">
-              <div class="action-icon">
-                <el-icon><Film /></el-icon>
-              </div>
-              <h3 class="action-title">视频记录</h3>
-              <p class="action-desc">查看视频检测历史记录</p>
-            </div>
-            
-            <div class="action-card" @click="navigateTo('/realtime-detection-records')">
-              <div class="action-icon">
-                <el-icon><Monitor /></el-icon>
-              </div>
-              <h3 class="action-title">摄像头记录</h3>
-              <p class="action-desc">查看实时检测历史记录</p>
-            </div>
-          </div>
-        </div>
-
-        <!-- 最近活动区域 -->
-        <div class="recent-activities">
-          <div class="section-header">
-            <h2 class="section-title">
-              <el-icon><Clock /></el-icon>
-              最近活动
-            </h2>
-          </div>
-          <div class="activities-list">
-            <div v-if="recentActivities.length === 0" class="no-activities">
-              <el-icon class="empty-icon"><Calendar /></el-icon>
-              <p>暂无最近活动</p>
-              <small>开始使用系统后，您的活动将在此显示</small>
-            </div>
-            <div v-else class="activity-item" v-for="activity in recentActivities" :key="activity.id">
-              <div class="activity-icon" :class="activity.type">
-                <el-icon><component :is="activity.icon" /></el-icon>
-              </div>
-              <div class="activity-content">
-                <h4 class="activity-title">{{ activity.title }}</h4>
-                <p class="activity-desc">{{ activity.description }}</p>
-                <span class="activity-time">{{ activity.time }}</span>
-              </div>
-            </div>
-          </div>
-        </div>
+      <div class="head-actions">
+        <el-button @click="go('/detection-records')">
+          <el-icon><Document /></el-icon>
+          全部记录
+        </el-button>
+        <el-button type="primary" @click="go('/detection')">
+          <el-icon><Camera /></el-icon>
+          开始图片巡检
+        </el-button>
       </div>
-    </div>
+    </header>
 
-    <!-- 系统信息区域 -->
-    <div class="system-info">
-      <div class="info-card">
-        <div class="info-header">
-          <h3 class="info-title">
-            <el-icon><InfoFilled /></el-icon>
-            系统信息
-          </h3>
-        </div>
-        <div class="info-content">
-          <div class="info-item">
-            <span class="info-label">系统版本：</span>
-            <span class="info-value">{{ systemInfo.version }}</span>
-          </div>
-          <div class="info-item">
-            <span class="info-label">最后更新：</span>
-            <span class="info-value">{{ systemInfo.lastUpdate }}</span>
-          </div>
-          <div class="info-item">
-            <span class="info-label">在线状态：</span>
-            <el-tag type="success" size="small">正常运行</el-tag>
-          </div>
-        </div>
+    <el-alert
+      v-if="loadError"
+      type="error"
+      :closable="false"
+      show-icon
+      class="load-error"
+      title="无法读取巡检记录"
+      :description="loadError"
+    >
+      <template #default>
+        <el-button size="small" @click="loadRecords">重新加载</el-button>
+      </template>
+    </el-alert>
+
+    <!-- 闭环链路 -->
+    <section class="hx-panel loop-panel">
+      <div class="hx-panel__head">
+        <h2 class="hx-panel__title">巡检闭环进度</h2>
+        <span class="loop-hint">
+          <span class="hx-dot" :class="`dot-${bottleneck.tone}`" />
+          {{ bottleneck.text }}
+        </span>
       </div>
+      <div v-loading="loading" class="loop-track">
+        <button
+          v-for="(stage, index) in stages"
+          :key="stage.key"
+          type="button"
+          class="stage"
+          :class="[`is-${stage.tone}`, { 'is-zero': stage.count === 0 }]"
+          @click="go(stage.path)"
+        >
+          <span class="stage-top">
+            <span class="stage-index hx-mono">{{ String(index + 1).padStart(2, '0') }}</span>
+            <span class="stage-name">{{ stage.name }}</span>
+          </span>
+          <span class="stage-count hx-mono">{{ stage.count }}</span>
+          <span class="stage-note">{{ stage.note }}</span>
+        </button>
+      </div>
+    </section>
+
+    <div class="work-grid">
+      <!-- 待处理记录 -->
+      <section class="hx-panel pending-panel">
+        <div class="hx-panel__head">
+          <div>
+            <h2 class="hx-panel__title">等待人工确认</h2>
+            <p class="panel-sub">模型结果只是待核证据，确认之后才会进入训练数据。</p>
+          </div>
+          <el-button link type="primary" @click="go('/detection-records')">查看全部</el-button>
+        </div>
+
+        <div v-loading="loading" class="pending-body">
+          <EmptyState
+            v-if="!loading && pendingRecords.length === 0"
+            title="没有待确认的记录"
+            description="新的巡检结果会先出现在这里，等你对照原图核对标注。"
+          >
+            <template #action>
+              <el-button size="small" type="primary" @click="go('/detection')">上传一张巡检图</el-button>
+            </template>
+          </EmptyState>
+
+          <ul v-else class="pending-list">
+            <li v-for="record in pendingRecords" :key="record.id" class="pending-item">
+              <div class="item-main">
+                <div class="item-title">{{ record.title }}</div>
+                <div class="item-meta">
+                  <span class="hx-mono">{{ shortId(record.id) }}</span>
+                  <span class="sep" />
+                  <span>{{ record.model_name }}</span>
+                  <span class="sep" />
+                  <span>{{ formatDateTime(record.create_time) }}</span>
+                </div>
+              </div>
+              <div class="item-status">
+                <StatusPill :meta="aiStatusOf(record.ai_review_status)" size="sm" />
+              </div>
+              <el-button size="small" type="primary" plain @click="openRecord(record)">
+                去确认
+              </el-button>
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- 右栏 -->
+      <aside class="side-col">
+        <section class="hx-panel todo-panel">
+          <div class="hx-panel__head">
+            <h2 class="hx-panel__title">接下来可以做什么</h2>
+          </div>
+          <ul class="todo-list">
+            <li v-for="todo in todos" :key="todo.key" class="todo-item">
+              <span class="todo-mark" :class="`is-${todo.tone}`" />
+              <div class="todo-text">
+                <span class="todo-label">{{ todo.label }}</span>
+                <span class="todo-desc">{{ todo.desc }}</span>
+              </div>
+              <el-button size="small" text type="primary" @click="go(todo.path)">前往</el-button>
+            </li>
+          </ul>
+        </section>
+
+        <section class="hx-panel quick-panel">
+          <div class="hx-panel__head">
+            <h2 class="hx-panel__title">巡检入口</h2>
+          </div>
+          <div class="quick-grid">
+            <button
+              v-for="entry in extraEntries"
+              :key="entry.path"
+              type="button"
+              class="quick-item"
+              @click="go(entry.path)"
+            >
+              <el-icon class="quick-icon"><component :is="entry.icon" /></el-icon>
+              <span class="quick-name">{{ entry.name }}</span>
+              <span class="quick-desc">{{ entry.desc }}</span>
+            </button>
+          </div>
+        </section>
+      </aside>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import { Camera, Document, VideoPlay, View, Files } from '@element-plus/icons-vue'
 import { useUserStore } from '@/stores/user'
-import systemInfo from 'virtual:build-info'
-import { 
-  Camera, VideoPlay, Monitor, List, MagicStick, 
-  Setting, TrendCharts, Clock, Calendar, InfoFilled,
-  Picture, Film
-} from '@element-plus/icons-vue'
+import { detectionApi } from '@/api/detection'
+import type { DetectionRecord } from '@/api/detection'
+import { formatDateTime } from '@/utils/format'
+import { aiStatusOf } from '@/constants/review'
+import StatusPill from '@/components/StatusPill.vue'
+import EmptyState from '@/components/EmptyState.vue'
 
 const router = useRouter()
 const userStore = useUserStore()
-
-// 用户信息
 const userInfo = computed(() => userStore.userInfo)
 
-// 当前日期
-const currentDate = new Date().toLocaleDateString('zh-CN', {
-  year: 'numeric',
-  month: 'long',
-  day: 'numeric',
-  weekday: 'long'
+const records = ref<DetectionRecord[]>([])
+const total = ref(0)
+const loading = ref(false)
+const loadError = ref('')
+
+const greeting = computed(() => {
+  const hour = new Date().getHours()
+  const name = userInfo.value?.realName || userInfo.value?.username || '巡检员'
+  if (hour < 6) return `${name}，夜间值守辛苦了`
+  if (hour < 12) return `${name}，早上好`
+  if (hour < 18) return `${name}，下午好`
+  return `${name}，晚上好`
 })
 
+/** 一次取够，用于统计各阶段数量；单页 200 条足够覆盖当前规模。 */
+async function loadRecords() {
+  loading.value = true
+  loadError.value = ''
+  try {
+    const res = await detectionApi.getRecords({ page: 1, page_size: 200 })
+    records.value = res.records || []
+    total.value = res.total ?? records.value.length
+  } catch (error) {
+    loadError.value = error instanceof Error ? error.message : '接口未响应，请确认后端服务已启动'
+    records.value = []
+    total.value = 0
+  } finally {
+    loading.value = false
+  }
+}
 
+const stats = computed(() => {
+  const list = records.value
+  const pending = list.filter((r) => r.human_review_status === 'pending').length
+  const confirmed = list.filter((r) => r.human_review_status === 'confirmed').length
+  const aiDone = list.filter((r) => r.ai_review_status && r.ai_review_status !== 'not_requested').length
+  const aiSuspect = list.filter((r) =>
+    ['possible_false_positive', 'possible_missed_detection', 'needs_human_review'].includes(r.ai_review_status)
+  ).length
+  const feedback = list.filter((r) => !!r.feedback_dataset_id).length
+  return { total: total.value, pending, confirmed, aiDone, aiSuspect, feedback }
+})
 
-// 最近活动
-const recentActivities = ref([
+const stages = computed(() => [
   {
-    id: 1,
-    type: 'detection',
-    icon: 'Camera',
-    title: '完成图片检测',
-    description: '成功检测光伏板图片，发现2个缺陷',
-    time: '2小时前'
+    key: 'detect',
+    name: '巡检检测',
+    count: stats.value.total,
+    note: '已生成的检测记录',
+    tone: 'done',
+    path: '/detection-records'
   },
   {
-    id: 2,
-    type: 'video',
-    icon: 'VideoPlay',
-    title: '开始视频检测',
-    description: '启动视频流检测任务',
-    time: '5小时前'
+    key: 'ai',
+    name: 'AI 辅助核查',
+    count: stats.value.aiDone,
+    note: stats.value.aiSuspect
+      ? `其中 ${stats.value.aiSuspect} 条提示疑点`
+      : `尚未核查 ${stats.value.total - stats.value.aiDone} 条`,
+    tone: 'assist',
+    path: '/detection-records'
   },
   {
-    id: 3,
-    type: 'realtime',
-    icon: 'Monitor',
-    title: '实时检测会话',
-    description: '建立实时检测连接',
-    time: '1天前'
+    key: 'review',
+    name: '待人工确认',
+    count: stats.value.pending,
+    note: '只有人判过的才算数',
+    tone: stats.value.pending ? 'attention' : 'done',
+    path: '/detection-records'
+  },
+  {
+    key: 'confirmed',
+    name: '已人工确认',
+    count: stats.value.confirmed,
+    note: '具备回流资格',
+    tone: 'done',
+    path: '/detection-records'
+  },
+  {
+    key: 'feedback',
+    name: '已回流样本',
+    count: stats.value.feedback,
+    note: '等待新数据集版本',
+    tone: stats.value.feedback ? 'done' : 'idle',
+    path: userStore.isAdmin() ? '/admin/datasets' : '/detection-records'
   }
 ])
 
-// 页面跳转
-const navigateTo = (path: string) => {
-  router.push(path)
+const bottleneck = computed(() => {
+  if (loading.value) return { text: '正在统计', tone: 'neutral' }
+  if (loadError.value) return { text: '接口未连接', tone: 'danger' }
+  if (stats.value.pending > 0) {
+    return { text: `当前积压在人工确认：${stats.value.pending} 条待核`, tone: 'attention' }
+  }
+  if (stats.value.confirmed > stats.value.feedback) {
+    return { text: `${stats.value.confirmed - stats.value.feedback} 条已确认但还未回流`, tone: 'attention' }
+  }
+  if (stats.value.feedback > 0) {
+    return { text: '样本已回流，可生成新数据集版本', tone: 'ok' }
+  }
+  return { text: '暂无待处理记录', tone: 'neutral' }
+})
+
+const pendingRecords = computed(() =>
+  records.value.filter((r) => r.human_review_status === 'pending').slice(0, 6)
+)
+
+const todos = computed(() => {
+  const list: Array<{ key: string; label: string; desc: string; tone: string; path: string }> = []
+  const { pending, confirmed, feedback, total: all, aiDone, aiSuspect } = stats.value
+
+  if (pending > 0) {
+    list.push({
+      key: 'review',
+      label: `确认 ${pending} 条待核记录`,
+      desc: '对照原图核对标注，确认或修正后提交',
+      tone: 'attention',
+      path: '/detection-records'
+    })
+  }
+  if (all - aiDone > 0) {
+    list.push({
+      key: 'ai',
+      label: `对 ${all - aiDone} 条记录发起 AI 辅助核查`,
+      desc: '让模型先指出可能的误报与漏检',
+      tone: 'sea',
+      path: '/detection-records'
+    })
+  }
+  if (aiSuspect > 0) {
+    list.push({
+      key: 'suspect',
+      label: `${aiSuspect} 条记录存在 AI 疑点`,
+      desc: '疑点只是线索，仍需人工判定',
+      tone: 'attention',
+      path: '/detection-records'
+    })
+  }
+  if (confirmed - feedback > 0) {
+    list.push({
+      key: 'feedback',
+      label: `把 ${confirmed - feedback} 条已确认记录加入反馈池`,
+      desc: '生成不可变的新数据集版本',
+      tone: 'ok',
+      path: '/detection-records'
+    })
+  }
+  if (feedback > 0 && userStore.isAdmin()) {
+    list.push({
+      key: 'train',
+      label: '生成新版本并启动增量训练',
+      desc: '在数据集与模型管理中完成',
+      tone: 'sea',
+      path: '/admin/datasets'
+    })
+  }
+  if (list.length === 0) {
+    list.push({
+      key: 'start',
+      label: '从一次巡检开始',
+      desc: '上传现场影像，生成第一条检测记录',
+      tone: 'sea',
+      path: '/detection'
+    })
+  }
+  return list
+})
+
+const entries = [
+  { name: '图片巡检', desc: '单张或多张影像', path: '/detection', icon: Camera },
+  { name: '视频巡检', desc: '按视频抽帧检测', path: '/video-detection', icon: VideoPlay },
+  { name: '实时巡检', desc: '接入画面即时判断', path: '/realtime-detection', icon: View },
+  { name: '识别记录', desc: '复核与数据回流', path: '/detection-records', icon: Document }
+]
+
+const extraEntries = computed(() =>
+  userStore.isAdmin()
+    ? [...entries, { name: '数据集管理', desc: '划分与版本', path: '/admin/datasets', icon: Files }]
+    : entries
+)
+
+const go = (path: string) => router.push(path)
+
+const openRecord = (record: DetectionRecord) => {
+  router.push({ path: '/detection-records', query: { record: record.id } })
 }
 
-// 组件挂载时加载数据
-onMounted(async () => {
-  // 可以在这里加载其他需要的数据
-})
+const shortId = (id: string) => (id ? id.slice(0, 8) : '—')
+
+onMounted(loadRecords)
 </script>
 
 <style scoped>
-.dashboard {
-  padding: 24px;
-  background-color: #f5f7fa;
-  min-height: 100vh;
-}
-
-/* 欢迎区域 */
-.welcome-section {
-  background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%);
-  border-radius: 16px;
-  padding: 32px;
-  margin-bottom: 24px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
-}
-
-.welcome-content {
+.workbench {
   display: flex;
+  flex-direction: column;
+  gap: var(--hx-gap);
+}
+
+/* —— 页头 —— */
+.page-head {
+  display: flex;
+  align-items: flex-end;
   justify-content: space-between;
-  align-items: center;
+  gap: 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--hx-line);
 }
 
-.welcome-title {
-  font-size: 28px;
-  font-weight: 600;
-  color: #303133;
-  margin: 0 0 8px 0;
-}
-
-.welcome-subtitle {
-  font-size: 16px;
-  color: #909399;
+.page-title {
   margin: 0;
-}
-
-.user-avatar {
-  background: linear-gradient(135deg, #409EFF 0%, #66b1ff 100%);
-  color: white;
-  font-size: 32px;
-  font-weight: 600;
-}
-
-
-
-/* 主要内容区域 */
-.main-content {
-  margin-bottom: 24px;
-}
-
-.content-grid {
-  display: grid;
-  grid-template-columns: 2fr 1fr;
-  gap: 24px;
-}
-
-/* 快捷操作区域 */
-.quick-actions {
-  background: white;
-  border-radius: 16px;
-  padding: 24px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
-}
-
-.section-header {
-  margin-bottom: 24px;
-}
-
-.section-title {
   font-size: 20px;
   font-weight: 600;
-  color: #303133;
-  margin: 0;
+  letter-spacing: 0.02em;
+  color: var(--hx-text);
+  padding-left: 10px;
+  border-left: 3px solid var(--hx-sea);
+  line-height: 1.2;
+}
+
+.page-sub {
+  margin: 6px 0 0 13px;
+  font-size: 13px;
+  color: var(--hx-text-2);
+}
+
+.hl {
+  color: var(--hx-beacon);
+  font-variant-numeric: tabular-nums;
+}
+
+.head-actions {
   display: flex;
-  align-items: center;
   gap: 8px;
-}
-
-.actions-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 16px;
-}
-
-.action-card {
-  background: #f8f9fa;
-  border-radius: 12px;
-  padding: 20px;
-  text-align: center;
-  cursor: pointer;
-  transition: all 0.3s ease;
-  border: 2px solid transparent;
-}
-
-.action-card:hover {
-  background: white;
-  border-color: #409EFF;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(64, 158, 255, 0.15);
-}
-
-.action-icon {
-  width: 50px;
-  height: 50px;
-  background: linear-gradient(135deg, #409EFF 0%, #66b1ff 100%);
-  border-radius: 12px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  margin: 0 auto 16px;
-  font-size: 20px;
-  color: white;
-}
-
-/* 为不同的记录类型设置不同的图标颜色 */
-.action-card:nth-child(4) .action-icon {
-  background: linear-gradient(135deg, #67C23A 0%, #85ce61 100%);
-}
-
-.action-card:nth-child(5) .action-icon {
-  background: linear-gradient(135deg, #E6A23C 0%, #ebb563 100%);
-}
-
-.action-card:nth-child(6) .action-icon {
-  background: linear-gradient(135deg, #9C27B0 0%, #BA68C8 100%);
-}
-
-.action-title {
-  font-size: 16px;
-  font-weight: 600;
-  color: #303133;
-  margin: 0 0 8px 0;
-}
-
-.action-desc {
-  font-size: 14px;
-  color: #909399;
-  margin: 0;
-  line-height: 1.4;
-}
-
-/* 最近活动区域 */
-.recent-activities {
-  background: white;
-  border-radius: 16px;
-  padding: 24px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
-}
-
-.activities-list {
-  max-height: 400px;
-  overflow-y: auto;
-}
-
-.no-activities {
-  text-align: center;
-  padding: 40px 20px;
-  color: #909399;
-}
-
-.empty-icon {
-  font-size: 48px;
-  margin-bottom: 16px;
-  opacity: 0.5;
-}
-
-.activity-item {
-  display: flex;
-  align-items: flex-start;
-  gap: 16px;
-  padding: 16px 0;
-  border-bottom: 1px solid #f0f0f0;
-}
-
-.activity-item:last-child {
-  border-bottom: none;
-}
-
-.activity-icon {
-  width: 40px;
-  height: 40px;
-  border-radius: 8px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 16px;
-  color: white;
   flex-shrink: 0;
 }
 
-.activity-icon.detection {
-  background: #409EFF;
+.load-error {
+  border-radius: var(--hx-radius);
 }
 
-.activity-icon.video {
-  background: #67C23A;
+/* —— 闭环链路 —— */
+.loop-panel :deep(.hx-panel__head) {
+  align-items: baseline;
 }
 
-.activity-icon.realtime {
-  background: #E6A23C;
-}
-
-.activity-content {
-  flex: 1;
-  min-width: 0;
-}
-
-.activity-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: #303133;
-  margin: 0 0 4px 0;
-}
-
-.activity-desc {
-  font-size: 13px;
-  color: #909399;
-  margin: 0 0 8px 0;
-  line-height: 1.4;
-}
-
-.activity-time {
-  font-size: 12px;
-  color: #c0c4cc;
-}
-
-/* 系统信息区域 */
-.system-info {
-  margin-bottom: 24px;
-}
-
-.info-card {
-  background: white;
-  border-radius: 16px;
-  padding: 24px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
-}
-
-.info-header {
-  margin-bottom: 20px;
-}
-
-.info-title {
-  font-size: 18px;
-  font-weight: 600;
-  color: #303133;
-  margin: 0;
-  display: flex;
+.loop-hint {
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--hx-text-2);
 }
 
-.info-content {
+.dot-attention {
+  background: var(--hx-beacon);
+}
+.dot-ok {
+  background: var(--hx-ok);
+}
+.dot-danger {
+  background: var(--hx-defect);
+}
+.dot-neutral {
+  background: var(--hx-text-3);
+}
+
+.loop-track {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 0;
+  padding: 4px;
+}
+
+.stage {
+  position: relative;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 4px;
+  padding: 14px 16px 16px;
+  border: none;
+  border-right: 1px solid var(--hx-line);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease;
 }
 
-.info-item {
+.stage:last-child {
+  border-right: none;
+}
+
+.stage:hover {
+  background: #f7faf9;
+}
+
+.stage::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 16px;
+  right: 16px;
+  height: 2px;
+  background: var(--hx-line-strong);
+}
+
+.stage.is-attention::before {
+  background: var(--hx-beacon);
+}
+
+.stage.is-done::before {
+  background: var(--hx-sea);
+}
+
+.stage.is-assist::before {
+  background: var(--hx-sea-line);
+}
+
+.stage-top {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  padding: 12px 0;
-  border-bottom: 1px solid #f0f0f0;
+  gap: 7px;
 }
 
-.info-item:last-child {
-  border-bottom: none;
+.stage-index {
+  font-size: 10px;
+  color: var(--hx-text-3);
+  letter-spacing: 0.04em;
 }
 
-.info-label {
-  font-size: 14px;
-  color: #606266;
-}
-
-.info-value {
-  font-size: 14px;
-  color: #303133;
+.stage-name {
+  font-size: 12px;
+  color: var(--hx-text-2);
   font-weight: 500;
 }
 
-/* 响应式设计 */
-@media (max-width: 1200px) {
-  .content-grid {
+.stage-count {
+  font-size: 26px;
+  line-height: 1.15;
+  font-weight: 600;
+  color: var(--hx-text);
+}
+
+.stage.is-attention .stage-count {
+  color: var(--hx-beacon);
+}
+
+.stage.is-zero .stage-count {
+  color: var(--hx-text-3);
+  font-weight: 400;
+}
+
+.stage-note {
+  font-size: 11px;
+  color: var(--hx-text-3);
+  line-height: 1.45;
+}
+
+/* —— 主栅格 —— */
+.work-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.9fr) minmax(280px, 1fr);
+  gap: var(--hx-gap);
+  align-items: start;
+}
+
+.panel-sub {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--hx-text-3);
+}
+
+.pending-body {
+  min-height: 120px;
+}
+
+.pending-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.pending-item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 11px 16px;
+  border-bottom: 1px solid var(--hx-line);
+}
+
+.pending-item:last-child {
+  border-bottom: none;
+}
+
+.pending-item:hover {
+  background: #fafcfb;
+}
+
+.item-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.item-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--hx-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.item-meta {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--hx-text-3);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.sep {
+  width: 1px;
+  height: 9px;
+  background: var(--hx-line-strong);
+  flex-shrink: 0;
+}
+
+.item-status {
+  flex-shrink: 0;
+}
+
+/* —— 右栏 —— */
+.side-col {
+  display: flex;
+  flex-direction: column;
+  gap: var(--hx-gap);
+}
+
+.todo-list {
+  list-style: none;
+  margin: 0;
+  padding: 6px 0;
+}
+
+.todo-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 16px;
+}
+
+.todo-mark {
+  width: 3px;
+  align-self: stretch;
+  min-height: 26px;
+  border-radius: 1px;
+  background: var(--hx-line-strong);
+  flex-shrink: 0;
+}
+
+.todo-mark.is-attention {
+  background: var(--hx-beacon);
+}
+.todo-mark.is-sea {
+  background: var(--hx-sea);
+}
+.todo-mark.is-ok {
+  background: var(--hx-ok);
+}
+
+.todo-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.todo-label {
+  font-size: 13px;
+  color: var(--hx-text);
+  line-height: 1.4;
+}
+
+.todo-desc {
+  font-size: 11px;
+  color: var(--hx-text-3);
+  line-height: 1.45;
+}
+
+.quick-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: var(--hx-line);
+  border-top: 1px solid var(--hx-line);
+}
+
+.quick-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 14px 16px;
+  background: var(--hx-paper);
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.quick-item:hover {
+  background: #f4f9f8;
+}
+
+.quick-icon {
+  font-size: 15px;
+  color: var(--hx-sea);
+  margin-bottom: 2px;
+}
+
+.quick-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--hx-text);
+}
+
+.quick-desc {
+  font-size: 11px;
+  color: var(--hx-text-3);
+}
+
+@media (max-width: 1180px) {
+  .work-grid {
     grid-template-columns: 1fr;
   }
 }
 
-@media (max-width: 768px) {
-  .dashboard {
-    padding: 16px;
+@media (max-width: 860px) {
+  .loop-track {
+    grid-template-columns: 1fr 1fr;
   }
-  
-  .welcome-content {
+  .stage {
+    border-right: none;
+    border-bottom: 1px solid var(--hx-line);
+  }
+  .page-head {
     flex-direction: column;
-    text-align: center;
-    gap: 20px;
+    align-items: flex-start;
   }
-  
-  .stats-grid {
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  }
-  
-  .actions-grid {
-    grid-template-columns: 1fr;
-  }
-  
-  .welcome-title {
-    font-size: 24px;
-  }
-  
-  .stat-number {
-    font-size: 28px;
+  .pending-item {
+    flex-wrap: wrap;
   }
 }
 </style>

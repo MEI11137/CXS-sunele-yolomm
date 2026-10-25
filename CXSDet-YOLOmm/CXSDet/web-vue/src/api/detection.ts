@@ -80,6 +80,7 @@ export interface DetectionRecord {
   feedback_dataset_id?: string
   source_dataset_id?: string
   source_dataset_name?: string
+  class_names?: string[]
   reviewed_by?: number
   reviewed_at?: string
   review_version: number

@@ -61,6 +61,11 @@ def run_schema_migrations(conn: sqlite3.Connection) -> None:
         "review_version": "INTEGER NOT NULL DEFAULT 0",
         "request_key": "TEXT",
     }
+    video_detection_columns = {
+        "dataset_generation_status": "TEXT NOT NULL DEFAULT 'not_requested'",
+        "dataset_draft_id": "TEXT",
+        "dataset_statistics": "TEXT",
+    }
 
     with conn:
         for name, ddl in dataset_columns.items():
@@ -69,6 +74,8 @@ def run_schema_migrations(conn: sqlite3.Connection) -> None:
             ensure_column(conn, "models", name, ddl)
         for name, ddl in detection_columns.items():
             ensure_column(conn, "detection_records", name, ddl)
+        for name, ddl in video_detection_columns.items():
+            ensure_column(conn, "video_detection_records", name, ddl)
 
         conn.execute(
             """
@@ -111,6 +118,59 @@ def run_schema_migrations(conn: sqlite3.Connection) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dataset_drafts (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                creator_id INTEGER NOT NULL,
+                source_type TEXT NOT NULL,
+                source_dataset_id TEXT,
+                video_detection_record_id TEXT,
+                dataset_mode TEXT NOT NULL DEFAULT 'single',
+                primary_modality TEXT NOT NULL DEFAULT 'rgb',
+                secondary_modality TEXT,
+                workflow_status TEXT NOT NULL DEFAULT 'generating',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                error_message TEXT,
+                create_time TEXT NOT NULL,
+                update_time TEXT NOT NULL,
+                finalized_at TEXT,
+                FOREIGN KEY (creator_id) REFERENCES user (id),
+                FOREIGN KEY (source_dataset_id) REFERENCES datasets (id),
+                FOREIGN KEY (video_detection_record_id)
+                    REFERENCES video_detection_records (id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dataset_draft_samples (
+                id TEXT PRIMARY KEY,
+                draft_id TEXT NOT NULL,
+                sample_key TEXT NOT NULL,
+                split TEXT NOT NULL DEFAULT 'unassigned',
+                rgb_bucket TEXT,
+                rgb_object_key TEXT,
+                secondary_image_bucket TEXT,
+                secondary_image_object_key TEXT,
+                label_bucket TEXT,
+                label_object_key TEXT,
+                annotations_json TEXT NOT NULL DEFAULT '[]',
+                frame_index INTEGER,
+                primary_timestamp REAL,
+                secondary_frame_index INTEGER,
+                secondary_timestamp REAL,
+                pairing_error_ms REAL,
+                pairing_state TEXT NOT NULL DEFAULT 'not_required',
+                create_time TEXT NOT NULL,
+                update_time TEXT NOT NULL,
+                FOREIGN KEY (draft_id) REFERENCES dataset_drafts (id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
         ensure_index(
             conn,
             "uq_feedback_record_annotation",
@@ -122,4 +182,21 @@ def run_schema_migrations(conn: sqlite3.Connection) -> None:
             "uq_detection_request_key",
             "CREATE UNIQUE INDEX uq_detection_request_key "
             "ON detection_records(request_key) WHERE request_key IS NOT NULL",
+        )
+        ensure_index(
+            conn,
+            "uq_dataset_draft_name",
+            "CREATE UNIQUE INDEX uq_dataset_draft_name ON dataset_drafts(name)",
+        )
+        ensure_index(
+            conn,
+            "uq_dataset_draft_sample_key",
+            "CREATE UNIQUE INDEX uq_dataset_draft_sample_key "
+            "ON dataset_draft_samples(draft_id, sample_key)",
+        )
+        ensure_index(
+            conn,
+            "ix_dataset_draft_sample_split",
+            "CREATE INDEX ix_dataset_draft_sample_split "
+            "ON dataset_draft_samples(draft_id, split)",
         )

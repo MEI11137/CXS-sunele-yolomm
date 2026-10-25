@@ -1,7 +1,9 @@
 
 from typing import Dict, List, Any
 import hashlib
+import json
 from clients.file_client import file_client
+from utils.dataset_classes import dataset_class_names
 
 # 用户模型
 class User:
@@ -319,6 +321,7 @@ class DetectionRecord:
         self.review_version = db_record.get('review_version', 0)
         self.source_dataset_id = db_record.get('source_dataset_id')
         self.source_dataset_name = db_record.get('source_dataset_name')
+        self.class_names = dataset_class_names(db_record.get('source_dataset_structure_info'))
         
         # 构建图片URL
         self.original_image_url = None
@@ -387,6 +390,7 @@ class DetectionRecord:
             ,'review_version': self.review_version
             ,'source_dataset_id': self.source_dataset_id
             ,'source_dataset_name': self.source_dataset_name
+            ,'class_names': self.class_names
         }
 
 # 图片识别记录信息VO
@@ -420,6 +424,7 @@ class DetectionRecordVO:
         self.review_version = record.review_version
         self.source_dataset_id = record.source_dataset_id
         self.source_dataset_name = record.source_dataset_name
+        self.class_names = record.class_names
     
     def to_dict(self) -> Dict:
         result = {
@@ -450,6 +455,7 @@ class DetectionRecordVO:
             ,'review_version': self.review_version
             ,'source_dataset_id': self.source_dataset_id
             ,'source_dataset_name': self.source_dataset_name
+            ,'class_names': self.class_names
         }
         
         # 只有管理员才能看到用户真实姓名
@@ -490,6 +496,12 @@ class VideoDetectionRecord:
         self.status = db_record.get('status', 0)
         self.title = db_record.get('title')
         self.description = db_record.get('description')
+        self.dataset_generation_status = db_record.get('dataset_generation_status', 'not_requested')
+        self.dataset_draft_id = db_record.get('dataset_draft_id')
+        try:
+            self.dataset_statistics = json.loads(db_record.get('dataset_statistics') or '{}')
+        except (TypeError, json.JSONDecodeError):
+            self.dataset_statistics = {}
         
         # 构建视频URL
         self.original_video_url = None
@@ -530,7 +542,10 @@ class VideoDetectionRecord:
             'complete_time': self.complete_time,
             'status': self.status,
             'title': self.title,
-            'description': self.description
+            'description': self.description,
+            'dataset_generation_status': self.dataset_generation_status,
+            'dataset_draft_id': self.dataset_draft_id,
+            'dataset_statistics': self.dataset_statistics,
         }
 
 # 视频识别记录信息VO
@@ -556,6 +571,9 @@ class VideoDetectionRecordVO:
         self.status = record.status
         self.title = record.title
         self.description = record.description
+        self.dataset_generation_status = record.dataset_generation_status
+        self.dataset_draft_id = record.dataset_draft_id
+        self.dataset_statistics = record.dataset_statistics
     
     def to_dict(self) -> Dict:
         result = {
@@ -577,7 +595,10 @@ class VideoDetectionRecordVO:
             'complete_time': self.complete_time,
             'status': self.status,
             'title': self.title,
-            'description': self.description
+            'description': self.description,
+            'dataset_generation_status': self.dataset_generation_status,
+            'dataset_draft_id': self.dataset_draft_id,
+            'dataset_statistics': self.dataset_statistics,
         }
         
         # 只有管理员才能看到用户真实姓名

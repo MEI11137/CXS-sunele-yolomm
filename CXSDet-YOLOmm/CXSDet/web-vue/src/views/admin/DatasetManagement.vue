@@ -8,8 +8,11 @@
 
 <template>
   <div class="dataset-management">
-    <div class="header">
-      <h2>数据集管理</h2>
+    <div class="header page-head">
+      <div>
+        <h2 class="page-title">数据集管理</h2>
+        <p class="page-sub">原始数据集与反馈版本都在这里。版本一经定稿不可修改，保证每次训练用的是哪批数据可查。</p>
+      </div>
       <el-button type="primary" @click="showUploadDialog = true">
         <el-icon><Upload /></el-icon>
         上传数据集
@@ -71,9 +74,16 @@
           </template>
         </el-table-column>
         
-        <el-table-column label="数据集统计" min-width="80" align="center">
+        <el-table-column label="数据集统计" min-width="130" align="center">
           <template #default="{ row }">
-            <div class="structure-info">
+            <div v-if="row.record_kind === 'draft'" class="structure-info">
+              <div v-for="split in draftSplits" :key="split.key" class="info-item">
+                <span class="label">{{ split.label }}:</span>
+                <span class="value">{{ row.split_counts?.[split.key] || 0 }}张</span>
+              </div>
+              <div class="info-item"><span class="label">总样本:</span><span class="value">{{ row.sample_count }}张</span></div>
+            </div>
+            <div v-else class="structure-info">
               <div class="info-item">
                 <span class="label">训练:</span>
                 <span class="value">{{ row.structure_info.train_images }}张</span>
@@ -92,20 +102,30 @@
         
         <el-table-column prop="file_size" label="文件大小" width="100" align="center">
           <template #default="{ row }">
-            {{ formatFileSize(row.file_size) }}
+            {{ row.record_kind === 'draft' ? '—' : formatFileSize(row.file_size) }}
           </template>
         </el-table-column>
         
         <el-table-column prop="status" label="状态" width="100" align="center">
           <template #default="{ row }">
-            <el-tag :type="getStatusType(row.status)">
-              {{ getStatusText(row.status) }}
+            <el-tag :type="row.record_kind === 'draft' ? getDraftStatusType(row.workflow_status) : getStatusType(row.status)">
+              {{ row.record_kind === 'draft' ? getDraftStatusText(row.workflow_status) : getStatusText(row.status) }}
             </el-tag>
           </template>
         </el-table-column>
         
-        <el-table-column label="操作" width="220" align="center" fixed="right">
+        <el-table-column label="操作" width="250" align="center" fixed="right">
           <template #default="{ row }">
+            <template v-if="row.record_kind === 'draft'">
+              <el-button v-if="row.workflow_status === 'draft'" size="small" type="primary" @click="openDraft(row.id)">
+                人工划分
+              </el-button>
+              <el-button v-else-if="row.workflow_status === 'failed'" size="small" type="warning" :loading="retryingDraftId === row.id" @click="retryDraft(row.id)">
+                重试
+              </el-button>
+              <span v-else-if="row.workflow_status === 'generating'" class="description">正在生成…</span>
+            </template>
+            <template v-else>
             <el-button size="small" @click="viewDataset(row)">
               <el-icon><View /></el-icon>
               查看
@@ -134,6 +154,7 @@
                 </el-dropdown-menu>
               </template>
             </el-dropdown>
+            </template>
           </template>
         </el-table-column>
       </el-table>
@@ -362,17 +383,26 @@ modality_used: [rgb, edge]</pre>
 
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { FormInstance, UploadFile, UploadInstance } from 'element-plus'
 import { 
   Upload, Search, DataLine, View, Edit, ArrowDown, 
   Download, Delete, RefreshRight
 } from '@element-plus/icons-vue'
-import { datasetApi, type Dataset } from '@/api/dataset'
+import { datasetApi, type Dataset, type DatasetListItem, type DraftDatasetListItem } from '@/api/dataset'
 import { formatFileSize, formatDateTime } from '@/utils/format'
 
 // 响应式数据
-const datasets = ref<Dataset[]>([])
+const router = useRouter()
+const datasets = ref<DatasetListItem[]>([])
+const draftSplits = [
+  { key: 'train' as const, label: '训练' },
+  { key: 'val' as const, label: '验证' },
+  { key: 'test' as const, label: '测试' },
+  { key: 'excluded' as const, label: '排除' },
+]
+const retryingDraftId = ref('')
 const loading = ref(false)
 const total = ref(0)
 const currentPage = ref(1)
@@ -434,7 +464,8 @@ const loadDatasets = async () => {
     const response = await datasetApi.list({
       page: currentPage.value,
       page_size: pageSize.value,
-      search: searchText.value
+      search: searchText.value,
+      record_kind: 'all'
     })
     datasets.value = response.datasets
     total.value = response.total
@@ -611,6 +642,29 @@ const getStatusType = (status: number): 'warning' | 'success' | 'danger' | 'info
   return typeMap[status] || 'info'
 }
 
+const getDraftStatusText = (status: DraftDatasetListItem['workflow_status']) => ({
+  generating: '生成中', draft: '待人工划分', failed: '生成失败', finalized: '训练可用'
+}[status] || '未知状态')
+
+const getDraftStatusType = (status: DraftDatasetListItem['workflow_status']): 'warning' | 'success' | 'danger' | 'info' => ({
+  generating: 'warning', draft: 'info', failed: 'danger', finalized: 'success'
+} as Record<DraftDatasetListItem['workflow_status'], 'warning' | 'success' | 'danger' | 'info'>)[status] || 'info'
+
+const openDraft = (id: string) => router.push({ name: 'DatasetDraftSplit', params: { draftId: id } })
+
+const retryDraft = async (id: string) => {
+  retryingDraftId.value = id
+  try {
+    await datasetApi.retryDraft(id)
+    ElMessage.success('已重新开始生成待划分数据集')
+    await loadDatasets()
+  } catch (error: any) {
+    ElMessage.error(error.response?.data?.msg || error.message || '重试失败')
+  } finally {
+    retryingDraftId.value = ''
+  }
+}
+
 
 // 处理下拉菜单命令
 const handleCommand = (command: { action: string; row: Dataset }) => {
@@ -630,7 +684,7 @@ const handleCommand = (command: { action: string; row: Dataset }) => {
 const createFeedbackVersion = async (dataset: Dataset) => {
   try {
     const result = await datasetApi.createFeedbackVersion(dataset.id)
-    ElMessage.success(`已生成 ${result.name}，新数据集 ID：${result.dataset_id}`)
+    ElMessage.success(`已生成待划分数据集 ${result.name}，请完成人工划分后再使用`)
     await loadDatasets()
   } catch (error: any) {
     ElMessage.error(error.response?.data?.msg || '生成反馈训练版本失败')
@@ -773,5 +827,34 @@ onMounted(() => {
       }
     }
   }
+}
+
+/* —— 统一页头 —— */
+.page-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--hx-line);
+  margin-bottom: var(--hx-gap);
+}
+
+.page-title {
+  margin: 0;
+  font-size: 20px;
+  line-height: 1.2;
+  font-weight: 600;
+  color: var(--hx-text);
+  padding-left: 10px;
+  border-left: 3px solid var(--hx-sea);
+}
+
+.page-sub {
+  margin: 6px 0 0 13px;
+  max-width: 720px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--hx-text-2);
 }
 </style>

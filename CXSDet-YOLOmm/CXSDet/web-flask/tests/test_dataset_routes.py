@@ -1,6 +1,7 @@
 import io
 import json
 import zipfile
+from types import SimpleNamespace
 
 import yaml
 from flask import Flask
@@ -158,3 +159,231 @@ def test_upload_generates_yaml_for_multimodal_archive_when_fields_are_supplied(m
     assert body["data"]["secondary_modality"] == "edge"
     assert captured["yaml"]["modality_used"] == ["rgb", "edge"]
     assert captured["yaml"]["names"] == ["hotspot", "crack"]
+
+
+def test_feedback_version_endpoint_returns_a_draft_for_manual_splitting(monkeypatch, tmp_path):
+    import routes.dataset as dataset_route
+    import utils.security_utils as security_utils
+    from services.dataset_draft_service import DraftDatasetResult
+
+    captured = {}
+
+    def create_draft(dataset_id, work_dir, creator_id, database, storage_client):
+        captured.update(
+            {
+                "dataset_id": dataset_id,
+                "creator_id": creator_id,
+                "database": database,
+                "storage_client": storage_client,
+            }
+        )
+        return DraftDatasetResult(
+            id="draft-1",
+            name="feedback-draft",
+            source_type="feedback",
+            source_dataset_id=dataset_id,
+            workflow_status="draft",
+        )
+
+    monkeypatch.setattr(dataset_route, "create_feedback_dataset_draft", create_draft)
+    monkeypatch.setattr(dataset_route, "db", object())
+    monkeypatch.setattr(dataset_route, "file_client", object())
+    monkeypatch.setattr(dataset_route, "TEMP_DIR", str(tmp_path))
+    monkeypatch.setattr(security_utils, "is_admin", lambda: True)
+
+    app = Flask(__name__)
+    app.register_blueprint(dataset_route.dataset_bp)
+    response = app.test_client().post(
+        "/api/dataset/d1/feedback-version",
+        headers={"Authorization": f"Bearer {generate_token(7)}"},
+    )
+    body = json.loads(response.data)
+
+    assert body["code"] == 200
+    assert body["msg"] == "反馈样本已生成待划分数据集"
+    assert body["data"]["workflow_status"] == "draft"
+    assert body["data"]["source_dataset_id"] == "d1"
+    assert captured["creator_id"] == 7
+
+
+def _draft_client(monkeypatch, *, admin=True):
+    import utils.security_utils as security_utils
+    from flask import Flask
+    import routes.dataset as dataset_route
+
+    monkeypatch.setattr(security_utils, "is_admin", lambda: admin)
+    app = Flask(__name__)
+    app.register_blueprint(dataset_route.dataset_bp)
+    return app.test_client()
+
+
+def test_draft_samples_route_is_admin_only(monkeypatch):
+    client = _draft_client(monkeypatch, admin=False)
+    response = client.get(
+        "/api/dataset/drafts/draft-1/samples",
+        headers={"Authorization": f"Bearer {generate_token(8)}"},
+    )
+    assert json.loads(response.data)["code"] == 403
+
+
+def test_dataset_list_unifies_records_and_excludes_finalized_drafts(monkeypatch):
+    import routes.dataset as dataset_route
+
+    captured = []
+    formal = {
+        "id": "draft-final", "name": "finalized", "description": None,
+        "structure_info": "{}", "upload_time": "2026-10-01", "file_size": 2,
+        "status": 1, "dataset_mode": "single", "primary_modality": "rgb",
+    }
+    draft = {
+        "id": "draft-open", "name": "pending split", "description": None,
+        "create_time": "2026-10-02", "workflow_status": "draft",
+        "metadata_json": "{}", "sample_count": 4, "unassigned_count": 2,
+        "train_count": 1, "val_count": 1, "test_count": 0, "excluded_count": 0,
+        "dataset_mode": "single", "primary_modality": "rgb",
+    }
+
+    class FakeDb:
+        def query(self, sql, params=(), fetchone=False):
+            captured.append(sql)
+            if "FROM datasets" in sql:
+                return [formal]
+            if "FROM dataset_drafts" in sql:
+                return [draft]
+            raise AssertionError(sql)
+
+    monkeypatch.setattr(dataset_route, "db", FakeDb())
+    client = _draft_client(monkeypatch)
+    response = client.get(
+        "/api/dataset/list?record_kind=all&page=1&page_size=10",
+        headers={"Authorization": f"Bearer {generate_token(8)}"},
+    )
+    body = json.loads(response.data)
+    assert body["code"] == 200
+    assert [item["record_kind"] for item in body["data"]["datasets"]] == ["draft", "formal"]
+    assert body["data"]["datasets"][0]["split_counts"]["unassigned"] == 2
+    draft_query = next(sql for sql in captured if "FROM dataset_drafts" in sql)
+    assert "workflow_status != 'finalized'" in draft_query
+
+    filtered = client.get(
+        "/api/dataset/list?record_kind=draft&workflow_status=draft",
+        headers={"Authorization": f"Bearer {generate_token(8)}"},
+    )
+    filtered_body = json.loads(filtered.data)
+    assert filtered_body["code"] == 200
+    assert len(filtered_body["data"]["datasets"]) == 1
+    assert "workflow_status = ?" in captured[-1]
+
+
+def test_draft_assignment_route_passes_atomic_sample_selection(monkeypatch):
+    import routes.dataset as dataset_route
+
+    captured = {}
+    monkeypatch.setattr(dataset_route, "assign_draft_samples", lambda *args: captured.update({"args": args}) or {"updated": 2})
+    monkeypatch.setattr(dataset_route, "db", object())
+    client = _draft_client(monkeypatch)
+    response = client.post(
+        "/api/dataset/drafts/draft-1/assign",
+        headers={"Authorization": f"Bearer {generate_token(8)}"},
+        json={"sample_ids": ["s1", "s2"], "split": "train"},
+    )
+    body = json.loads(response.data)
+    assert body["code"] == 200
+    assert captured["args"][:3] == ("draft-1", ["s1", "s2"], "train")
+
+
+def test_sample_preview_streams_stored_image_with_derived_mime(monkeypatch):
+    import routes.dataset as dataset_route
+    from services.dataset_draft_service import DraftSampleResult
+
+    sample = DraftSampleResult(
+        id="sample-1", draft_id="draft-1", sample_key="frame_000001",
+        rgb_bucket="images", rgb_object_key="path/frame_000001.png",
+    )
+    monkeypatch.setattr(dataset_route, "get_draft", lambda *_args: {"id": "draft-1"})
+    monkeypatch.setattr(dataset_route, "get_draft_sample", lambda *_args: sample)
+    monkeypatch.setattr(dataset_route.file_client, "get", lambda bucket, key: b"png bytes")
+    monkeypatch.setattr(dataset_route, "db", object())
+    client = _draft_client(monkeypatch)
+    response = client.get(
+        "/api/dataset/drafts/draft-1/samples/sample-1/preview/rgb",
+        headers={"Authorization": f"Bearer {generate_token(8)}"},
+    )
+    assert response.status_code == 200
+    assert response.mimetype == "image/png"
+    assert response.data == b"png bytes"
+
+
+def test_secondary_repair_reports_sample_ownership_validation(monkeypatch, tmp_path):
+    import routes.dataset as dataset_route
+    from services.dataset_draft_service import DraftSampleResult, DraftValidationError
+
+    class FakeFileClient:
+        def __init__(self):
+            self.deleted = []
+
+        def upload(self, bucket, path):
+            return {"bucket": bucket, "objectKey": "repair.jpg"}
+
+        def delete(self, bucket, key):
+            self.deleted.append((bucket, key))
+
+    storage = FakeFileClient()
+    monkeypatch.setattr(dataset_route, "TEMP_DIR", str(tmp_path))
+    monkeypatch.setattr(dataset_route, "file_client", storage)
+    monkeypatch.setattr(
+        dataset_route,
+        "get_draft_sample",
+        lambda *_args: DraftSampleResult(
+            id="foreign-sample", draft_id="draft-1", sample_key="frame-1"
+        ),
+    )
+    monkeypatch.setattr(
+        dataset_route,
+        "repair_draft_sample_secondary",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(DraftValidationError("样本不存在或不属于该数据集")),
+    )
+    monkeypatch.setattr(dataset_route, "db", object())
+    client = _draft_client(monkeypatch)
+    response = client.post(
+        "/api/dataset/drafts/draft-1/samples/foreign-sample/secondary",
+        headers={"Authorization": f"Bearer {generate_token(8)}"},
+        data={"file": (io.BytesIO(b"image bytes"), "repair.jpg")},
+        content_type="multipart/form-data",
+    )
+    body = json.loads(response.data)
+    assert body["code"] == 400
+    assert "不属于" in body["msg"]
+    assert storage.deleted == [("dataset_images", "repair.jpg")]
+
+
+def test_finalize_draft_route_returns_formal_dataset(monkeypatch, tmp_path):
+    import routes.dataset as dataset_route
+
+    result = {"dataset_id": "draft-1", "name": "ready", "sample_count": 4}
+    monkeypatch.setattr(dataset_route, "TEMP_DIR", str(tmp_path))
+    monkeypatch.setattr(dataset_route, "finalize_draft", lambda *_args: SimpleNamespace(to_dict=lambda: result))
+    monkeypatch.setattr(dataset_route, "db", object())
+    monkeypatch.setattr(dataset_route, "file_client", object())
+    client = _draft_client(monkeypatch)
+    response = client.post(
+        "/api/dataset/drafts/draft-1/finalize",
+        headers={"Authorization": f"Bearer {generate_token(8)}"},
+    )
+    body = json.loads(response.data)
+    assert body["code"] == 200
+    assert body["data"]["dataset_id"] == "draft-1"
+
+
+def test_retry_rejects_non_failed_draft(monkeypatch):
+    import routes.dataset as dataset_route
+    monkeypatch.setattr(dataset_route, "get_draft", lambda *_args: {"id": "draft-1", "workflow_status": "draft"})
+    monkeypatch.setattr(dataset_route, "db", object())
+    client = _draft_client(monkeypatch)
+    response = client.post(
+        "/api/dataset/drafts/draft-1/retry",
+        headers={"Authorization": f"Bearer {generate_token(8)}"},
+    )
+    body = json.loads(response.data)
+    assert body["code"] == 400
+    assert "失败" in body["msg"]

@@ -15,8 +15,8 @@
     <div class="page-header">
       <div class="header-content">
         <div class="header-left">
-          <h1 class="page-title">实时检测记录</h1>
-          <p class="page-subtitle">查看和管理光伏板缺陷实时检测的历史记录与会话数据</p>
+          <h1 class="page-title">实时记录</h1>
+          <p class="page-subtitle">查看和管理海上风电场实时巡检的历史记录与会话数据</p>
         </div>
         <div class="header-right">
           <el-button @click="refreshRecords" :loading="loading" type="primary" class="refresh-btn">

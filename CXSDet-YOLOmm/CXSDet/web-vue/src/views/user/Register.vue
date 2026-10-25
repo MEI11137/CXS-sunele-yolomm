@@ -14,12 +14,12 @@
       <div class="background-overlay"></div>
       <div class="content-wrapper">
         <div class="logo-section">
-          <h1 class="system-title">光伏板缺陷检测系统</h1>
+          <h1 class="system-title">海上风电场检测系统</h1>
         </div>
         <div class="intro-section">
           <p class="intro-description">
-            基于深度学习的光伏板缺陷检测系统，支持实时检测、批量处理、智能分析等功能。
-            提供高精度、高效率的缺陷识别服务，助力光伏电站运维效率提升。
+            面向海上风电场的巡检影像检测系统，支持图片、视频与实时检测，
+            并由人工确认结果回流训练，持续迭代模型。
           </p>
           <div class="feature-list">
             <div class="feature-item">
@@ -45,7 +45,7 @@
         <div class="register-header">
           <img src="@/assets/images/logo.png" alt="Logo" class="header-logo" />
           <h2 class="register-title">用户注册</h2>
-          <p class="register-subtitle">创建您的光伏板缺陷检测系统账户</p>
+          <p class="register-subtitle">创建您的海上风电场检测系统账户</p>
         </div>
         
         <el-form
