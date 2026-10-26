@@ -18,6 +18,7 @@ import type {
   DatasetSummary,
   DetectionModel,
   DetectionRecordSummary,
+  ModelSummary,
   PageResult,
   PersonalConnection,
   ResourceRef,
@@ -118,6 +119,13 @@ export interface DefectItem {
   severity: 'low' | 'medium' | 'high'
 }
 
+export interface SendMessageOptions {
+  /** 已登记的项目资源 id：后端只认这个，不认文件名 */
+  resourceRefs?: Array<{ id: string; kind?: ResourceKind; display_name?: string }>
+  onDelta?: (delta: string) => void
+  signal?: AbortSignal
+}
+
 export interface ApiAdapter {
   readonly mode: Mode
 
@@ -152,7 +160,7 @@ export interface ApiAdapter {
     apiKey?: string
   }): Promise<PersonalConnection>
   deleteConnection(): Promise<void>
-  checkConnection(): Promise<ConnectionCapabilities>
+  checkConnection(): Promise<PersonalConnection>
 
   // -------------------------------------------------------------- 资源
   listResources(projectId: string, kinds?: ResourceKind[]): Promise<ResourceRef[]>
@@ -172,12 +180,7 @@ export interface ApiAdapter {
   /** 会话列表不含完整消息，必须显式拉取历史。 */
   listMessages(sessionId: string): Promise<ChatMessage[]>
   createSession(projectId: string, title: string): Promise<Session>
-  sendMessage(
-    sessionId: string,
-    content: string,
-    onDelta?: (delta: string) => void,
-    signal?: AbortSignal,
-  ): Promise<ChatTurn>
+  sendMessage(sessionId: string, content: string, options?: SendMessageOptions): Promise<ChatTurn>
   listEvents(sessionId: string, afterSequence: number): Promise<AgentEvent[]>
 
   // -------------------------------------------------------------- 任务
@@ -202,10 +205,43 @@ export interface ApiAdapter {
   requestAiReview(recordId: string): Promise<Record<string, unknown>>
   submitHumanReview(recordId: string, input: HumanReviewInput): Promise<Record<string, unknown>>
   addFeedback(recordId: string, input: { datasetId: string }): Promise<Record<string, unknown>>
+  /** 批量回流：每条记录自动回到它所属模型的原训练数据集 */
+  addFeedbackBatch(recordIds: string[]): Promise<Record<string, unknown>>
   listCategories(): Promise<Array<{ id: number; name: string; label: string; color?: string }>>
+  /**
+   * 明确业务动作入口：用户显式选定模型与影像后直接推理。
+   * 与"由 Agent 规划"是两条路，二者都不绕过人工确认。
+   */
+  detectImage(input: {
+    modelId: string
+    file: File
+    xFile?: File
+    confidence: number
+    title?: string
+  }): Promise<DetectionRecordSummary>
   listDatasets(query?: PageQuery): Promise<PageResult<DatasetSummary>>
+  /** 上传一个 YOLO 结构 ZIP 并登记为数据集（后端校验结构后才算成功） */
+  uploadDataset(input: {
+    file: File
+    name: string
+    description?: string
+    datasetMode: 'single' | 'multimodal'
+    secondaryModality?: string
+    classNames?: string[]
+  }): Promise<Record<string, unknown>>
   listModels(query?: PageQuery): Promise<PageResult<DetectionModel>>
+  /** 模型详情：含真实 status(0-4)、发布状态与指标，列表 DTO 不够用 */
+  getModelDetail(modelId: string): Promise<ModelSummary | null>
   compareModels(parentId: string, childId: string): Promise<Record<string, unknown>>
+  /** 发布模型：后端按本人/项目范围归档同模态旧版本 */
+  publishModel(modelId: string): Promise<Record<string, unknown>>
+  /** 导入外部训练好的 .pt 权重，登记为草稿模型（需选来源数据集） */
+  importModelWeight(input: {
+    name: string
+    description?: string
+    datasetId: string
+    weight: File
+  }): Promise<Record<string, unknown>>
 
   // ------------------------------------------------- 兼容旧页面的读接口
   /** 复核队列：真实实现由检测记录映射，不再使用内置假数据。 */

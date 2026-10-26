@@ -11,10 +11,10 @@ import type {
   ChatMessage,
   ChatTurn,
   Confirmation,
-  ConnectionCapabilities,
   DatasetSummary,
   DetectionModel,
   DetectionRecordSummary,
+  ModelSummary,
   PageResult,
   PersonalConnection,
   ResourceRef,
@@ -31,6 +31,7 @@ import {
   type ManualInfo,
   type Mode,
   type PageQuery,
+  type SendMessageOptions,
   type TaskSnapshot,
   type ToolInfo,
   type WorkspaceOverview,
@@ -78,7 +79,7 @@ export abstract class BaseAdapter implements ApiAdapter {
   async deleteConnection(): Promise<void> {
     this.unsupported('删除个人连接')
   }
-  async checkConnection(): Promise<ConnectionCapabilities> {
+  async checkConnection(): Promise<PersonalConnection> {
     return this.unsupported('检查个人连接')
   }
 
@@ -111,8 +112,7 @@ export abstract class BaseAdapter implements ApiAdapter {
   async sendMessage(
     _sessionId?: string,
     _content?: string,
-    _onDelta?: (delta: string) => void,
-    _signal?: AbortSignal,
+    _options?: SendMessageOptions,
   ): Promise<ChatTurn> {
     return this.unsupported('发送消息')
   }
@@ -176,11 +176,29 @@ export abstract class BaseAdapter implements ApiAdapter {
   async listDatasets(_query?: PageQuery): Promise<PageResult<DatasetSummary>> {
     return this.unsupported('数据集列表')
   }
+  async uploadDataset(_input?: unknown): Promise<Record<string, unknown>> {
+    return this.unsupported('数据集导入')
+  }
+  async publishModel(_modelId?: string): Promise<Record<string, unknown>> {
+    return this.unsupported('模型发布')
+  }
+  async importModelWeight(_input?: unknown): Promise<Record<string, unknown>> {
+    return this.unsupported('模型权重导入')
+  }
+  async addFeedbackBatch(_recordIds?: string[]): Promise<Record<string, unknown>> {
+    return this.unsupported('批量反馈回流')
+  }
   async listModels(_query?: PageQuery): Promise<PageResult<DetectionModel>> {
     return this.unsupported('模型列表')
   }
+  async getModelDetail(_modelId?: string): Promise<ModelSummary | null> {
+    return this.unsupported('模型详情')
+  }
   async compareModels(_parentId?: string, _childId?: string): Promise<Record<string, unknown>> {
     return this.unsupported('模型对比')
+  }
+  async detectImage(_input?: unknown): Promise<DetectionRecordSummary> {
+    return this.unsupported('直接检测')
   }
 
   async listDefects(_projectId?: string): Promise<DefectItem[]> {

@@ -1,9 +1,32 @@
 <script setup lang="ts">
+import { ref, onMounted } from 'vue'
 import { useGuideStore } from '@/stores/guide'
+import { getAdapter } from '@/services'
+import type { ManualInfo } from '@/services'
 
 const guide = useGuideStore()
 
-const version = 'V1（Agent 化改造）'
+// 版本号与手册清单都来自后端，不再写死
+const version = ref('')
+const manuals = ref<ManualInfo[]>([])
+const loading = ref(false)
+const loadError = ref('')
+
+onMounted(async () => {
+  loading.value = true
+  try {
+    const [overview, list] = await Promise.all([
+      getAdapter().getOverview(),
+      getAdapter().listManuals(),
+    ])
+    version.value = overview.version
+    manuals.value = list
+  } catch (e) {
+    loadError.value = '读取手册失败：' + (e as Error).message
+  } finally {
+    loading.value = false
+  }
+})
 </script>
 
 <template>
@@ -15,7 +38,7 @@ const version = 'V1（Agent 化改造）'
     <section class="section">
       <h2 class="section-title">当前版本说明</h2>
       <div class="panel manual-card">
-        <h3 class="manual-title">海巡智检 · {{ version }}</h3>
+        <h3 class="manual-title">海巡智检 · {{ version ? 'v' + version : '（版本读取中）' }}</h3>
         <p class="manual-desc">
           海上风电叶片巡检工作平台，面向影像巡检、检测计划确认、缺陷人工复核与项目资源管理。
         </p>
@@ -39,10 +62,28 @@ const version = 'V1（Agent 化改造）'
     <section class="section">
       <h2 class="section-title">手册资料</h2>
       <div class="panel manual-card">
-        <div class="empty">
-          <div class="empty-title">暂无上传的手册</div>
-          <div class="empty-desc">文档解析、索引及引用来源需接入真实解析服务（第三人）后可用。</div>
+        <div v-if="loading" class="empty"><div class="empty-desc">正在读取手册…</div></div>
+        <div v-else-if="loadError" class="empty">
+          <div class="empty-title">读取失败</div>
+          <div class="empty-desc">{{ loadError }}</div>
         </div>
+        <div v-else-if="!manuals.length" class="empty">
+          <div class="empty-title">暂无可用手册</div>
+          <div class="empty-desc">后端尚未返回任何内置或自建手册。</div>
+        </div>
+        <table v-else class="data-table">
+          <thead>
+            <tr><th>名称</th><th>版本</th><th>来源</th><th>摘要</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="m in manuals" :key="m.id">
+              <td>{{ m.name }}</td>
+              <td class="num">v{{ m.version }}</td>
+              <td><span class="tag">{{ m.source || '内置' }}</span></td>
+              <td class="hint">{{ m.summary || '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </section>
   </div>

@@ -1,47 +1,43 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
+import { getAdapter } from '@/services'
+import type { ToolInfo } from '@/services'
 
-// MCP / 目录授权（由第三人实现，此处为界面 + 模拟状态）
-const mcps = ref([
-  { id: 'mcp1', name: '本地文件 MCP', type: '本机', status: 'disconnected', tools: [] as { name: string; desc: string; readonly: boolean; authorized: boolean }[] },
-  { id: 'mcp2', name: '目录浏览工具', type: '本机', status: 'disconnected', tools: [] as { name: string; desc: string; readonly: boolean; authorized: boolean }[] },
-])
+// 这里只展示后端真实提供的工具与授权记录。
+// MCP 服务器的连接管理（握手、发现工具、逐工具放行）目前**没有 HTTP 接口**，
+// 因此页面不提供"连接"按钮，也不假装已连接。
+const tools = ref<ToolInfo[]>([])
+const grants = ref<Array<Record<string, unknown>>>([])
+const loading = ref(false)
+const loadError = ref('')
 
-const dirs = ref<{ path: string; scope: string; readonly: boolean; authorized: boolean }[]>([])
-const dirNotice = ref('')
-
-function connectMcp(m: typeof mcps.value[0]) {
-  // 模拟：列出工具清单
-  m.tools = [
-    { name: 'list_files', desc: '列出目录文件', readonly: true, authorized: false },
-    { name: 'read_file', desc: '读取文件内容', readonly: true, authorized: false },
-    { name: 'write_file', desc: '写入文件', readonly: false, authorized: false },
-  ]
-  m.status = 'connected'
-}
-
-function disconnectMcp(m: typeof mcps.value[0]) {
-  m.status = 'disconnected'
-  m.tools = []
-}
-
-function authorizeTool(_m: typeof mcps.value[0], tool: { name: string; desc: string; readonly: boolean; authorized: boolean }) {
-  if (!tool.readonly) {
-    dirNotice.value = '仅允许逐个放行经核对的只读工具；写入类工具需额外确认。'
-    return
+async function load() {
+  loading.value = true
+  loadError.value = ''
+  try {
+    const [t, g] = await Promise.all([getAdapter().listTools(), getAdapter().listGrants()])
+    tools.value = t
+    grants.value = g
+  } catch (e) {
+    loadError.value = '读取工具清单失败：' + (e as Error).message
+  } finally {
+    loading.value = false
   }
-  tool.authorized = true
 }
 
-function addDir() {
-  // 模拟：目录选择仅授权该目录，不等于获得整台电脑权限
-  dirs.value.push({
-    path: 'D:/demo/叶片数据集',
-    scope: '仅该目录',
-    readonly: true,
-    authorized: true,
-  })
-  dirNotice.value = '目录已授权（只读）。浏览器选择目录不等于服务器获得整台电脑的文件访问权限。'
+onMounted(load)
+
+/** 工具名去掉内部前缀，便于阅读；真实名保留在 title 里 */
+function shortName(name: string): string {
+  return name.replace(/^business_/, '')
+}
+
+function riskLabel(risk: string): string {
+  return risk === 'write' ? '写入' : risk === 'external' ? '外部调用' : '只读'
+}
+
+function riskClass(risk: string): string {
+  return risk === 'write' ? 'tag-warn' : risk === 'external' ? 'tag-error' : 'tag-success'
 }
 </script>
 
@@ -49,73 +45,88 @@ function addDir() {
   <div class="page">
     <div class="page-header">
       <h1 class="page-title">扩展与连接</h1>
-      <span class="tag">交互原型 · 模拟数据</span>
+      <span class="tag num">{{ tools.length }} 个工具 · {{ grants.length }} 条授权</span>
     </div>
 
-    <!-- MCP 连接 -->
+    <div v-if="loadError" class="notice notice-error">{{ loadError }}</div>
+
     <section class="section">
-      <h2 class="section-title">MCP / 工具连接</h2>
-      <div class="mcp-list">
-        <div v-for="m in mcps" :key="m.id" class="panel mcp-card">
-          <div class="mcp-head">
-            <div class="mcp-name">{{ m.name }}</div>
-            <div class="mcp-meta">
-              <span class="tag">{{ m.type }}</span>
-              <span class="tag" :class="m.status === 'connected' ? 'tag-success' : ''">
-                {{ m.status === 'connected' ? '已连接' : '未连接' }}
-              </span>
-            </div>
-          </div>
-          <div v-if="m.tools.length" class="tool-list">
-            <div class="tool-item" v-for="t in m.tools" :key="t.name">
-              <div class="tool-info">
-                <span class="tool-name mono">{{ t.name }}</span>
-                <span class="tool-desc">{{ t.desc }}</span>
-                <span class="tag" :class="t.readonly ? 'tag-accent' : ''">{{ t.readonly ? '只读' : '可写' }}</span>
-              </div>
-              <button
-                v-if="!t.authorized"
-                class="btn btn-sm"
-                :disabled="!t.readonly"
-                @click="authorizeTool(m, t)"
-              >
-                {{ t.readonly ? '授权' : '需额外确认' }}
-              </button>
-              <span v-else class="tag tag-success">已授权</span>
-            </div>
-          </div>
-          <div class="mcp-actions">
-            <button v-if="m.status === 'disconnected'" class="btn btn-sm" @click="connectMcp(m)">连接</button>
-            <button v-else class="btn btn-sm btn-danger" @click="disconnectMcp(m)">断开</button>
-          </div>
-        </div>
+      <h2 class="section-title">当前可用工具（同一份清单也给模型看）</h2>
+      <div v-if="loading" class="empty panel"><div class="empty-desc">正在读取…</div></div>
+      <div v-else-if="!tools.length" class="empty panel">
+        <div class="empty-title">没有可用工具</div>
+        <div class="empty-desc">业务后端未注入或当前账号没有可用工具。</div>
+      </div>
+      <div v-else class="panel table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr><th>工具</th><th>说明</th><th>风险</th><th>需要确认</th><th>状态</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="t in tools" :key="t.name">
+              <td class="mono" :title="t.name">{{ shortName(t.name) }}</td>
+              <td class="hint">{{ t.description || t.title }}</td>
+              <td><span class="tag" :class="riskClass(t.risk)">{{ riskLabel(t.risk) }}</span></td>
+              <td>{{ t.requires_confirmation ? '是' : '否' }}</td>
+              <td>
+                <span class="tag" :class="t.available ? 'tag-success' : 'tag-error'">
+                  {{ t.available ? '可用' : '不可用' }}
+                </span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </section>
 
-    <!-- 目录授权 -->
     <section class="section">
-      <h2 class="section-title">目录授权</h2>
-      <div class="panel dir-card">
-        <p class="dir-desc">授权目录用于文件检查、修改预览与候选输出。目录授权仅针对所选目录，不等于授予整台电脑的文件访问权限。</p>
-        <button class="btn" @click="addDir">选择目录</button>
-        <div v-if="dirs.length" class="dir-list">
-          <div v-for="d in dirs" :key="d.path" class="dir-item">
-            <span class="mono">{{ d.path }}</span>
-            <span class="tag tag-accent">只读</span>
-            <button class="btn btn-sm btn-danger btn-ghost" @click="dirs = dirs.filter(x => x.path !== d.path)">移除</button>
-          </div>
+      <h2 class="section-title">外部工具授权</h2>
+      <div v-if="!grants.length" class="empty panel">
+        <div class="empty-title">暂无授权记录</div>
+        <div class="empty-desc">
+          外部 MCP 工具需要逐个放行已核对的只读工具；当前后端尚未提供 MCP 连接管理接口，
+          因此这里不会出现"已连接"的假状态。
         </div>
+      </div>
+      <div v-else class="panel table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr><th>服务</th><th>工具</th><th>版本</th><th>范围</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="(g, i) in grants" :key="i">
+              <td class="mono">{{ g.server_id }}</td>
+              <td class="mono">{{ g.tool_name }}</td>
+              <td class="num">{{ g.tool_version }}</td>
+              <td>{{ g.project_id || '当前账号' }}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </section>
 
-    <div v-if="dirNotice" class="notice">{{ dirNotice }}</div>
+    <section class="section">
+      <h2 class="section-title">暂不可用的能力</h2>
+      <div class="panel notice-block">
+        <ul class="cap-list">
+          <li>
+            <strong>MCP 服务器连接</strong>：后端只有工具授权（grants）与注册接口，
+            缺少真实传输、握手与工具发现，所以本页不提供"连接"入口，避免出现假连接。
+          </li>
+          <li>
+            <strong>受控目录授权</strong>：目录类工具（inspect / search / transform）由助手在对话中按授权目录调用，
+            页面暂未提供可视化选择器。
+          </li>
+        </ul>
+      </div>
+    </section>
   </div>
 </template>
 
 <style scoped>
 .page {
   padding: var(--content-pad);
-  max-width: 800px;
+  max-width: 1000px;
   margin: 0 auto;
 }
 .page-header {
@@ -137,80 +148,28 @@ function addDir() {
   font-weight: 600;
   margin: 0 0 12px;
 }
-.mcp-list {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+.table-wrap {
+  padding: 0;
+  overflow-x: auto;
 }
-.mcp-card {
-  padding: 16px;
+.data-table th {
+  white-space: nowrap;
 }
-.mcp-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 12px;
+.data-table td {
+  vertical-align: top;
 }
-.mcp-name {
-  font-size: 14px;
-  font-weight: 600;
-}
-.mcp-meta {
-  display: flex;
-  gap: 6px;
-}
-.tool-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-.tool-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 8px 10px;
-  background: var(--panel-secondary);
-  border-radius: var(--radius-sm);
-}
-.tool-info {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.tool-name {
-  font-size: 12px;
-}
-.tool-desc {
+.hint {
   font-size: 12px;
   color: var(--text-secondary);
 }
-.mcp-actions {
-  display: flex;
-  justify-content: flex-end;
-}
-.dir-card {
+.notice-block {
   padding: 16px;
 }
-.dir-desc {
+.cap-list {
+  margin: 0;
+  padding-left: 18px;
   font-size: 13px;
+  line-height: 1.7;
   color: var(--text-secondary);
-  line-height: 1.6;
-  margin: 0 0 12px;
-}
-.dir-list {
-  margin-top: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.dir-item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
-  background: var(--panel-secondary);
-  border-radius: var(--radius-sm);
-  font-size: 12px;
 }
 </style>

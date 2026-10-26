@@ -17,6 +17,7 @@ import type {
   DatasetSummary,
   DetectionModel,
   DetectionRecordSummary,
+  ModelSummary,
   PageResult,
   PersonalConnection,
   ResourceRef,
@@ -51,6 +52,7 @@ import type {
   ManualInfo,
   Mode,
   PageQuery,
+  SendMessageOptions,
   TaskSnapshot,
   ToolInfo,
   WorkspaceOverview,
@@ -185,9 +187,10 @@ export class RealAdapter extends BaseAdapter {
     await http.del('/api/agent/connection')
   }
 
-  async checkConnection(): Promise<ConnectionCapabilities> {
+  async checkConnection(): Promise<PersonalConnection> {
+    // 后端返回的是完整连接视图（含 capabilities 与 checked_now），不是裸能力表
     const data = await http.post<unknown>('/api/agent/connection/check')
-    return raw(data) as unknown as ConnectionCapabilities
+    return raw(data) as unknown as PersonalConnection
   }
 
   // ---------------------------------------------------------------- 资源
@@ -289,16 +292,18 @@ export class RealAdapter extends BaseAdapter {
   async sendMessage(
     sessionId: string,
     content: string,
-    _onDelta?: (delta: string) => void,
-    signal?: AbortSignal,
+    options: SendMessageOptions = {},
   ): Promise<ChatTurn> {
     // 后端这一轮是同步返回复合结果（reply/task/action/plan），没有 token 流；
     // 不伪造逐字输出，界面按"等待结果"处理。
-    const data = await http.post<unknown>(
-      `/api/agent/sessions/${sessionId}/messages`,
-      { text: content },
-      { signal },
-    )
+    // 附件只以已登记资源 id 传递，绝不把文件名当输入。
+    const body: Raw = { text: content }
+    if (options.resourceRefs?.length) {
+      body.resource_refs = options.resourceRefs.map((ref) => ({ id: ref.id }))
+    }
+    const data = await http.post<unknown>(`/api/agent/sessions/${sessionId}/messages`, body, {
+      signal: options.signal,
+    })
     return mapChatTurn(sessionId, data)
   }
 
@@ -507,6 +512,88 @@ export class RealAdapter extends BaseAdapter {
       page: Number(data.page ?? query.page ?? 1),
       pageSize: Number(data.page_size ?? query.pageSize ?? 20),
     }
+  }
+
+  async detectImage(input: {
+    modelId: string
+    file: File
+    xFile?: File
+    confidence: number
+    title?: string
+  }): Promise<DetectionRecordSummary> {
+    const form = new FormData()
+    form.append('model_id', input.modelId)
+    form.append('confidence_threshold', String(input.confidence))
+    if (input.title) form.append('title', input.title)
+    form.append('image', input.file, input.file.name)
+    if (input.xFile) form.append('x_image', input.xFile, input.xFile.name)
+
+    // 后端在推理成功后自动落库并返回 record_id，前端不能自己编造记录
+    const data = raw(await http.upload<unknown>('/api/detection/detect', form))
+    const recordId = toString(data.record_id)
+    if (!recordId) {
+      throw new Error('检测接口未返回记录号，结果不可确认')
+    }
+    if (data.record_saved === false) {
+      throw new Error('检测完成但记录未保存，无法进入复核队列')
+    }
+    const record = await this.getRecord(recordId)
+    if (!record) {
+      throw new Error('检测记录已生成但读取失败：' + recordId)
+    }
+    return record
+  }
+
+  async uploadDataset(input: {
+    file: File
+    name: string
+    description?: string
+    datasetMode: 'single' | 'multimodal'
+    secondaryModality?: string
+    classNames?: string[]
+  }): Promise<Record<string, unknown>> {
+    const form = new FormData()
+    form.append('file', input.file, input.file.name)
+    form.append('name', input.name)
+    form.append('description', input.description ?? '')
+    form.append('dataset_mode', input.datasetMode)
+    if (input.datasetMode === 'multimodal' && input.secondaryModality) {
+      form.append('secondary_modality', input.secondaryModality)
+    }
+    if (input.classNames?.length) form.append('class_names', input.classNames.join(','))
+    return raw(await http.upload<unknown>('/api/dataset/upload', form))
+  }
+
+  async publishModel(modelId: string): Promise<Record<string, unknown>> {
+    return raw(await http.post<unknown>(`/api/model/${modelId}/publish`))
+  }
+
+  async importModelWeight(input: {
+    name: string
+    description?: string
+    datasetId: string
+    weight: File
+  }): Promise<Record<string, unknown>> {
+    const form = new FormData()
+    form.append('name', input.name)
+    form.append('description', input.description ?? '')
+    form.append('dataset_id', input.datasetId)
+    form.append('weight', input.weight, input.weight.name)
+    // 后端会真实验证权重可加载，失败即报错
+    return raw(await http.upload<unknown>('/api/model/import', form))
+  }
+
+  async addFeedbackBatch(recordIds: string[]): Promise<Record<string, unknown>> {
+    return raw(
+      await http.post<unknown>('/api/detection/records/feedback/batch', { record_ids: recordIds }),
+    )
+  }
+
+  async getModelDetail(modelId: string): Promise<ModelSummary | null> {
+    const data = await http.get<unknown>(`/api/model/${modelId}`)
+    if (!data || typeof data !== 'object') return null
+    const summary = mapModel(data)
+    return { ...summary, is_personal: true }
   }
 
   async compareModels(parentId: string, childId: string): Promise<Record<string, unknown>> {

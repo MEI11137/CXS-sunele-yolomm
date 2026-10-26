@@ -18,7 +18,7 @@ import type {
   Workspace,
 } from '@/types'
 import { BaseAdapter } from './adapter-base'
-import type { DefectItem, Mode, TaskSnapshot } from './types'
+import type { DefectItem, Mode, SendMessageOptions, TaskSnapshot } from './types'
 import {
   mockDefects,
   mockModels,
@@ -145,18 +145,17 @@ export class MockAdapter extends BaseAdapter {
   async sendMessage(
     sessionId: string,
     content: string,
-    onDelta?: (delta: string) => void,
-    signal?: AbortSignal,
+    options: SendMessageOptions = {},
   ): Promise<ChatTurn> {
     const reply = this.mockReply(content)
     let i = 0
     while (i < reply.length) {
-      if (signal?.aborted) {
+      if (options.signal?.aborted) {
         throw new DOMException('Aborted', 'AbortError')
       }
       const chunk = reply.slice(i, i + 3)
       i += 3
-      onDelta?.(chunk)
+      options.onDelta?.(chunk)
       await delay(18)
     }
     const message: ChatMessage = {

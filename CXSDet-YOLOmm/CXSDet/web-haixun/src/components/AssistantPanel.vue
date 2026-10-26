@@ -2,7 +2,8 @@
 import { ref, computed, watch, nextTick, onMounted } from 'vue'
 import { useSessionStore } from '@/stores/session'
 import { useWorkspaceStore } from '@/stores/workspace'
-import type { ChatMessage, Attachment } from '@/types'
+import { getAdapter } from '@/services'
+import type { ChatMessage, Attachment, ResourceKind } from '@/types'
 
 const props = defineProps<{ open: boolean; mobile?: boolean }>()
 const emit = defineEmits<{ toggle: [] }>()
@@ -19,6 +20,7 @@ const mobileOpen = ref(false)
 const attachments = ref<Attachment[]>([])
 const showSessionList = ref(false)
 const fileInput = ref<HTMLInputElement | null>(null)
+const attachNotice = ref('')
 
 const isCompact = computed(() => !props.open && !props.mobile)
 
@@ -47,31 +49,71 @@ async function send() {
   if (!text && attachments.value.length === 0) return
   if (session.streaming) return
 
-  if (!session.current()) {
-    await session.createSession(workspace.currentId || 'ws-default')
+  attachNotice.value = ''
+  // 附件必须先上传并登记成项目资源，未完成时不允许发送
+  const pending = attachments.value.filter(
+    (a) => a.state === 'selected' || a.state === 'uploading',
+  )
+  if (pending.length) {
+    attachNotice.value = '还有附件正在上传，请稍候'
+    return
+  }
+  const failed = attachments.value.filter((a) => a.state === 'failed')
+  if (failed.length) {
+    attachNotice.value = '有附件上传失败，请重试或移除后再发送'
+    return
   }
 
-  const content = text + (attachments.value.length ? `\n[附件: ${attachments.value.map(a => a.name).join(', ')}]` : '')
+  if (!session.current()) {
+    await session.createSession(workspace.currentId || '', '新会话')
+  }
+
+  const ready = attachments.value.filter((a) => a.state === 'uploaded' && a.resourceId)
+  const refs = ready.map((a) => ({
+    id: a.resourceId!,
+    kind: kindOf(a.name),
+    display_name: a.name,
+  }))
+  // 只回显附件名，真实内容由后端按 resource_refs 取，不把文件名当输入
+  const shown: Attachment[] = ready.map((a) => ({ ...a, file: undefined }))
+
+  // 后端 text 必填：只有附件时给一句明确指令，而不是拼文件名
+  const content = text || '请查看我上传的附件。'
   input.value = ''
   attachments.value = []
   scrollToBottom()
 
   abortCtrl.value = new AbortController()
-  await session.send(content, (delta) => {
-    // 流式增量更新当前助手消息
-    const cur = session.current()
-    if (cur && cur.messages.length) {
-      const last = cur.messages[cur.messages.length - 1]
-      if (last.streaming) last.content += delta
-    }
-    scrollToBottom()
-  }, abortCtrl.value.signal)
+  await session.send(
+    content,
+    {
+      resourceRefs: refs,
+      onDelta: (delta) => {
+        const cur = session.current()
+        if (cur && cur.messages.length) {
+          const last = cur.messages[cur.messages.length - 1]
+          if (last.streaming) last.content += delta
+        }
+        scrollToBottom()
+      },
+      signal: abortCtrl.value.signal,
+    },
+    shown,
+  )
   abortCtrl.value = null
   scrollToBottom()
 }
 
-function stop() {
+// 停止只中断本次等待，并同步请求后端停止任务（不假装已经停下）
+async function stop() {
   abortCtrl.value?.abort()
+  const taskId = session.lastTurn?.task?.id
+  if (!taskId) return
+  try {
+    await getAdapter().stopTask(taskId, '用户在助手面板停止')
+  } catch (e) {
+    attachNotice.value = '中断已发送，但后端停止失败：' + (e as Error).message
+  }
 }
 
 function onKeydown(e: KeyboardEvent) {
@@ -109,17 +151,75 @@ function onFileSelect(e: Event) {
   ;(e.target as HTMLInputElement).value = ''
 }
 
+function kindOf(name: string): ResourceKind {
+  const ext = name.split('.').pop()?.toLowerCase() ?? ''
+  if (['jpg', 'jpeg', 'png', 'webp', 'bmp'].includes(ext)) return 'image'
+  if (ext === 'zip') return 'dataset'
+  if (ext === 'pt') return 'model'
+  return 'manual'
+}
+
+/** 上传并登记为项目资源；失败保留 File 供重试。 */
+async function uploadAttachment(a: Attachment) {
+  const projectId = workspace.currentId
+  if (!projectId) {
+    a.state = 'failed'
+    a.error = '请先选择工作区'
+    return
+  }
+  if (!a.file) {
+    a.state = 'failed'
+    a.error = '本机文件已丢失，请重新选择'
+    return
+  }
+  a.state = 'uploading'
+  a.error = ''
+  try {
+    const asset = await getAdapter().uploadProjectFile(projectId, a.file)
+    const resource = await getAdapter().registerResource(projectId, {
+      kind: kindOf(a.name),
+      displayName: a.name,
+      metadata: { file_id: asset.file_id, content_type: asset.content_type },
+    })
+    a.fileId = asset.file_id
+    a.resourceId = resource.id
+    a.state = 'uploaded'
+  } catch (e) {
+    a.state = 'failed'
+    a.error = (e as Error).message
+  }
+}
+
 function addAttachment(f: File) {
   const ext = f.name.split('.').pop()?.toLowerCase() ?? ''
   const needsConvert = ext === 'doc'
-  attachments.value.push({
+  const item: Attachment = {
     id: 'a-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
     name: f.name,
     type: needsConvert ? 'doc（需转 docx）' : ext,
     size: f.size,
     source: 'local',
     state: 'selected',
-  })
+    // File 本体必须留下，否则上传失败无法重试、也无法真正上传
+    file: f,
+  }
+  attachments.value.push(item)
+  void uploadAttachment(item)
+}
+
+async function retryAttachment(a: Attachment) {
+  await uploadAttachment(a)
+}
+
+function removeAttachment(id: string) {
+  attachments.value = attachments.value.filter((x) => x.id !== id)
+}
+
+function attachLabel(a: Attachment): string {
+  if (a.state === 'uploading') return '上传中…'
+  if (a.state === 'uploaded') return '已上传'
+  if (a.state === 'failed') return a.error ? `失败：${a.error}` : '上传失败'
+  return '待上传'
 }
 
 function formatSize(n: number) {
@@ -129,7 +229,7 @@ function formatSize(n: number) {
 }
 
 async function newSession() {
-  await session.createSession(workspace.currentId || 'ws-default')
+  await session.createSession(workspace.currentId || '', '新会话')
   showSessionList.value = false
   scrollToBottom()
 }
@@ -200,12 +300,23 @@ onMounted(scrollToBottom)
 
       <footer class="assistant-input">
         <div v-if="attachments.length" class="attach-list">
-          <div v-for="a in attachments" :key="a.id" class="attach-chip">
+          <div
+            v-for="a in attachments"
+            :key="a.id"
+            class="attach-chip"
+            :class="'attach-' + a.state"
+          >
             <span class="attach-name">{{ a.name }}</span>
-            <span class="attach-meta">{{ a.type }} · {{ formatSize(a.size) }} · {{ a.state === 'selected' ? '待上传' : a.state }}</span>
-            <button class="attach-remove" aria-label="移除附件" @click="attachments = attachments.filter(x => x.id !== a.id)">✕</button>
+            <span class="attach-meta">{{ a.type }} · {{ formatSize(a.size) }} · {{ attachLabel(a) }}</span>
+            <button
+              v-if="a.state === 'failed'"
+              class="attach-retry"
+              @click="retryAttachment(a)"
+            >重试</button>
+            <button class="attach-remove" aria-label="移除附件" @click="removeAttachment(a.id)">✕</button>
           </div>
         </div>
+        <div v-if="attachNotice" class="attach-notice">{{ attachNotice }}</div>
         <div class="input-row">
           <textarea
             ref="textareaEl"
@@ -503,6 +614,27 @@ onMounted(scrollToBottom)
 .attach-meta {
   color: var(--text-secondary);
   font-size: 11px;
+}
+.attach-chip.attach-uploaded {
+  border-color: var(--success-border, #b7dfc4);
+}
+.attach-chip.attach-failed {
+  border-color: var(--danger-border, #f0b8b8);
+  background: var(--danger-bg, #fdf1f1);
+}
+.attach-retry {
+  border: 1px solid var(--border-control);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.attach-notice {
+  font-size: 11px;
+  color: var(--warn-text);
+  margin-bottom: 6px;
 }
 .attach-remove {
   margin-left: auto;

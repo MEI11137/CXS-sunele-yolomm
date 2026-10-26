@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useThemeStore } from '@/stores/theme'
 import { useGuideStore } from '@/stores/guide'
+import { getAdapter } from '@/services'
+import type { CapabilityEntry, PersonalConnection } from '@/types'
 
 const theme = useThemeStore()
 const guide = useGuideStore()
@@ -11,7 +13,8 @@ function setTheme(t: 'light' | 'dark') {
   theme.apply(t)
 }
 
-// 个人大模型连接（Key 不持久化，仅临时表单）
+// ---------------------------------------------------------------- 个人连接
+// Key 只提交给后端加密保存，界面永远只显示后端给的脱敏提示。
 const showConnDialog = ref(false)
 const connForm = ref({
   provider: 'deepseek',
@@ -19,57 +22,139 @@ const connForm = ref({
   model: 'deepseek-chat',
   apiKey: '',
 })
-const connState = ref<'idle' | 'testing' | 'saved' | 'error'>('idle')
-const savedConn = ref<{ provider: string; model: string; maskedKey: string } | null>(null)
-const capability = ref({ auth: false, chat: false, vision: false, tools: false })
+const connState = ref<'idle' | 'testing' | 'saving' | 'error'>('idle')
+const connection = ref<PersonalConnection | null>(null)
 const connNotice = ref('')
+const loading = ref(false)
+
+const configured = computed(() => !!connection.value?.configured)
+
+const capabilityRows = computed(() => {
+  const caps = connection.value?.capabilities ?? {}
+  const labels: Record<string, string> = {
+    chat: '文本对话',
+    vision: '图片理解',
+    tools: '工具调用',
+  }
+  return Object.keys(labels).map((key) => {
+    const entry: CapabilityEntry | undefined = caps[key]
+    return {
+      key,
+      label: labels[key],
+      status: entry?.status ?? 'unchecked',
+      message: entry?.message ?? '',
+    }
+  })
+})
+
+function statusText(status: string): string {
+  if (status === 'ok') return '可用'
+  if (status === 'failed') return '不可用'
+  if (status === 'unsupported') return '不支持'
+  return '未检测'
+}
+
+function statusClass(status: string): string {
+  if (status === 'ok') return 'tag-success'
+  if (status === 'failed') return 'tag-error'
+  return ''
+}
+
+/** 首次进入读取已保存的本人连接（服务端加密保存，不回读明文） */
+async function loadConnection() {
+  loading.value = true
+  try {
+    connection.value = await getAdapter().getConnection()
+    if (connection.value?.configured) {
+      connForm.value.provider = connection.value.provider || 'deepseek'
+      connForm.value.baseUrl = connection.value.api_url || 'https://api.deepseek.com'
+      connForm.value.model = connection.value.model || 'deepseek-chat'
+    }
+  } catch (e) {
+    connNotice.value = '读取个人连接失败：' + (e as Error).message
+    connState.value = 'error'
+  } finally {
+    loading.value = false
+  }
+}
+
+onMounted(loadConnection)
 
 function openConn() {
+  // 打开弹窗时不回填 Key：后端只给脱敏提示，页面上也清空输入
   connForm.value.apiKey = ''
   connState.value = 'idle'
   connNotice.value = ''
   showConnDialog.value = true
 }
 
+/** 保存：Key 留空表示沿用已保存的 Key（首次配置必须填） */
+async function saveConn(closeAfter = true): Promise<boolean> {
+  if (!configured.value && !connForm.value.apiKey.trim()) {
+    connNotice.value = '首次配置必须填写 API Key'
+    connState.value = 'error'
+    return false
+  }
+  connState.value = 'saving'
+  connNotice.value = ''
+  try {
+    connection.value = await getAdapter().saveConnection({
+      provider: connForm.value.provider,
+      apiUrl: connForm.value.baseUrl,
+      model: connForm.value.model,
+      apiKey: connForm.value.apiKey.trim() || undefined,
+    })
+    // 保存成功后立刻清空表单里的 Key，避免停留在界面上
+    connForm.value.apiKey = ''
+    connState.value = 'idle'
+    if (closeAfter) {
+      showConnDialog.value = false
+      connNotice.value = '个人连接已保存到本机，Key 由服务端加密存储。'
+    }
+    return true
+  } catch (e) {
+    connState.value = 'error'
+    connNotice.value = '保存失败：' + (e as Error).message
+    return false
+  }
+}
+
+/** 测试：后端要求先有已保存连接，因此先保存再执行真实能力检测 */
 async function testConnection() {
-  if (!connForm.value.apiKey) {
-    connNotice.value = '请先输入 API Key'
-    return
-  }
+  if (connState.value === 'testing' || connState.value === 'saving') return
   connState.value = 'testing'
-  capability.value = { auth: false, chat: false, vision: false, tools: false }
-  // 模拟能力检查（真实接口由第二人提供）
-  await new Promise((r) => setTimeout(r, 800))
-  capability.value = { auth: true, chat: true, vision: false, tools: false }
-  connState.value = 'saved'
-  connNotice.value = '连接测试通过（模拟）。文本能力可用，视觉与工具调用需后端能力检查确认。'
-}
-
-function saveConn() {
-  if (!connForm.value.apiKey) {
-    connNotice.value = '请先输入 API Key'
-    return
+  connNotice.value = ''
+  try {
+    if (connForm.value.apiKey.trim() || !configured.value) {
+      const saved = await saveConn(false)
+      if (!saved) {
+        connState.value = 'error'
+        return
+      }
+    }
+    connection.value = await getAdapter().checkConnection()
+    connState.value = 'idle'
+    const missing = connection.value?.missing_capabilities ?? []
+    connNotice.value = missing.length
+      ? '检测完成，以下能力仍不可用：' + missing.join('、')
+      : '检测完成，三项能力均可用。'
+  } catch (e) {
+    connState.value = 'error'
+    connNotice.value = '检测失败：' + (e as Error).message
   }
-  // Key 不持久化到 localStorage，仅内存脱敏展示
-  savedConn.value = {
-    provider: connForm.value.provider,
-    model: connForm.value.model,
-    maskedKey: maskKey(connForm.value.apiKey),
+}
+
+async function deleteConn() {
+  connNotice.value = ''
+  try {
+    await getAdapter().deleteConnection()
+    connection.value = { configured: false }
+    connForm.value.apiKey = ''
+    connNotice.value = '已删除当前个人连接。'
+  } catch (e) {
+    connState.value = 'error'
+    connNotice.value = '删除失败：' + (e as Error).message
   }
-  connState.value = 'saved'
-  showConnDialog.value = false
-  connNotice.value = '已保存（临时）。当前未接入后端密钥机制，关闭页面后需重新输入，Key 未持久化。'
-}
-
-function deleteConn() {
-  savedConn.value = null
-  connForm.value.apiKey = ''
-  connNotice.value = '已删除当前个人连接。'
-}
-
-function maskKey(key: string) {
-  if (key.length <= 8) return '••••••••'
-  return key.slice(0, 4) + '••••••••' + key.slice(-4)
 }
 </script>
 
@@ -121,26 +206,31 @@ function maskKey(key: string) {
         <div class="setting-row">
           <div class="setting-info">
             <div class="setting-name">助手大模型</div>
-            <div class="setting-desc">配置巡检助手使用的大模型，与检测模型相互独立</div>
+            <div class="setting-desc">配置巡检助手使用的大模型，与检测模型相互独立；Key 由服务端加密保存</div>
           </div>
           <div class="setting-action">
-            <span v-if="savedConn" class="tag tag-success">{{ savedConn.provider }} · {{ savedConn.model }}</span>
-            <button class="btn" @click="openConn">{{ savedConn ? '替换' : '配置' }}</button>
-            <button v-if="savedConn" class="btn btn-danger btn-ghost" @click="deleteConn">删除</button>
+            <span v-if="configured" class="tag tag-success">
+              {{ connection?.provider }} · {{ connection?.model }}
+            </span>
+            <span v-else-if="loading" class="tag">读取中…</span>
+            <button class="btn" @click="openConn">{{ configured ? '替换' : '配置' }}</button>
+            <button v-if="configured" class="btn btn-danger btn-ghost" @click="deleteConn">删除</button>
           </div>
         </div>
-        <div v-if="savedConn" class="conn-status">
+        <div v-if="configured" class="conn-status">
           <div class="cap-row">
             <span class="cap-label">API Key</span>
-            <span class="mono">{{ savedConn.maskedKey }}</span>
+            <span class="mono">{{ connection?.key_hint || '已加密保存' }}</span>
           </div>
-          <div class="cap-row">
-            <span class="cap-label">文本能力</span>
-            <span class="tag tag-success">可用（模拟）</span>
+          <div v-for="row in capabilityRows" :key="row.key" class="cap-row">
+            <span class="cap-label">{{ row.label }}</span>
+            <span class="tag" :class="statusClass(row.status)">
+              {{ statusText(row.status) }}<template v-if="row.message"> · {{ row.message }}</template>
+            </span>
           </div>
-          <div class="cap-row">
-            <span class="cap-label">视觉 / 工具调用</span>
-            <span class="tag">待后端能力检查</span>
+          <div v-if="connection?.failure_reason" class="cap-row">
+            <span class="cap-label">失败原因</span>
+            <span class="mono">{{ connection.failure_reason }}</span>
           </div>
         </div>
       </div>
@@ -189,20 +279,32 @@ function maskKey(key: string) {
           </div>
           <div class="field">
             <label class="field-label" for="apiKey">API Key</label>
-            <input id="apiKey" v-model="connForm.apiKey" class="input" type="password" autocomplete="off" placeholder="仅本次输入，不持久化存储" />
-            <div class="field-hint">Key 不会进入聊天、本地持久存储、URL 或日志。当前未接入后端密钥机制，仅作临时表单输入，关闭后清除。</div>
+            <input id="apiKey" v-model="connForm.apiKey" class="input" type="password" autocomplete="off" :placeholder="configured ? '留空则沿用已保存的 Key' : '首次配置必须填写'" />
+            <div class="field-hint">
+              Key 由后端加密保存，接口不会回读明文，也不会进入聊天记录、URL 或日志。
+              <template v-if="configured">修改其它字段时可留空 Key。</template>
+            </div>
           </div>
-          <div v-if="connState === 'testing'" class="notice">
-            <span class="spinner" style="display:inline-block;margin-right:8px"></span> 正在测试连接…
+          <div v-if="connState === 'testing' || connState === 'saving'" class="notice">
+            <span class="spinner" style="display:inline-block;margin-right:8px"></span>
+            {{ connState === 'saving' ? '正在保存…' : '正在执行真实能力检测…' }}
           </div>
-          <div v-else-if="connState === 'saved'" class="notice notice-success">
-            连接测试通过。文本能力可用，视觉与工具调用待后端确认。
+          <div
+            v-else-if="connNotice"
+            class="notice"
+            :class="connState === 'error' ? 'notice-error' : 'notice-success'"
+          >
+            {{ connNotice }}
           </div>
         </div>
         <div class="dialog-footer">
           <button class="btn" @click="showConnDialog = false">取消</button>
-          <button class="btn" @click="testConnection">测试连接</button>
-          <button class="btn btn-primary" :disabled="!connForm.apiKey" @click="saveConn">保存</button>
+          <button class="btn" :disabled="connState === 'testing' || connState === 'saving'" @click="testConnection">
+            测试连接
+          </button>
+          <button class="btn btn-primary" :disabled="connState === 'testing' || connState === 'saving'" @click="saveConn(true)">
+            保存
+          </button>
         </div>
       </div>
     </div>

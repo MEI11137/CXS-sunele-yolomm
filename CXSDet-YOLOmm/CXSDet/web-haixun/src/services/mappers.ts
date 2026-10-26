@@ -426,7 +426,20 @@ export function mapDataset(value: unknown): DatasetSummary {
 
 export function mapModel(value: unknown): ModelSummary {
   const obj = raw(value)
-  const metrics = raw(parseJsonLike(obj.metrics_json))
+  // 指标优先取 metrics_json；为空时从 Ultralytics 的 train_result.results_dict 里取真实训练结果
+  let metrics = raw(parseJsonLike(obj.metrics_json))
+  if (!Object.keys(metrics).length) {
+    const trainResult = raw(parseJsonLike(obj.train_result))
+    const results = raw(trainResult.results_dict)
+    if (Object.keys(results).length) {
+      metrics = {
+        'metrics/mAP50(B)': results['metrics/mAP50(B)'],
+        'metrics/mAP50-95(B)': results['metrics/mAP50-95(B)'],
+        'metrics/precision(B)': results['metrics/precision(B)'],
+        'metrics/recall(B)': results['metrics/recall(B)'],
+      }
+    }
+  }
   const status = num(obj.status)
   return {
     id: str(obj.id),
@@ -443,10 +456,10 @@ export function mapModel(value: unknown): ModelSummary {
     create_time: isoOrEmpty(obj.create_time),
     metrics: Object.keys(metrics).length
       ? {
-          mAP50: num(metrics.mAP50 ?? metrics.map50),
-          mAP5095: num(metrics.mAP50_95 ?? metrics.map5095),
-          precision: num(metrics.precision),
-          recall: num(metrics.recall),
+          mAP50: num(metrics.mAP50 ?? metrics.map50 ?? metrics['metrics/mAP50(B)']),
+          mAP5095: num(metrics.mAP50_95 ?? metrics.map5095 ?? metrics['metrics/mAP50-95(B)']),
+          precision: num(metrics.precision ?? metrics['metrics/precision(B)']),
+          recall: num(metrics.recall ?? metrics['metrics/recall(B)']),
         }
       : undefined,
   }

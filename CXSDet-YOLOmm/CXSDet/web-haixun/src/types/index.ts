@@ -152,7 +152,10 @@ export interface BoundingBox {
   y: number
   w: number
   h: number
+  /** 后端 class_name（提交时用） */
   category: string
+  /** 展示用名称（如中文类别名），不参与提交 */
+  label?: string
   severity: 'low' | 'medium' | 'high'
 }
 
@@ -188,7 +191,14 @@ export interface Attachment {
   type: string
   size: number
   source: string
-  state: 'selected' | 'uploading' | 'uploaded' | 'parsed' | 'imported'
+  state: 'selected' | 'uploading' | 'uploaded' | 'failed'
+  /** 本机文件本体：上传前必须保留，否则无法重试 */
+  file?: File
+  /** 后端文件资产 id（受保护存储） */
+  fileId?: string
+  /** 登记后的 Agent 资源 id，发消息时作为 resource_refs */
+  resourceId?: string
+  error?: string
 }
 
 export type CardPayload =
@@ -242,24 +252,32 @@ export interface AuthUser {
 // 个人连接
 // ---------------------------------------------------------------------------
 
+/** 单项能力检测结果：ok / failed / unsupported / unchecked。 */
+export interface CapabilityEntry {
+  status: string
+  message?: string
+  reason?: string
+  checked_at?: string
+}
+
 export interface PersonalConnection {
   configured: boolean
   provider?: string
   api_url?: string
   model?: string
-  /** 掩码后的 Key；接口不会回读明文 */
-  api_key_masked?: string
-  updated_at?: number
+  /** 后端脱敏提示（只给首尾几位），接口绝不回读明文 Key */
+  key_hint?: string
+  status?: string
+  capabilities?: Record<string, CapabilityEntry>
+  missing_capabilities?: string[]
+  failure_reason?: string | null
+  last_checked_at?: string
+  updated_at?: string
+  checked_now?: boolean
 }
 
-export interface ConnectionCapabilities {
-  configured: boolean
-  chat?: boolean
-  vision?: boolean
-  tools?: boolean
-  message?: string
-  checked_at?: number
-}
+/** 能力集合：键为 chat / vision / tools 等。 */
+export type ConnectionCapabilities = Record<string, CapabilityEntry>
 
 // ---------------------------------------------------------------------------
 // 业务 DTO（来自 C 分支真实接口，字段名保持后端原样，映射只发生在 services/mappers.ts）

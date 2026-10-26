@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { useInspectionStore } from '@/stores/inspection'
+import { getAdapter } from '@/services'
 import { mockTurbines } from '@/services/mock-data'
 import { IMAGES, bladeImageFor } from '@/assets/images'
 
@@ -10,16 +11,39 @@ const router = useRouter()
 const workspace = useWorkspaceStore()
 const inspection = useInspectionStore()
 
-// 所有数量从当前项目数据计算
+// 数量全部来自真实接口，不再用固定台数推算
+const realStats = ref({ records: 0, models: 0, datasets: 0, loaded: false })
+
+onMounted(async () => {
+  try {
+    const [r, m, d] = await Promise.all([
+      getAdapter().listRecords({ page: 1, pageSize: 1 }),
+      getAdapter().listModels({ page: 1, pageSize: 50 }),
+      getAdapter().listDatasets({ page: 1, pageSize: 50 }),
+    ])
+    realStats.value = {
+      records: r.total,
+      models: m.items.filter((x) => x.status === 'available').length,
+      datasets: d.total,
+      loaded: true,
+    }
+  } catch {
+    realStats.value = { records: 0, models: 0, datasets: 0, loaded: false }
+  }
+})
+
 const stats = computed(() => {
   const defects = inspection.defects
   const pending = defects.filter((d) => d.reviewStatus === 'pending').length
-  const currentModelDef = inspection.models.find((m) => m.status === 'available' && m.type === 'system')
+  const available = inspection.models.filter((m) => m.status === 'available')
+  const current = available[0]
   return {
-    turbinesInspected: mockTurbines.count,
+    // 真实统计
+    records: realStats.value.records,
     pendingReview: pending,
-    totalImages: mockTurbines.count * 2, // 每台风机 2 张影像（演示）
-    currentModel: (currentModelDef?.name ?? '—') + ' ' + (currentModelDef?.version ?? ''),
+    models: realStats.value.models,
+    datasets: realStats.value.datasets,
+    currentModel: current ? `${current.name} ${current.version}` : '未发布',
   }
 })
 
@@ -66,8 +90,8 @@ function formatConfidence(c: number) {
     <!-- 指标带：整体容器 + 细竖线分隔 -->
     <div class="metrics panel" role="list" aria-label="巡检指标">
       <div class="metric" role="listitem">
-        <div class="metric-value num">{{ stats.turbinesInspected }}</div>
-        <div class="metric-label">已巡检风机</div>
+        <div class="metric-value num">{{ realStats.loaded ? stats.records : '—' }}</div>
+        <div class="metric-label">检测记录</div>
       </div>
       <div class="metric-sep" aria-hidden="true"></div>
       <div class="metric" role="listitem">
@@ -76,19 +100,19 @@ function formatConfidence(c: number) {
       </div>
       <div class="metric-sep" aria-hidden="true"></div>
       <div class="metric" role="listitem">
-        <div class="metric-value num">{{ stats.totalImages }}</div>
-        <div class="metric-label">巡检影像</div>
+        <div class="metric-value num">{{ realStats.loaded ? stats.models : '—' }}</div>
+        <div class="metric-label">可用模型</div>
       </div>
       <div class="metric-sep" aria-hidden="true"></div>
       <div class="metric" role="listitem">
-        <div class="metric-value model">{{ stats.currentModel }}</div>
-        <div class="metric-label">当前检测模型</div>
+        <div class="metric-value num">{{ realStats.loaded ? stats.datasets : '—' }}</div>
+        <div class="metric-label">数据集</div>
       </div>
     </div>
 
     <!-- 风场巡检分布 -->
     <div class="section">
-      <h2 class="section-title">风场巡检分布</h2>
+      <h2 class="section-title">巡检分布（示意图，非真实台数）</h2>
       <div class="distribution">
         <!-- 左侧 60%：海上风机场景（真实照片） -->
         <div class="dist-scene">

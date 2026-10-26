@@ -8,6 +8,8 @@ const props = defineProps<{
   zoom: number
   mode: 'draw' | 'select'
   selectedBoxId: string | null
+  /** 新画框使用的类别：由父组件按真实类别表给出，不能写死示例类别 */
+  defaultCategory?: string
 }>()
 
 const emit = defineEmits<{
@@ -110,7 +112,8 @@ function severityColor(s: string) {
 }
 
 function label(b: BoundingBox) {
-  return `${b.category}·${b.severity === 'high' ? '高' : b.severity === 'medium' ? '中' : '低'}`
+  const name = b.label || b.category || '未分类'
+  return `${name}·${b.severity === 'high' ? '高' : b.severity === 'medium' ? '中' : '低'}`
 }
 
 function labelWidth(b: BoundingBox) {
@@ -171,7 +174,7 @@ function onMouseUp() {
         y: clamp(Math.min(y1, y2), 0, 1 - h),
         w: clamp(w, 0, 1),
         h: clamp(h, 0, 1),
-        category: '前缘侵蚀',
+        category: props.defaultCategory || '',
         severity: 'medium',
       }
       emit('draw', box)

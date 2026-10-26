@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import type { Session, ChatMessage, ChatTurn } from '@/types'
+import type { Session, ChatMessage, ChatTurn, Attachment } from '@/types'
+import type { SendMessageOptions } from '@/services'
 import { getAdapter } from '@/services'
 
 export const useSessionStore = defineStore('session', () => {
@@ -57,8 +58,9 @@ export const useSessionStore = defineStore('session', () => {
 
   async function send(
     content: string,
-    onDelta?: (delta: string) => void,
-    signal?: AbortSignal,
+    options: SendMessageOptions = {},
+    /** 随消息一起展示的附件（仅用于界面回显，真实内容靠 resourceRefs） */
+    attachedFiles: Attachment[] = [],
   ): Promise<ChatMessage | null> {
     const s = current()
     if (!s) return null
@@ -69,6 +71,7 @@ export const useSessionStore = defineStore('session', () => {
       role: 'user',
       content,
       created_at: Date.now(),
+      attachments: attachedFiles.length ? attachedFiles : undefined,
     }
     s.messages.push(userMsg)
 
@@ -86,7 +89,7 @@ export const useSessionStore = defineStore('session', () => {
     streaming.value = true
     try {
       // 真实模式返回的是复合结果（reply/task/action/plan），不是单一消息
-      const turn = await getAdapter().sendMessage(s.id, content, onDelta, signal)
+      const turn = await getAdapter().sendMessage(s.id, content, options)
       assistantMsg.content = turn.message.content
       assistantMsg.cards = turn.message.cards
       lastTurn.value = turn
