@@ -1,9 +1,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
-import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 
-const router = useRouter()
 const auth = useAuthStore()
 
 const mode = ref<'login' | 'register'>('login')
@@ -27,16 +25,16 @@ function submit() {
     return
   }
   auth.login(username.value)
-  router.push('/overview')
 }
 </script>
 
 <template>
-  <div class="auth-page">
-    <div class="auth-card">
+  <div v-if="auth.modalOpen" class="auth-overlay" role="dialog" aria-modal="true" aria-label="登录">
+    <div class="auth-dialog">
+      <button class="close" aria-label="关闭" title="暂不登录，使用本地模式" @click="auth.dismiss">×</button>
+
       <div class="brand">
         <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
-          <!-- 风机标记：塔筒 + 三叶片 -->
           <line x1="12" y1="12" x2="12" y2="22" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
           <line x1="12" y1="12" x2="12" y2="3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
           <line x1="12" y1="12" x2="4.2" y2="16.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
@@ -45,69 +43,35 @@ function submit() {
         </svg>
         <span class="brand-name">海巡智检</span>
       </div>
-      <p class="brand-sub">海上风电叶片巡检平台</p>
 
-      <h1 class="auth-title">{{ isRegister ? '创建账号' : '登录' }}</h1>
+      <h2 class="title">{{ isRegister ? '创建账号' : '登录' }}</h2>
+      <p class="sub">登录后可云端查看；不登录则使用本地模式</p>
 
       <div class="mode-tabs" role="tablist">
-        <button
-          class="mode-tab"
-          :class="{ active: !isRegister }"
-          role="tab"
-          @click="mode = 'login'"
-        >
-          登录
-        </button>
-        <button
-          class="mode-tab"
-          :class="{ active: isRegister }"
-          role="tab"
-          @click="mode = 'register'"
-        >
-          注册
-        </button>
+        <button class="mode-tab" :class="{ active: !isRegister }" role="tab" @click="mode = 'login'">登录</button>
+        <button class="mode-tab" :class="{ active: isRegister }" role="tab" @click="mode = 'register'">注册</button>
       </div>
 
-      <form class="auth-form" @submit.prevent="submit">
+      <form class="form" @submit.prevent="submit">
         <label class="field">
           <span class="field-label">用户名</span>
-          <input
-            v-model="username"
-            class="input"
-            type="text"
-            autocomplete="username"
-            placeholder="请输入用户名"
-          />
+          <input v-model="username" class="input" type="text" autocomplete="username" placeholder="请输入用户名" />
         </label>
-
         <label class="field">
           <span class="field-label">密码</span>
-          <input
-            v-model="password"
-            class="input"
-            type="password"
-            :autocomplete="isRegister ? 'new-password' : 'current-password'"
-            placeholder="请输入密码"
-          />
+          <input v-model="password" class="input" type="password" :autocomplete="isRegister ? 'new-password' : 'current-password'" placeholder="请输入密码" />
         </label>
-
         <label v-if="isRegister" class="field">
           <span class="field-label">确认密码</span>
-          <input
-            v-model="confirmPassword"
-            class="input"
-            type="password"
-            autocomplete="new-password"
-            placeholder="请再次输入密码"
-          />
+          <input v-model="confirmPassword" class="input" type="password" autocomplete="new-password" placeholder="请再次输入密码" />
         </label>
 
         <p v-if="notice" class="notice">{{ notice }}</p>
 
-        <button type="submit" class="submit" :disabled="!canSubmit">
-          {{ isRegister ? '注册' : '登录' }}
-        </button>
+        <button type="submit" class="submit" :disabled="!canSubmit">{{ isRegister ? '注册' : '登录' }}</button>
       </form>
+
+      <button class="skip" @click="auth.dismiss">暂不登录，使用本地模式</button>
 
       <p class="mock-hint">交互原型 · 模拟数据 — 账号体系待后端接入</p>
     </div>
@@ -115,21 +79,43 @@ function submit() {
 </template>
 
 <style scoped>
-.auth-page {
-  min-height: 100vh;
+.auth-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(17, 23, 29, 0.42);
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--bg);
   padding: 24px;
 }
-.auth-card {
+.auth-dialog {
+  position: relative;
   width: 100%;
-  max-width: 360px;
+  max-width: 380px;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
-  padding: 32px 28px;
+  padding: 28px 26px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.16);
+}
+.close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 6px;
+}
+.close:hover {
+  background: var(--bg-selected);
+  color: var(--text);
 }
 .brand {
   display: flex;
@@ -142,19 +128,19 @@ function submit() {
   color: var(--accent);
 }
 .brand-name {
-  font-size: 18px;
+  font-size: 17px;
   font-weight: 600;
   color: var(--text);
 }
-.brand-sub {
-  margin: 4px 0 24px;
+.title {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 16px 0 4px;
+}
+.sub {
   font-size: 12px;
   color: var(--text-secondary);
-}
-.auth-title {
-  font-size: 22px;
-  font-weight: 600;
-  color: var(--text);
   margin: 0 0 16px;
 }
 .mode-tabs {
@@ -162,7 +148,7 @@ function submit() {
   background: var(--panel-secondary);
   border-radius: 6px;
   padding: 3px;
-  margin-bottom: 20px;
+  margin-bottom: 18px;
 }
 .mode-tab {
   flex: 1;
@@ -179,10 +165,10 @@ function submit() {
   color: var(--text);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
 }
-.auth-form {
+.form {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 12px;
 }
 .field {
   display: flex;
@@ -224,8 +210,23 @@ function submit() {
   opacity: 0.5;
   cursor: not-allowed;
 }
+.skip {
+  width: 100%;
+  margin-top: 12px;
+  height: 36px;
+  border: 1px solid var(--border-control);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+  border-radius: 6px;
+}
+.skip:hover {
+  color: var(--text);
+  border-color: var(--text-secondary);
+}
 .mock-hint {
-  margin-top: 20px;
+  margin: 16px 0 0;
   font-size: 11px;
   color: var(--text-secondary);
   text-align: center;

@@ -3,6 +3,7 @@ import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import SideNav from './SideNav.vue'
 import AssistantPanel from './AssistantPanel.vue'
 import GuideOverlay from './GuideOverlay.vue'
+import AuthModal from './AuthModal.vue'
 
 const assistantOpen = ref(true)
 const isMobile = ref(false)
@@ -120,6 +121,7 @@ const assistantStyle = computed(() => ({
     <AssistantPanel v-else class="mobile-assistant" :open="false" :mobile="true" />
 
     <GuideOverlay />
+    <AuthModal />
   </div>
 </template>
 

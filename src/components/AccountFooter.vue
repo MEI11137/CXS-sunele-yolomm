@@ -1,17 +1,14 @@
 <script setup lang="ts">
-import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 
-const router = useRouter()
 const auth = useAuthStore()
 
 function goLogin() {
-  router.push('/login')
+  auth.openModal()
 }
 
 function doLogout() {
   auth.logout()
-  router.push('/login')
 }
 </script>
 
@@ -20,7 +17,7 @@ function doLogout() {
     <div class="avatar" aria-hidden="true">{{ auth.user ? auth.user.name.charAt(0) : '访' }}</div>
     <div class="account-info">
       <div class="account-name">{{ auth.user ? auth.user.name : '未登录' }}</div>
-      <div class="account-role">{{ auth.user ? '已登录' : '本地用户' }}</div>
+      <div class="account-role">{{ auth.user ? '云端模式' : '本地模式' }}</div>
     </div>
     <button v-if="!auth.isLoggedIn" class="account-action" @click="goLogin">登录</button>
     <button v-else class="account-action" @click="doLogout">退出</button>

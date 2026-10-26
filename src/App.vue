@@ -1,29 +1,39 @@
 <script setup lang="ts">
-import { onMounted, watch, computed } from 'vue'
-import { useRoute } from 'vue-router'
+import { onMounted, watch } from 'vue'
 import AppLayout from '@/components/AppLayout.vue'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { useInspectionStore } from '@/stores/inspection'
 import { useGuideStore } from '@/stores/guide'
-
-const route = useRoute()
-const isLoginPage = computed(() => route.name === 'login')
+import { useAuthStore } from '@/stores/auth'
 
 const workspace = useWorkspaceStore()
 const inspection = useInspectionStore()
 const guide = useGuideStore()
+const auth = useAuthStore()
 
 onMounted(async () => {
   await Promise.all([workspace.load(), inspection.load()])
-  // URL 指定步骤（演示/测试）
+  // 首次进入：未登录且未选择跳过时，先弹登录浮层
+  if (auth.shouldShowOnEntry()) {
+    requestAnimationFrame(() => auth.openModal())
+    return
+  }
+  // 已登录 / 已跳过登录后，进入引导逻辑
   if (guide.initFromUrl()) return
-  // 首次进入且未看过引导时，自动弹出
   if (guide.shouldAutoShow) {
-    requestAnimationFrame(() => {
-      guide.open(true)
-    })
+    requestAnimationFrame(() => guide.open(true))
   }
 })
+
+// 登录浮层关闭后（登录成功或跳过），再进入首次引导
+watch(
+  () => auth.modalOpen,
+  (open) => {
+    if (!open && guide.shouldAutoShow) {
+      requestAnimationFrame(() => guide.open(true))
+    }
+  },
+)
 
 // 切换工作区后，缺陷数据归属变化（mock 阶段返回同一批演示数据）
 watch(
@@ -36,6 +46,5 @@ watch(
 </script>
 
 <template>
-  <router-view v-if="isLoginPage" />
-  <AppLayout v-else />
+  <AppLayout />
 </template>

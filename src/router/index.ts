@@ -4,7 +4,6 @@ const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/', redirect: '/overview' },
-    { path: '/login', name: 'login', component: () => import('@/views/LoginView.vue'), meta: { title: '登录' } },
     { path: '/overview', name: 'overview', component: () => import('@/views/OverviewView.vue'), meta: { title: '工作区总览' } },
     { path: '/inspection', name: 'inspection', component: () => import('@/views/InspectionView.vue'), meta: { title: '图片巡检' } },
     { path: '/records', name: 'records', component: () => import('@/views/RecordsView.vue'), meta: { title: '识别记录' } },
