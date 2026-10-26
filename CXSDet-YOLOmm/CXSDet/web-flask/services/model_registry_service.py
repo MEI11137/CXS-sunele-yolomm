@@ -14,6 +14,10 @@ class ModelRegistryError(ValueError):
     pass
 
 
+class ModelPublishConflict(ModelRegistryError):
+    """The published model set changed after a caller's preview."""
+
+
 @dataclass(frozen=True)
 class IncrementalModel:
     model_id: str
@@ -204,6 +208,8 @@ def publish_model(
     operator_id: int,
     database,
     storage_exists: Callable[[str, str], bool] | None = None,
+    *,
+    expected_archived_model_ids: list[str] | None = None,
 ) -> PublishResult:
     conn = database.get_connection()
     conn.row_factory = sqlite3.Row
@@ -226,13 +232,12 @@ def publish_model(
             raise ModelRegistryError("模型模式与数据集不匹配")
         if (dataset["secondary_modality"] or None) != (candidate["secondary_modality"] or None):
             raise ModelRegistryError("模型第二模态与数据集不匹配")
-        previous = _row(
-            conn,
+        published = conn.execute(
             """
             SELECT id FROM models
             WHERE status = 3 AND id != ? AND model_mode = ?
               AND primary_modality = ? AND secondary_modality IS ?
-            ORDER BY create_time DESC LIMIT 1
+            ORDER BY create_time DESC
             """,
             (
                 model_id,
@@ -240,7 +245,11 @@ def publish_model(
                 candidate["primary_modality"],
                 candidate["secondary_modality"],
             ),
-        )
+        ).fetchall()
+        if (expected_archived_model_ids is not None and
+                sorted(row["id"] for row in published) != sorted(expected_archived_model_ids)):
+            raise ModelPublishConflict("待归档模型已变化，请重新预检")
+        previous = published[0] if published else None
         conn.execute(
             """
             UPDATE models SET status = 1, publish_status = 'archived'

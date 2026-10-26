@@ -171,6 +171,17 @@ def run_schema_migrations(conn: sqlite3.Connection) -> None:
             )
             """
         )
+        # 单机单训练占用的机器级互斥（页面路由与 Agent 业务工具共用一行）
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS training_lock (
+                lock_id INTEGER PRIMARY KEY CHECK (lock_id = 1),
+                owner TEXT NOT NULL,
+                holder_pid INTEGER,
+                acquired_at TEXT NOT NULL
+            )
+            """
+        )
         ensure_index(
             conn,
             "uq_feedback_record_annotation",

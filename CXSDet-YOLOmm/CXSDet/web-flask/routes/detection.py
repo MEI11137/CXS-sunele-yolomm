@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 from datetime import datetime
 from PIL import Image
-from flask import Blueprint, request, g
+from flask import Blueprint, request, g, current_app
 from clients.file_client import file_client
 from utils.response import success, error
 from utils.db import db
@@ -26,6 +26,7 @@ from services.feedback_dataset_service import (
     FeedbackValidationError,
     add_confirmed_record,
 )
+from services.file_access import FileAccess
 from services.batch_review_service import (
     BatchValidationError,
     add_batch_confirmed_records,
@@ -377,6 +378,19 @@ def save_detection():
         if not save_data:
             return error("保存数据不能为空")
 
+        # Client-supplied file references must already be owned by this user.
+        access = None
+        for prefix in ('original_image', 'result_image', 'enhanced_image'):
+            bucket = save_data.get(f'{prefix}_bucket')
+            object_key = save_data.get(f'{prefix}_object_key')
+            if bool(bucket) != bool(object_key):
+                raise PermissionError("图像文件引用不完整")
+            if bucket:
+                if access is None:
+                    access = FileAccess(current_app.config['DATABASE'])
+                    access.require_account(g.user_id)
+                access.require_read(g.user_id, bucket, object_key)
+
         existing_record_id = save_data.get('record_id')
         if existing_record_id:
             existing = db.query(
@@ -434,6 +448,8 @@ def save_detection():
         else:
             return error("保存失败")
         
+    except PermissionError:
+        return error("图像文件无权访问", 403)
     except Exception as e:
         return error(f"保存识别结果失败: {str(e)}")
 
@@ -736,22 +752,20 @@ def delete_detection_record(record_id):
         if not record_data:
             return error("识别记录不存在或无权访问", 404)
         
-        # 删除文件服务中的图片文件
-        try:
-            # 删除原始图片
-            if record_data['original_image_bucket'] and record_data['original_image_object_key']:
-                file_client.delete(record_data['original_image_bucket'], record_data['original_image_object_key'])
-            
-            # 删除结果图片
-            if record_data['result_image_bucket'] and record_data['result_image_object_key']:
-                file_client.delete(record_data['result_image_bucket'], record_data['result_image_object_key'])
-            
-            # 删除增强图片
-            if record_data['enhanced_image_bucket'] and record_data['enhanced_image_object_key']:
-                file_client.delete(record_data['enhanced_image_bucket'], record_data['enhanced_image_object_key'])
-                
-        except Exception as e:
-            print(f"删除图片文件失败: {e}")
+        # Legacy rows may contain client-supplied keys. Removing a record must
+        # never turn such a key into authority to delete a physical object.
+        access = FileAccess(current_app.config['DATABASE'])
+        for prefix in ('original_image', 'result_image', 'enhanced_image'):
+            bucket = record_data.get(f'{prefix}_bucket')
+            object_key = record_data.get(f'{prefix}_object_key')
+            if not bucket or not object_key:
+                continue
+            try:
+                access.require_delete(g.user_id, bucket, object_key)
+            except PermissionError:
+                continue
+            file_client.delete(bucket, object_key)
+            access.mark_deleted(bucket, object_key)
         
         # 删除记录
         affected_rows = db.execute('''
@@ -777,6 +791,12 @@ def enhance_image():
         
         if not bucket or not object_key:
             return error("缺少图像文件信息")
+        try:
+            access = FileAccess(current_app.config['DATABASE'])
+            access.require_account(g.user_id)
+            access.require_read(g.user_id, bucket, object_key)
+        except PermissionError:
+            return error("图像文件无权访问", 403)
         
         # 获取原始图像
         image_data = file_client.get(bucket, object_key)
@@ -811,6 +831,10 @@ def enhance_image():
         try:
             # 上传增强后的图像
             enhanced_upload_result = file_client.upload('detection_enhanced', temp_enhanced_path)
+            access.register_upload(
+                g.user_id, enhanced_upload_result['bucket'], enhanced_upload_result['objectKey'],
+                'enhanced_image', 'image/jpeg', os.path.getsize(temp_enhanced_path),
+            )
             
             return success({
                 'enhanced_image_url': file_client.get_file_url(
@@ -843,6 +867,12 @@ def analyze_defects():
         
         if not bucket or not object_key:
             return error("缺少图像文件信息")
+        try:
+            access = FileAccess(current_app.config['DATABASE'])
+            access.require_account(g.user_id)
+            access.require_read(g.user_id, bucket, object_key)
+        except PermissionError:
+            return error("图像文件无权访问", 403)
         
         # 获取图像数据
         image_data = file_client.get(bucket, object_key)

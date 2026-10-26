@@ -1,13 +1,39 @@
 
 import jwt
 import time
+import os
+import secrets
+from pathlib import Path
 from typing import Dict, Optional
 from flask import request, g
 from functools import wraps
 from utils.response import error
+from config import FILE_STORE_CONFIG
 
-# JWT 密钥
-JWT_SECRET = 'gjq-web-flask-secret'
+def _load_jwt_secret() -> str:
+    configured = os.environ.get('CXS_JWT_SECRET')
+    if configured:
+        if len(configured) < 32:
+            raise RuntimeError('CXS_JWT_SECRET must contain at least 32 characters')
+        return configured
+    root = Path(FILE_STORE_CONFIG['base_path'])
+    root.mkdir(parents=True, exist_ok=True)
+    secret_path = root / '.jwt-secret'
+    try:
+        descriptor = os.open(secret_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, 'w', encoding='ascii') as secret_file:
+            secret_file.write(secrets.token_urlsafe(48))
+    except FileExistsError:
+        pass
+    if os.name == 'posix':
+        os.chmod(secret_path, 0o600)
+    value = secret_path.read_text(encoding='ascii').strip()
+    if len(value) < 32:
+        raise RuntimeError('Local JWT signing key is incomplete')
+    return value
+
+
+JWT_SECRET = _load_jwt_secret()
 # Token过期时间(秒)
 JWT_EXPIRATION = 86400  # 24小时
 

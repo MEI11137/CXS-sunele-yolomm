@@ -29,7 +29,14 @@ def create_app(config_overrides=None):
     if config_overrides:
         flask_app.config.update(config_overrides)
 
-    CORS(flask_app)
+    frontend_origins = [
+        origin.strip()
+        for origin in os.environ.get(
+            'FRONTEND_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000'
+        ).split(',')
+        if origin.strip()
+    ]
+    CORS(flask_app, origins=frontend_origins, supports_credentials=True)
 
     # 注册路由(注意：url前缀已经在路由文件中设置，无需重复设置)
     flask_app.register_blueprint(health_bp)
