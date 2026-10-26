@@ -1,23 +1,41 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import { useAuthStore } from '@/stores/auth'
+import { CURRENT_MODE } from '@/services'
 
 const auth = useAuthStore()
+
+const displayName = computed(() => {
+  if (!auth.user) return '未登录'
+  return auth.user.realName || auth.user.username
+})
+
+const initial = computed(() => {
+  const name = displayName.value
+  return name ? name.charAt(0) : '访'
+})
+
+// 不承诺任何"云端同步"；本机部署就是本机部署
+const roleLabel = computed(() => {
+  if (CURRENT_MODE === 'mock') return auth.isLoggedIn ? '演示模式 · 已登录' : '演示模式 · 只读'
+  return auth.isLoggedIn ? '本机账号' : '只读浏览'
+})
 
 function goLogin() {
   auth.openModal()
 }
 
 function doLogout() {
-  auth.logout()
+  void auth.logout()
 }
 </script>
 
 <template>
   <div class="account">
-    <div class="avatar" aria-hidden="true">{{ auth.user ? auth.user.name.charAt(0) : '访' }}</div>
+    <div class="avatar" aria-hidden="true">{{ initial }}</div>
     <div class="account-info">
-      <div class="account-name">{{ auth.user ? auth.user.name : '未登录' }}</div>
-      <div class="account-role">{{ auth.user ? '云端模式' : '本地模式' }}</div>
+      <div class="account-name">{{ displayName }}</div>
+      <div class="account-role">{{ roleLabel }}</div>
     </div>
     <button v-if="!auth.isLoggedIn" class="account-action" @click="goLogin">登录</button>
     <button v-else class="account-action" @click="doLogout">退出</button>

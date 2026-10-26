@@ -129,7 +129,7 @@ async function confirmRun() {
 
 async function rejectPlan() {
   if (!task.value) return
-  task.value.status = 'cancelled'
+  task.value.status = 'stopped'
   confirmState.value = 'cancelled'
   notice.value = '已拒绝该计划，任务未执行。'
 }

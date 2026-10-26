@@ -1,20 +1,29 @@
-// Mock 适配器实现 —— 模拟响应，覆盖各种状态。
-import type { ApiAdapter, Mode } from './types'
+// Mock 适配器：只在演示模式（VITE_API_MODE=mock）下使用，界面上必须明确标注"模拟"。
+// 真实模式下 createAdapter() 不会返回它，接口失败也绝不回退到这里。
+
 import type {
-  Workspace,
-  Defect,
-  DetectionModel,
-  Session,
-  ChatMessage,
-  AgentTask,
   AgentEvent,
+  AgentTask,
+  AuthUser,
+  ChatMessage,
+  ChatTurn,
   Confirmation,
+  DatasetSummary,
+  DetectionModel,
+  DetectionRecordSummary,
+  PageResult,
+  PersonalConnection,
+  ResourceRef,
+  Session,
+  Workspace,
 } from '@/types'
+import { BaseAdapter } from './adapter-base'
+import type { DefectItem, Mode, TaskSnapshot } from './types'
 import {
-  mockWorkspaces,
   mockDefects,
   mockModels,
   mockSessions,
+  mockWorkspaces,
 } from './mock-data'
 
 function clone<T>(o: T): T {
@@ -25,15 +34,35 @@ function delay(ms: number) {
   return new Promise((r) => setTimeout(r, ms))
 }
 
-export class MockAdapter implements ApiAdapter {
-  mode: Mode = 'mock'
+export class MockAdapter extends BaseAdapter {
+  readonly mode: Mode = 'mock'
 
   private workspaces: Workspace[] = clone(mockWorkspaces)
-  private defects: Defect[] = clone(mockDefects)
+  private defects: DefectItem[] = clone(mockDefects)
   private models: DetectionModel[] = clone(mockModels)
   private sessions: Session[] = clone(mockSessions)
   private tasks: AgentTask[] = []
   private events: AgentEvent[] = []
+
+  /** 演示登录：不产生真实凭据，token 留空，界面按"演示模式"展示。 */
+  async login(username: string): Promise<AuthUser> {
+    await delay(120)
+    return {
+      id: 0,
+      username: username.trim() || 'demo',
+      realName: username.trim() || '演示用户',
+      role: 2,
+      token: '',
+    }
+  }
+
+  async currentUser(): Promise<AuthUser | null> {
+    return null
+  }
+
+  async logout(): Promise<void> {
+    await delay(40)
+  }
 
   async listWorkspaces(): Promise<Workspace[]> {
     await delay(80)
@@ -51,6 +80,7 @@ export class MockAdapter implements ApiAdapter {
       name: input.name,
       description: input.description,
       requirements: input.requirements,
+      requirements_raw: input.requirements ? { notes: input.requirements } : {},
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     }
@@ -72,26 +102,31 @@ export class MockAdapter implements ApiAdapter {
     throw new Error('工作区不存在')
   }
 
-  async listDefects(_projectId: string): Promise<Defect[]> {
+  async listDefects(_projectId: string): Promise<DefectItem[]> {
     await delay(80)
-    // 演示：默认工作区返回全部缺陷；新项目返回空状态
     return clone(this.defects)
   }
 
-  async getDefect(id: string): Promise<Defect | null> {
+  async getDefect(id: string): Promise<DefectItem | null> {
     await delay(40)
     const d = this.defects.find((x) => x.id === id)
     return d ? clone(d) : null
   }
 
-  async listModels(): Promise<DetectionModel[]> {
+  async listModels(): Promise<PageResult<DetectionModel>> {
     await delay(60)
-    return clone(this.models)
+    return { items: clone(this.models), total: this.models.length, page: 1, pageSize: this.models.length }
   }
 
   async listSessions(projectId: string): Promise<Session[]> {
     await delay(60)
     return clone(this.sessions.filter((s) => s.project_id === projectId))
+  }
+
+  async listMessages(sessionId: string): Promise<ChatMessage[]> {
+    await delay(40)
+    const session = this.sessions.find((s) => s.id === sessionId)
+    return clone(session?.messages ?? [])
   }
 
   async createSession(projectId: string, title: string): Promise<Session> {
@@ -112,12 +147,10 @@ export class MockAdapter implements ApiAdapter {
     content: string,
     onDelta?: (delta: string) => void,
     signal?: AbortSignal,
-  ): Promise<ChatMessage> {
+  ): Promise<ChatTurn> {
     const reply = this.mockReply(content)
-    const total = reply.length
     let i = 0
-    // 流式逐字返回，模拟真实流式
-    while (i < total) {
+    while (i < reply.length) {
       if (signal?.aborted) {
         throw new DOMException('Aborted', 'AbortError')
       }
@@ -126,14 +159,22 @@ export class MockAdapter implements ApiAdapter {
       onDelta?.(chunk)
       await delay(18)
     }
-    const msg: ChatMessage = {
+    const message: ChatMessage = {
       id: 'm-' + Date.now(),
       session_id: sessionId,
       role: 'assistant',
       content: reply,
       created_at: Date.now(),
     }
-    return clone(msg)
+    return {
+      session_id: sessionId,
+      message,
+      task: null,
+      action: null,
+      plan: null,
+      eventsAfter: 0,
+      status: 'completed',
+    }
   }
 
   private mockReply(content: string): string {
@@ -161,46 +202,92 @@ export class MockAdapter implements ApiAdapter {
       id: 't-' + Date.now(),
       session_id: input.session_id,
       project_id: input.project_id,
-      status: 'waiting_confirm',
+      status: 'awaiting_plan',
+      goal: '对上传影像执行光伏板缺陷检测',
       steps: [
         { id: 'st1', name: '校验影像', status: 'pending' },
         { id: 'st2', name: '加载检测模型', status: 'pending' },
-        { id: 'st3', name: '执行叶片检测', status: 'pending' },
+        { id: 'st3', name: '执行缺陷检测', status: 'pending' },
         { id: 'st4', name: '生成复核队列', status: 'pending' },
       ],
-      waiting_for: 'plan_confirm',
+      waiting_for: { kind: 'plan_confirm', refs: [], conditions: {} },
       business_refs: [
-        { kind: 'model', id: input.model_id, display_name: model ? `${model.name} ${model.version}` : input.model_id },
+        {
+          kind: 'model',
+          id: input.model_id,
+          display_name: model ? `${model.name} ${model.version}` : input.model_id,
+        },
         { kind: 'image', id: 'img-batch', display_name: `${input.images.length} 张影像` },
       ],
+      planVersion: 1,
+      updatedAt: Date.now(),
     }
     this.tasks.push(task)
     return clone(task)
   }
 
-  async confirmAction(
-    actionId: string,
-    decision: 'approved' | 'rejected',
-  ): Promise<Confirmation> {
+  async confirmAction(actionId: string, expectedRevision: number): Promise<Confirmation> {
     await delay(150)
     return {
       action_id: actionId,
-      revision: 'rev-' + Date.now(),
+      task_id: 't-demo',
+      revision: expectedRevision,
       actual_target_projects: ['ws-default'],
-      parameters_summary: { decision },
-      preview: decision === 'approved' ? '将开始执行检测' : '已拒绝，任务不执行',
-      status: decision === 'approved' ? 'approved' : 'rejected',
+      parameters: {},
+      parameters_summary: '将开始执行检测',
+      preview: { tool_title: '执行检测' },
+      tool_name: 'detection.run',
+      tool_title: '执行检测',
+      status: 'approved',
+      execution_state: 'executed',
     }
   }
 
-  async listEvents(taskId: string, afterSequence: number): Promise<AgentEvent[]> {
-    await delay(40)
-    return clone(this.events.filter((e) => e.task_id === taskId && e.sequence > afterSequence))
+  async rejectAction(actionId: string): Promise<Confirmation> {
+    await delay(80)
+    return {
+      action_id: actionId,
+      task_id: 't-demo',
+      revision: 0,
+      actual_target_projects: [],
+      parameters: {},
+      parameters_summary: '已拒绝，任务不执行',
+      preview: { tool_title: '执行检测' },
+      tool_name: 'detection.run',
+      tool_title: '执行检测',
+      status: 'rejected',
+      execution_state: 'not_executed',
+    }
   }
 
-  async getTaskSnapshot(taskId: string): Promise<AgentTask | null> {
+  async listEvents(sessionId: string, afterSequence: number): Promise<AgentEvent[]> {
+    await delay(40)
+    const taskIds = this.tasks.filter((t) => t.session_id === sessionId).map((t) => t.id)
+    return clone(
+      this.events.filter((e) => taskIds.includes(e.task_id) && e.sequence > afterSequence),
+    )
+  }
+
+  async getTaskSnapshot(taskId: string): Promise<TaskSnapshot> {
     await delay(40)
     const t = this.tasks.find((x) => x.id === taskId)
-    return t ? clone(t) : null
+    return { task: t ? clone(t) : null, actions: [], note: null }
+  }
+
+  // 以下能力演示模式没有真实数据，明确报"未接入"，由页面显示空状态
+  async getConnection(): Promise<PersonalConnection> {
+    return { configured: false }
+  }
+
+  async listResources(_projectId: string): Promise<ResourceRef[]> {
+    return []
+  }
+
+  async listRecords(): Promise<PageResult<DetectionRecordSummary>> {
+    return { items: [], total: 0, page: 1, pageSize: 0 }
+  }
+
+  async listDatasets(): Promise<PageResult<DatasetSummary>> {
+    return { items: [], total: 0, page: 1, pageSize: 0 }
   }
 }

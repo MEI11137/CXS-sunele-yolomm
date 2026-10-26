@@ -19,7 +19,8 @@ export const useInspectionStore = defineStore('inspection', () => {
         getAdapter().listModels(),
       ])
       defects.value = d
-      models.value = m
+      // 模型列表是分页结构，页面只用第一页的条目做选择
+      models.value = m.items
       loaded.value = true
     } finally {
       loading.value = false

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { useAuthStore } from '@/stores/auth'
+import { CURRENT_MODE } from '@/services'
 
 const auth = useAuthStore()
 
@@ -8,23 +9,43 @@ const mode = ref<'login' | 'register'>('login')
 const username = ref('')
 const password = ref('')
 const confirmPassword = ref('')
+const realName = ref('')
 const notice = ref('')
 
 const isRegister = computed(() => mode.value === 'register')
+const isMock = computed(() => CURRENT_MODE === 'mock')
+const submitting = computed(() => auth.loading)
+
 const canSubmit = computed(() => {
   if (!username.value.trim() || !password.value) return false
   if (isRegister.value && password.value !== confirmPassword.value) return false
+  if (submitting.value) return false
   return true
 })
 
-// 模拟登录/注册：仅前端占位，真实账号体系由后端实现
-function submit() {
+// 真实登录/注册：必须由后端校验，失败不产生登录态
+async function submit() {
   if (!canSubmit.value) return
+  notice.value = ''
   if (isRegister.value && password.value !== confirmPassword.value) {
     notice.value = '两次输入的密码不一致'
     return
   }
-  auth.login(username.value)
+  try {
+    if (isRegister.value) {
+      await auth.register({
+        username: username.value.trim(),
+        password: password.value,
+        realName: realName.value.trim(),
+      })
+      // 注册成功后直接走登录校验，避免"注册即登录"的假象
+      await auth.login(username.value, password.value)
+    } else {
+      await auth.login(username.value, password.value)
+    }
+  } catch (e) {
+    notice.value = (e as Error).message || '操作失败，请稍后重试'
+  }
 }
 </script>
 
@@ -45,7 +66,9 @@ function submit() {
       </div>
 
       <h2 class="title">{{ isRegister ? '创建账号' : '登录' }}</h2>
-      <p class="sub">登录后可云端查看；不登录则使用本地模式</p>
+      <p class="sub">
+        登录后才能上传影像、执行检测、训练与发布；不登录只能在界面上只读浏览。
+      </p>
 
       <div class="mode-tabs" role="tablist">
         <button class="mode-tab" :class="{ active: !isRegister }" role="tab" @click="mode = 'login'">登录</button>
@@ -62,18 +85,26 @@ function submit() {
           <input v-model="password" class="input" type="password" :autocomplete="isRegister ? 'new-password' : 'current-password'" placeholder="请输入密码" />
         </label>
         <label v-if="isRegister" class="field">
+          <span class="field-label">真实姓名（可选）</span>
+          <input v-model="realName" class="input" type="text" autocomplete="name" placeholder="用于记录复核人" />
+        </label>
+        <label v-if="isRegister" class="field">
           <span class="field-label">确认密码</span>
           <input v-model="confirmPassword" class="input" type="password" autocomplete="new-password" placeholder="请再次输入密码" />
         </label>
 
         <p v-if="notice" class="notice">{{ notice }}</p>
 
-        <button type="submit" class="submit" :disabled="!canSubmit">{{ isRegister ? '注册' : '登录' }}</button>
+        <button type="submit" class="submit" :disabled="!canSubmit">
+          {{ submitting ? '提交中…' : isRegister ? '注册' : '登录' }}
+        </button>
       </form>
 
-      <button class="skip" @click="auth.dismiss">暂不登录，使用本地模式</button>
+      <button class="skip" @click="auth.dismiss">暂不登录，只读浏览</button>
 
-      <p class="mock-hint">交互原型 · 模拟数据 — 账号体系待后端接入</p>
+      <p class="mock-hint">
+        {{ isMock ? '演示模式 · 页面数据为模拟数据' : '本机部署 · 账号与权限由本机后端校验' }}
+      </p>
     </div>
   </div>
 </template>

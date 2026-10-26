@@ -12,7 +12,14 @@ const guide = useGuideStore()
 const auth = useAuthStore()
 
 onMounted(async () => {
-  await Promise.all([workspace.load(), inspection.load()])
+  // 先用已保存的 Token 校验身份，再决定能加载什么数据
+  await auth.bootstrap()
+  try {
+    await Promise.all([workspace.load(), inspection.load()])
+  } catch (e) {
+    // 未登录时接口会 401：保留空状态，由登录浮层引导，不伪造数据
+    console.warn('[海巡智检] 首屏数据加载失败：', e)
+  }
   // 首次进入：未登录且未选择跳过时，先弹登录浮层
   if (auth.shouldShowOnEntry()) {
     requestAnimationFrame(() => auth.openModal())

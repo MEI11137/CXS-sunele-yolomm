@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import type { Session, ChatMessage } from '@/types'
+import type { Session, ChatMessage, ChatTurn } from '@/types'
 import { getAdapter } from '@/services'
 
 export const useSessionStore = defineStore('session', () => {
@@ -8,6 +8,8 @@ export const useSessionStore = defineStore('session', () => {
   const currentId = ref<string>('')
   const streaming = ref(false)
   const loaded = ref(false)
+  /** 最近一轮对话的完整结果（含任务/动作/计划），供确认卡片使用 */
+  const lastTurn = ref<ChatTurn | null>(null)
 
   const current = () => sessions.value.find((s) => s.id === currentId.value) ?? null
 
@@ -16,7 +18,25 @@ export const useSessionStore = defineStore('session', () => {
     if (!currentId.value && sessions.value.length) {
       currentId.value = sessions.value[0].id
     }
+    // 会话列表不含完整消息，必须再拉一次历史，避免界面显示"空会话"
+    await loadMessages(currentId.value)
     loaded.value = true
+  }
+
+  async function loadMessages(sessionId: string) {
+    if (!sessionId) return
+    const target = sessions.value.find((s) => s.id === sessionId)
+    if (!target) return
+    target.messages = await getAdapter().listMessages(sessionId)
+  }
+
+  /** 切换会话时按需补拉历史 */
+  async function selectSession(id: string) {
+    currentId.value = id
+    const target = sessions.value.find((s) => s.id === id)
+    if (target && target.messages.length === 0) {
+      await loadMessages(id)
+    }
   }
 
   async function createSession(projectId: string, title = '新会话') {
@@ -65,8 +85,11 @@ export const useSessionStore = defineStore('session', () => {
 
     streaming.value = true
     try {
-      const full = await getAdapter().sendMessage(s.id, content, onDelta, signal)
-      assistantMsg.content = full.content
+      // 真实模式返回的是复合结果（reply/task/action/plan），不是单一消息
+      const turn = await getAdapter().sendMessage(s.id, content, onDelta, signal)
+      assistantMsg.content = turn.message.content
+      assistantMsg.cards = turn.message.cards
+      lastTurn.value = turn
       assistantMsg.streaming = false
       return assistantMsg
     } catch (e) {
@@ -87,8 +110,11 @@ export const useSessionStore = defineStore('session', () => {
     currentId,
     streaming,
     loaded,
+    lastTurn,
     current,
     load,
+    loadMessages,
+    selectSession,
     createSession,
     setCurrent,
     appendMessage,
