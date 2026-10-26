@@ -1,0 +1,9 @@
+# Agent 后端本地文件（不进版本库）
+agent_secret.key
+agent_secret.key.*
+AGENT_SECRET*.txt
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
