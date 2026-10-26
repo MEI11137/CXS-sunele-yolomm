@@ -1,9 +1,13 @@
 <script setup lang="ts">
-import { onMounted, watch } from 'vue'
+import { onMounted, watch, computed } from 'vue'
+import { useRoute } from 'vue-router'
 import AppLayout from '@/components/AppLayout.vue'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { useInspectionStore } from '@/stores/inspection'
 import { useGuideStore } from '@/stores/guide'
+
+const route = useRoute()
+const isLoginPage = computed(() => route.name === 'login')
 
 const workspace = useWorkspaceStore()
 const inspection = useInspectionStore()
@@ -32,5 +36,6 @@ watch(
 </script>
 
 <template>
-  <AppLayout />
+  <router-view v-if="isLoginPage" />
+  <AppLayout v-else />
 </template>
