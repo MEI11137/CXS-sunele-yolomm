@@ -96,22 +96,28 @@ class ToolRegistry:
     def specs(self, actor, project_id: Optional[str] = None) -> List[ToolSpec]:
         """按注册顺序聚合工具，同名只保留第一个（真实业务优先于替身）。"""
         seen: Dict[str, ToolSpec] = {}
+        # 正式来源清单不可用时，替身一律不出现：否则模型会看到一个和真实工具
+        # 同名、却只有假行为的工具（R3）。
+        real_source_broken = False
         for entry in self._entries:
             try:
                 provided = entry["provider"].list_tools(actor) or []
             except AgentError as exc:
                 self.warnings.append(f"{entry['source']} 工具清单不可用：{exc.message}")
+                real_source_broken = real_source_broken or entry["source"] != SOURCE_STUB
                 continue
             except Exception as exc:  # noqa: BLE001
                 self.warnings.append(f"{entry['source']} 工具清单读取失败：{exc}")
+                real_source_broken = real_source_broken or entry["source"] != SOURCE_STUB
                 continue
             for spec in provided:
                 if spec.name in CONTROL_TOOL_NAMES:
                     continue
                 if spec.name in seen:
                     continue
-                if spec.source == SOURCE_STUB and not settings().allow_stub_tools:
-                    continue
+                if spec.source == SOURCE_STUB:
+                    if not settings().allow_stub_tools or real_source_broken:
+                        continue
                 seen[spec.name] = spec
         # 控制工具始终可用
         seen[PROPOSE_PLAN] = CONTROL_PROPOSE_PLAN
@@ -131,12 +137,15 @@ class ToolRegistry:
             return CONTROL_ASK_USER, None, SOURCE_CONTROL
 
         stub_match: Optional[Tuple[ToolSpec, ToolProvider]] = None
+        broken_sources: List[str] = []
         for entry in self._entries:
             if entry["source"] == SOURCE_CONTROL:
                 continue
             try:
                 provided = entry["provider"].list_tools(actor) or []
-            except Exception:  # noqa: BLE001 - 单个 provider 故障不影响其他工具
+            except Exception as exc:  # noqa: BLE001 - 单个 provider 故障不影响其他工具
+                if entry["source"] != SOURCE_STUB:
+                    broken_sources.append(f"{entry['source']}: {exc}")
                 continue
             for spec in provided:
                 if spec.name != name:
@@ -148,6 +157,14 @@ class ToolRegistry:
                 return spec, entry["provider"], entry["source"]
 
         if stub_match is not None:
+            if broken_sources:
+                # 正式工具来源出错时用同名替身顶替，等于用假执行掩盖真故障（R3）
+                raise AgentError(
+                    Code.TOOL_BACKEND_UNAVAILABLE,
+                    "正式工具清单暂时不可用，不会用同名替身代替执行",
+                    http_status=503,
+                    details={"tool": name, "failed_sources": broken_sources},
+                )
             if not settings().allow_stub_tools:
                 raise AgentError(
                     Code.STUB_NOT_ALLOWED,

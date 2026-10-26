@@ -59,13 +59,11 @@ class AgentReviewBoundaries(unittest.TestCase):
         )
         self.assertIn(response.status_code, (400, 403, 404))
 
-    @unittest.expectedFailure
     def test_default_configuration_must_disable_stub_tools(self):
         with patch.dict(os.environ):
             os.environ.pop("AGENT_ALLOW_STUB", None)
             self.assertFalse(settings().allow_stub_tools)
 
-    @unittest.expectedFailure
     def test_external_prepare_must_wait_for_user_approval(self):
         f = self.fixture
         spec = ToolSpec(
@@ -100,7 +98,6 @@ class AgentReviewBoundaries(unittest.TestCase):
         self.assertEqual(result["status"], "awaiting_action")
         self.assertEqual(provider.prepare_calls, 0)
 
-    @unittest.expectedFailure
     def test_critical_tool_cannot_disable_confirmation_via_spec_flag(self):
         spec = ToolSpec(
             name="review_publish", title="Review publish", description="Review only",
@@ -108,7 +105,6 @@ class AgentReviewBoundaries(unittest.TestCase):
         )
         self.assertTrue(grants.needs_confirmation(self.fixture.a1, spec))
 
-    @unittest.expectedFailure
     def test_cross_project_confirmation_must_name_actual_target_project(self):
         f = self.fixture
         target = permissions.create_project(f.a1, "Different review target")
@@ -126,7 +122,6 @@ class AgentReviewBoundaries(unittest.TestCase):
         self.assertEqual(result["action"]["parameters"]["project_id"], target["id"])
         self.assertEqual(result["action"]["target_projects"], [target["id"]])
 
-    @unittest.expectedFailure
     def test_empty_business_response_must_not_be_treated_as_success(self):
         with self.assertRaises(AgentError):
             business._as_result({})

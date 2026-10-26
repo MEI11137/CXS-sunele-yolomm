@@ -109,14 +109,83 @@ def build_provider(backend: Any) -> Optional[Any]:
     return BusinessToolProvider(backend)
 
 
+# 业务端可以返回的执行状态。不在表里的状态一律不认，不能猜成成功。
+_ALLOWED_STATUSES = {
+    "succeeded",
+    "completed",
+    "completed_with_warnings",
+    "partial",
+    "partial_failed",
+    "failed",
+    "aborted",
+    "cancelled",
+    "running",
+    "pending",
+    "unknown",
+}
+
+# 每种字段允许的类型；类型不符就是契约不符，不能硬塞进 OperationResult。
+_FIELD_TYPES = {
+    "operation_id": (str, type(None)),
+    "business_refs": (list,),
+    "outputs": (dict,),
+    "item_results": (list,),
+    "error": (dict, type(None)),
+    "is_stub": (bool,),
+    "execution_state": (str,),
+}
+
+
 def _as_result(raw: Any) -> OperationResult:
+    """把业务返回值转成 ``OperationResult``；没有证据的成功一律不接受（R7）。
+
+    空字典、缺少状态、状态不在约定表里、字段类型不符，都不能当成
+    "succeeded"——那等于用默认值伪造成功，会让用户在什么都没发生的情况下
+    看到"已完成"。
+    """
     if isinstance(raw, OperationResult):
         return raw
-    if isinstance(raw, dict):
-        filtered = {k: v for k, v in raw.items() if k in _VALID_OPERATION_FIELDS}
-        filtered.setdefault("status", "succeeded")
-        return OperationResult(**filtered)
-    raise AgentError(Code.TOOL_BACKEND_UNAVAILABLE, "业务工具返回了无法识别的结果")
+    if not isinstance(raw, dict):
+        raise AgentError(Code.TOOL_BACKEND_UNAVAILABLE, "业务工具返回了无法识别的结果")
+    if not raw:
+        raise AgentError(
+            Code.TOOL_BACKEND_UNAVAILABLE,
+            "业务工具返回了空结果，无法确认是否执行成功",
+        )
+
+    unknown_fields = set(raw) - _VALID_OPERATION_FIELDS
+    if unknown_fields:
+        raise AgentError(
+            Code.TOOL_BACKEND_UNAVAILABLE,
+            "业务工具返回了未约定的字段：" + "、".join(sorted(unknown_fields)),
+            details={"fields": sorted(unknown_fields)},
+        )
+
+    status = str(raw.get("status") or "").strip().lower()
+    if not status:
+        raise AgentError(
+            Code.TOOL_BACKEND_UNAVAILABLE,
+            "业务工具没有返回执行状态，无法确认是否执行成功",
+        )
+    if status not in _ALLOWED_STATUSES:
+        raise AgentError(
+            Code.TOOL_BACKEND_UNAVAILABLE,
+            f"业务工具返回了无法识别的执行状态：{status}",
+            details={"status": status},
+        )
+
+    filtered: Dict[str, Any] = {}
+    for key, value in raw.items():
+        expected = _FIELD_TYPES.get(key)
+        if expected is not None and not isinstance(value, expected):
+            raise AgentError(
+                Code.TOOL_BACKEND_UNAVAILABLE,
+                f"业务工具返回的 {key} 字段类型不符合约定",
+                details={"field": key, "type": type(value).__name__},
+            )
+        filtered[key] = value
+    filtered["status"] = status
+    return OperationResult(**filtered)
 
 
 class BusinessToolProvider:

@@ -74,11 +74,23 @@ class ToolSpec:
         return self.risk == RISK_READ
 
     @property
+    def forced_confirmation(self) -> bool:
+        """写入/训练/发布/计费类动作的强制确认，工具自己说了不算（R5）。"""
+        return self.risk in (RISK_WRITE, RISK_CRITICAL) or self.billable
+
+    @property
     def needs_confirmation(self) -> bool:
-        """写入/计费/关键动作默认逐次确认；只读查询默认直接执行。"""
+        """写入/计费/关键动作强制逐次确认；只读查询才允许工具声明免确认。
+
+        工具声明 ``requires_confirmation=False`` 只能免除**只读**动作的确认，
+        不能免除写入/训练/发布/计费动作——否则一个写工具把标志位设成 False
+        就绕过了确认卡。
+        """
+        if self.forced_confirmation:
+            return True
         if self.requires_confirmation is not None:
             return bool(self.requires_confirmation)
-        return self.risk in (RISK_WRITE, RISK_CRITICAL) or self.billable
+        return False
 
     def to_openai_tool(self) -> Dict[str, Any]:
         schema = dict(self.parameters or {"type": "object", "properties": {}})

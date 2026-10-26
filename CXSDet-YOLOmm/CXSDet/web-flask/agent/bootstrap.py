@@ -24,6 +24,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from agent.config import settings
+
 EXTENSION_KEY = "haixun_agent"
 
 
@@ -220,10 +222,13 @@ def configure_business_backend(app, *, overrides: Optional[Dict[str, Any]] = Non
                 "candidate_root": candidate_root,
                 "project_file_access": "installed",
                 "dependencies": deps,
+                # 替身是否可用要能在启动报告里被核实，不能只看环境变量
+                "allow_stub_tools": settings().allow_stub_tools,
                 "notes": [
                     "新数据集/模型/记录/草稿在业务成功后按真实归属登记，状态变化递增版本（INT-03）",
                     "历史数据按原提交者/管理员登记，未判定归属的不公开；清单见 system_default_manifest",
                     "工具清单是否可见取决于本次请求的真实 principal",
+                    "工具替身默认关闭，需显式 AGENT_ALLOW_STUB=1；正式工具故障不会按同名回落（INT-04 R3）",
                 ],
             }
         )

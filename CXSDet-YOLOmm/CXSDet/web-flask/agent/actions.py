@@ -421,6 +421,44 @@ def _force_status(action_id: str, status: str, *, error_code: Optional[str] = No
         conn.close()
 
 
+def attach_prepared(
+    action_id: str,
+    prepared_id: str,
+    preview: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """确认之后补上业务预备记录（外部工具只能在这个时点 prepare，R4）。
+
+    只允许给尚未执行的动作补；已经执行过的不再改动，避免把结果和新的预备
+    记录混在一起。
+    """
+    conn = connect()
+    try:
+        row = query_one(conn, "SELECT * FROM agent_action WHERE id = ?", (action_id,))
+        if not row:
+            raise AgentError(Code.ACTION_NOT_FOUND, "动作不存在", http_status=404)
+        if row["status"] not in (STATUS_PENDING, STATUS_EXECUTING):
+            raise AgentError(
+                Code.ACTION_STALE,
+                "该动作已经处理过，不能再补预备记录",
+                http_status=409,
+            )
+        merged = dict(loads(row.get("preview_json")) or {})
+        if preview:
+            merged.update(preview)
+        if prepared_id:
+            merged.setdefault("prepared_id", prepared_id)
+        conn.execute(
+            "UPDATE agent_action SET prepared_id = ?, preview_json = ?, updated_at = ? "
+            "WHERE id = ?",
+            (prepared_id or row.get("prepared_id"), dumps(merged), now(), action_id),
+        )
+        conn.commit()
+        updated = query_one(conn, "SELECT * FROM agent_action WHERE id = ?", (action_id,))
+    finally:
+        conn.close()
+    return _action_view(updated)
+
+
 def mark_unknown(action_id: str, reason: str) -> Dict[str, Any]:
     return mark_result(
         action_id,

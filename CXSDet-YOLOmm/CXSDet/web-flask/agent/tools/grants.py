@@ -30,10 +30,14 @@ def needs_confirmation(
     effective_source = source or spec.source
     if effective_source == SOURCE_CONTROL:
         return False
+    # R5：写入/训练/发布/计费的强制确认先于任何"工具自称可免确认"的说法，
+    # 包括外部连接的只读放行记录——放行只能覆盖只读且不计费的具体工具。
+    if spec.forced_confirmation:
+        return True
     if effective_source != SOURCE_MCP:
         return spec.needs_confirmation
 
-    # 外部工具：写/训练/发布无论是否放行都要确认
+    # 外部工具：只读且不计费，才看得具体授权记录
     if not spec.readonly or spec.billable:
         return True
     grant = _find_grant(actor, spec, project_id)

@@ -70,7 +70,9 @@ def settings() -> AgentSettings:
         recent_message_limit=_env_int("AGENT_RECENT_MESSAGE_LIMIT", 12),
         action_ttl_seconds=_env_int("AGENT_ACTION_TTL_SECONDS", 1800),
         readonly_retry_limit=_env_int("AGENT_READONLY_RETRY_LIMIT", 1),
-        allow_stub_tools=_env_flag("AGENT_ALLOW_STUB", True),
+        # INT-04 R3：替身默认关闭。只有显式 AGENT_ALLOW_STUB=1 才出现在工具
+        # 清单里，避免"看起来能跑"的假成功被当成真实能力。
+        allow_stub_tools=_env_flag("AGENT_ALLOW_STUB", False),
         default_provider_url=os.environ.get(
             "AGENT_DEFAULT_PROVIDER_URL", DEFAULT_DEEPSEEK_API_URL
         ),

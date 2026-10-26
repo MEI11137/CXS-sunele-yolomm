@@ -26,6 +26,7 @@ from agent.tools import business, grants
 from agent.tools.contract import (
     RISK_CRITICAL,
     RISK_WRITE,
+    SOURCE_BUSINESS,
     OperationResult,
     ToolSpec,
     validate_arguments,
@@ -61,6 +62,15 @@ _RESOURCE_ARG_KEYS = {
     "candidate_ref",
     "project_id",
 }
+
+# 参数里可以显式指定"操作/输出项目"的名字。确认卡上的目标项目只认这些
+# 经过核实的值，不拿聊天项目凑数（INT-04 R6）。
+_PROJECT_ARG_KEYS = ("project_id", "target_project_id", "output_project_id")
+
+# 允许在用户确认之前做预检的工具来源。只有本进程内的业务工具能进这个集合：
+# 它读的是本地库、只做参数校验；外部连接（MCP）的 prepare 会真实发起外部
+# 调用，必须等确认之后（INT-04 R4）。
+PREPARE_BEFORE_APPROVAL_SOURCES = {SOURCE_BUSINESS}
 
 
 def classify_intent(text: str, has_active_task: bool) -> str:
@@ -242,6 +252,21 @@ class AgentRuntime:
             )
 
         try:
+            prepared_id = action.get("prepared_id")
+            if (
+                not prepared_id
+                and provider is not None
+                and spec.supports_preview
+                and source not in PREPARE_BEFORE_APPROVAL_SOURCES
+            ):
+                # 外部工具：用户已经确认，这时才允许真的发起外部预检
+                prepared = provider.prepare(actor, spec, action["parameters"], None) or {}
+                prepared_id = prepared.get("prepared_id")
+                if prepared_id:
+                    action = actions.attach_prepared(
+                        action["id"], prepared_id, prepared.get("preview") or {}
+                    )
+
             outcome = self._execute_tool(
                 actor,
                 project,
@@ -253,7 +278,7 @@ class AgentRuntime:
                 action_id=action["id"],
                 request_key=action["request_key"],
                 # 执行必须复用确认卡绑定的那条业务预备记录
-                prepared_id=action.get("prepared_id"),
+                prepared_id=prepared_id,
             )
         except AgentError as exc:
             actions.mark_result(
@@ -547,7 +572,7 @@ class AgentRuntime:
         )
 
         # 1) 资源权限：能用资源索引核对的先核对
-        revisions, unverified = self._guard_arguments(actor, arguments)
+        revisions, unverified, resource_projects = self._guard_arguments(actor, arguments)
 
         # 2) 计划门禁：多步写入必须先确认整体计划
         gate = self._plan_gate(task, spec)
@@ -566,20 +591,28 @@ class AgentRuntime:
         if need_confirm:
             preview: Dict[str, Any] = {}
             prepared_id: Optional[str] = None
+            # R4：确认前只允许**本进程内**的业务预检（读库、校验参数、出预览）。
+            # 外部连接（MCP 等）的 prepare 会真的发起外部调用，必须等用户确认
+            # 之后再做，否则"还没同意就已经动了外部系统"。
             if spec.supports_preview and provider is not None:
-                try:
-                    prepared = provider.prepare(actor, spec, arguments, None) or {}
-                except AgentError as exc:
-                    # 预检失败或被业务拦截：不能生成"确认后即可执行"的动作
-                    self._feedback_tool_error(
-                        session, task, spec, exc.message, code=exc.code
-                    )
-                    return None
-                preview = prepared.get("preview") or {}
-                prepared_id = prepared.get("prepared_id")
-                if prepared_id:
-                    # 预备记录 ID 随确认卡落库，确认后复用它执行
-                    preview.setdefault("prepared_id", prepared_id)
+                if source in PREPARE_BEFORE_APPROVAL_SOURCES:
+                    try:
+                        prepared = provider.prepare(actor, spec, arguments, None) or {}
+                    except AgentError as exc:
+                        # 预检失败或被业务拦截：不能生成"确认后即可执行"的动作
+                        self._feedback_tool_error(
+                            session, task, spec, exc.message, code=exc.code
+                        )
+                        return None
+                    preview = prepared.get("preview") or {}
+                    prepared_id = prepared.get("prepared_id")
+                    if prepared_id:
+                        # 预备记录 ID 随确认卡落库，确认后复用它执行
+                        preview.setdefault("prepared_id", prepared_id)
+                else:
+                    # 告知前端与用户：这张卡上的预览只是参数与影响范围，
+                    # 真正的外部预检/执行都在确认之后。
+                    preview["prepare_after_approval"] = True
             if unverified:
                 preview.setdefault("unverified_refs", unverified)
             action = actions.create_action(
@@ -590,7 +623,9 @@ class AgentRuntime:
                 tool_title=spec.title,
                 parameters=arguments,
                 preview=preview,
-                target_projects=[project["id"]],
+                target_projects=self._target_projects(
+                    actor, project, arguments, resource_projects
+                ),
                 resource_revisions=revisions,
                 prepared_id=prepared_id,
             )
@@ -645,7 +680,7 @@ class AgentRuntime:
                 f"工具 {spec.name} 尚未接入，无法执行",
                 http_status=409,
             )
-        revisions, _ = self._guard_arguments(actor, arguments)
+        revisions, _, _ = self._guard_arguments(actor, arguments)
         key = request_key or actions.build_request_key(
             task["id"], spec.name, spec.version, arguments, revisions
         )
@@ -874,10 +909,15 @@ class AgentRuntime:
     # ------------------------------------------------------------------ #
     def _guard_arguments(
         self, actor: ActorContext, arguments: Dict[str, Any]
-    ) -> tuple[Dict[str, Any], List[str]]:
-        """能通过资源索引核对的目标先核对；核对不了的如实标为"未核对"。"""
+    ) -> tuple[Dict[str, Any], List[str], List[str]]:
+        """能通过资源索引核对的目标先核对；核对不了的如实标为"未核对"。
+
+        返回 ``(revisions, unverified, project_ids)``：``project_ids`` 是已核实
+        资源实际所属的项目，供确认卡写明"这会动到哪个项目"，不再一律填聊天项目。
+        """
         revisions: Dict[str, Any] = {}
         unverified: List[str] = []
+        project_ids: List[str] = []
         for key in _RESOURCE_ARG_KEYS & set(arguments.keys()):
             value = arguments.get(key)
             if value in (None, ""):
@@ -894,10 +934,53 @@ class AgentRuntime:
                         continue
                     raise
                 revisions[resource["id"]] = resource["revision"]
+                resource_project = resource.get("project_id")
+                if resource_project and str(resource_project) not in project_ids:
+                    project_ids.append(str(resource_project))
                 if key == "project_id" and resource.get("kind") == "project":
                     continue
                 permissions.require_access(actor, resource, "read")
-        return revisions, unverified
+        return revisions, unverified, project_ids
+
+    def _target_projects(
+        self,
+        actor: ActorContext,
+        chat_project: Dict[str, Any],
+        arguments: Dict[str, Any],
+        resource_projects: List[str],
+    ) -> List[str]:
+        """确认卡上的目标项目 = 已核实的实际操作项目（R6）。
+
+        优先级：参数里显式写明且核实为本人的项目 → 本次引用资源所属的**唯一**
+        项目 → 当前聊天项目。显式写了项目但核实不了（不存在或不是本人）时直接
+        拒绝，不能悄悄退回聊天项目，否则确认卡会写错目标。
+        """
+        targets: List[str] = []
+        for key in _PROJECT_ARG_KEYS:
+            value = arguments.get(key)
+            if not value:
+                continue
+            items = value if isinstance(value, list) else [value]
+            for item in items:
+                project_id = str(item)
+                try:
+                    permissions.get_project(actor, project_id)
+                except AgentError as exc:
+                    raise AgentError(
+                        exc.code,
+                        f"目标项目 {project_id} 不在当前账号名下，不能作为操作目标",
+                        http_status=403,
+                        details={"project_id": project_id},
+                    ) from exc
+                if project_id not in targets:
+                    targets.append(project_id)
+
+        if targets:
+            return targets
+        unique = [pid for pid in resource_projects if pid]
+        if len(set(unique)) == 1:
+            return unique[:1]
+        return [chat_project["id"]]
 
     def _plan_gate(
         self, task: Dict[str, Any], spec: ToolSpec
