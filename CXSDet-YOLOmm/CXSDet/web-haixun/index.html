@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>海巡智检 · 海上风电叶片巡检平台</title>
+    <script>
+      // 初始加载避免闪错主题：在 CSS 前同步读取偏好
+      (function () {
+        try {
+          // URL 参数可临时覆盖主题（用于演示/测试，不写回 localStorage）
+          var qs = new URLSearchParams(location.search)
+          var qt = qs.get('theme')
+          var t = qt === 'dark' || qt === 'light' ? qt : localStorage.getItem('haixun.theme')
+          if (t === 'dark' || t === 'light') {
+            document.documentElement.setAttribute('data-theme', t)
+          } else {
+            document.documentElement.setAttribute('data-theme', 'light')
+          }
+        } catch (e) {
+          document.documentElement.setAttribute('data-theme', 'light')
+        }
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
