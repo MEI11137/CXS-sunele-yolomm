@@ -47,6 +47,20 @@ def set_backend(backend: Optional[Any]) -> None:
 
 
 def get_backend() -> Optional[Any]:
+    """当前 app 装配的业务后端；无应用上下文时回退模块级实例。
+
+    app 优先是为了让多个 app（或测试库）各自持有自己的实例，不会共享同一个
+    业务后端，也不会把 A 库的动作写到 B 库。
+    """
+    try:
+        from flask import current_app
+
+        entry = current_app.extensions.get("haixun_agent") or {}
+        backend = entry.get("business_backend")
+        if backend is not None:
+            return backend
+    except Exception:  # noqa: BLE001 - 无应用上下文时走模块级
+        pass
     return _backend
 
 

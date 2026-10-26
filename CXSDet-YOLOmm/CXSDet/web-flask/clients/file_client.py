@@ -83,6 +83,13 @@ class FileClient:
     def delete(self, bucket: str, object_key: str) -> None:
         self._path(bucket, object_key).unlink(missing_ok=True)
 
+    def exists(self, bucket: str, object_key: str) -> bool:
+        """Whether the stored object is present, without reading its bytes."""
+        try:
+            return self._path(bucket, object_key).is_file()
+        except (ValueError, OSError):
+            return False
+
     def get(self, bucket: str, object_key: str) -> bytes:
         return self._path(bucket, object_key).read_bytes()
 

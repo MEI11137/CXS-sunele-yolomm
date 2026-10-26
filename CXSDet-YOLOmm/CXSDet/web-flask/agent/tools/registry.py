@@ -171,24 +171,39 @@ class _ControlOnlyProvider:
 
 
 _registry: Optional[ToolRegistry] = None
+_registry_key = None
+# 持有后端强引用，避免对象被回收后 id() 复用导致命中错误的缓存
+_registry_backend = None
 
 
 def get_registry() -> ToolRegistry:
-    """进程级注册表：真实业务后端优先，工具替身按配置兜底。"""
-    global _registry
-    if _registry is None:
-        from agent.tools import business, stub
+    """注册表缓存按"当前业务后端 + 替身开关"隔离。
 
-        registry = ToolRegistry()
-        backend = business.get_backend()
-        if backend is not None:
-            registry.add_provider(business.BusinessToolProvider(backend), SOURCE_BUSINESS)
-        if settings().allow_stub_tools:
-            registry.add_provider(stub.StubToolProvider(), SOURCE_STUB)
-        _registry = registry
+    不同 app/测试库不会命中彼此的缓存。替身是否出现仍由 ``AGENT_ALLOW_STUB``
+    决定；"默认关闭替身、且正式工具故障不按同名回落"属于 INT-04 R3。
+    """
+    global _registry, _registry_key, _registry_backend
+    from agent.tools import business, stub
+
+    backend = business.get_backend()
+    allow_stub = settings().allow_stub_tools
+    key = (id(backend) if backend is not None else 0, allow_stub)
+    if _registry is not None and _registry_key == key:
+        return _registry
+
+    registry = ToolRegistry()
+    if backend is not None:
+        registry.add_provider(business.BusinessToolProvider(backend), SOURCE_BUSINESS)
+    if allow_stub:
+        registry.add_provider(stub.StubToolProvider(), SOURCE_STUB)
+    _registry = registry
+    _registry_key = key
+    _registry_backend = backend
     return _registry
 
 
 def reset_registry() -> None:
-    global _registry
+    global _registry, _registry_key, _registry_backend
     _registry = None
+    _registry_key = None
+    _registry_backend = None
