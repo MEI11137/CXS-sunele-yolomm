@@ -584,6 +584,39 @@ def _record_is_accessible(record_id):
     return bool(record)
 
 
+def _publish_review_change(user_id, record_id, result):
+    """人工复核成功后：递增索引版本并发出业务变更通知。
+
+    只有真的写了新版本才发布；通知发不出去也不影响已经落库的人工决定。
+    """
+    try:
+        from agent import resources
+
+        resources.ensure("detection_records", record_id)
+        revision = resources.bump("detection_records", record_id)
+        notifier = (current_app.extensions.get("haixun_agent") or {}).get("notifier")
+        if notifier is None:
+            return
+        notifier(
+            int(user_id),
+            {
+                "tool": "review.submit_human",
+                "principal_id": int(user_id),
+                "business_refs": [
+                    {
+                        "type": "record",
+                        "id": record_id,
+                        "version": str(revision or result.new_version),
+                    }
+                ],
+                "summary": {"human_review_status": result.status},
+            },
+        )
+    except Exception:
+        # 通知/索引属于附加链路，不能把已经保存成功的人工决定报成失败
+        pass
+
+
 @detection_bp.route('/records/<record_id>/human-review', methods=['POST'])
 @token_required
 def human_review_detection_record(record_id):
@@ -600,6 +633,8 @@ def human_review_detection_record(record_id):
             payload.get('decision'),
             db,
         )
+        # 人工决定落库成功：递增 Agent 索引版本，再通知业务变更（B 核实版本后才接力）
+        _publish_review_change(g.user_id, record_id, result)
         return success(result.to_dict(), "人工复核已保存")
     except ReviewConflictError as exc:
         return error(str(exc), 409), 409

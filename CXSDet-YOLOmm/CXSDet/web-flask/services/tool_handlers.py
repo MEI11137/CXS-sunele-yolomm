@@ -541,17 +541,18 @@ class ModelPublish(BaseHandler):
     def prepare(self, adapter, principal, arguments):
         spec = _spec("model.publish")
         resource = adapter._resource(principal, arguments["model_id"], spec)
-        return resource, _preview_model_publish(adapter, resource.id)
+        return resource, _preview_model_publish(adapter, principal, resource.id)
 
     def execute(self, adapter, principal, arguments, preview, resource):
         outputs = adapter._publish_model(
             resource.id, principal, preview["archived_model_ids"],
+            scope_model_ids=preview.get("scope_model_ids"),
         )
         return outputs, [{"type": "model", "id": resource.id, "version": resource.version,
                           "project_id": resource.project_id}]
 
 
-def _preview_model_publish(adapter, model_id: str) -> dict:
+def _preview_model_publish(adapter, principal: int, model_id: str) -> dict:
     if not callable(adapter.storage_exists):
         raise ValueError("Model storage check is not configured")
     model = adapter._read_model(model_id)
@@ -559,6 +560,8 @@ def _preview_model_publish(adapter, model_id: str) -> dict:
         raise ToolRefused("MODEL_NOT_READY", "模型未就绪，不能发布")
     if adapter.storage_exists(model["model_bucket"], model["model_object_key"]) is not True:
         raise ToolRefused("MODEL_WEIGHT_MISSING", "文件服务中找不到模型权重")
+    # 归档范围只认真实 owner/project 内的模型，并且逐个重新授权
+    scope = adapter._model_scope(principal, model_id)
     with adapter.connect() as conn:
         dataset = conn.execute(
             "SELECT dataset_mode, secondary_modality FROM datasets WHERE id=?",
@@ -568,18 +571,22 @@ def _preview_model_publish(adapter, model_id: str) -> dict:
                 (model["model_mode"] or "single") or
                 (dataset["secondary_modality"] or None) != (model["secondary_modality"] or None)):
             raise ToolRefused("MODEL_DATASET_MISMATCH", "模型数据集缺失或模态不匹配")
+        placeholders = ", ".join("?" for _ in scope)
         archived = conn.execute(
-            "SELECT id FROM models WHERE status=3 AND id<>? AND model_mode=? "
-            "AND primary_modality=? AND secondary_modality IS ? "
-            "ORDER BY create_time DESC",
+            f"SELECT id FROM models WHERE status=3 AND id<>? AND model_mode=? "
+            f"AND primary_modality=? AND secondary_modality IS ? "
+            f"AND id IN ({placeholders}) "
+            f"ORDER BY create_time DESC",
             (model_id, model["model_mode"], model["primary_modality"],
-             model["secondary_modality"]),
+             model["secondary_modality"], *scope),
         ).fetchall()
     return {
         "effect": "write",
         "model_id": model_id,
         "previous_model_id": archived[0]["id"] if archived else None,
         "archived_model_ids": [row["id"] for row in archived],
+        # 预览里带上本次核准的范围：确认后仍按这份范围复核，范围本身不可扩大
+        "scope_model_ids": scope,
         "impact": "本次发布将把上面列出的同模态已发布模型置为归档，不可自动回滚",
     }
 
@@ -591,23 +598,29 @@ class ModelUnpublish(BaseHandler):
         model = adapter._model_row(resource.id)
         if model["status"] != 3:
             raise ToolRefused("MODEL_NOT_PUBLISHED", "只能取消发布已发布的模型")
+        scope = adapter._model_scope(principal, resource.id)
+        placeholders = ", ".join("?" for _ in scope)
         with adapter.connect() as conn:
             archived = conn.execute(
-                "SELECT id FROM models WHERE publish_status='archived' AND id<>? "
-                "AND model_mode=? AND primary_modality=? AND secondary_modality IS ?",
+                f"SELECT id FROM models WHERE publish_status='archived' AND id<>? "
+                f"AND model_mode=? AND primary_modality=? AND secondary_modality IS ? "
+                f"AND id IN ({placeholders})",
                 (resource.id, model["model_mode"], model["primary_modality"],
-                 model["secondary_modality"]),
+                 model["secondary_modality"], *scope),
             ).fetchall()
         preview = {
             "effect": "write",
             "model_id": resource.id,
             "model_name": model.get("name") or model["id"],
             "archived_model_ids": [row["id"] for row in archived],
+            "scope_model_ids": scope,
             "impact": "取消发布后该模型不再参与检测；已归档的旧模型不会自动恢复发布",
         }
         return resource, preview
 
     def execute(self, adapter, principal, arguments, preview, resource):
+        # 执行前重新核一次归档范围授权：默认共享模型（owner 为系统）不可被普通用户撤销
+        adapter._model_scope(principal, resource.id)
         with adapter.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             current = conn.execute(
@@ -691,19 +704,33 @@ def _compare_conditions(adapter, parent_id: str, child_id: str) -> dict:
 
 @handler("detection.run")
 class DetectionRun(BaseHandler):
+    def _output_resource(self, adapter, principal, arguments, asset):
+        """解析本轮**显式选择**的输出项目；没选就用原图所在项目。
+
+        模型归属不参与这里的判断：跨项目只读引用模型是允许的，检测结果只落在
+        用户能写的那个项目里。
+        """
+        output_project_id = str(arguments.get("output_project_id") or "").strip()
+        spec = _spec("detection.run")
+        if not output_project_id:
+            return adapter._project_resource(principal, asset["project_id"], spec), "asset_project"
+        if output_project_id == asset["project_id"]:
+            return adapter._project_resource(principal, output_project_id, spec), "explicit"
+        # 显式指定了另一个项目：必须能写（detection:create），否则直接拒绝
+        return adapter._project_resource(principal, output_project_id, spec), "explicit"
+
     def prepare(self, adapter, principal, arguments):
         from services.detection_service import resolve_inference_inputs  # noqa: F401
 
         asset = _asset(adapter, principal, arguments["asset_id"], {"image"})
-        spec = _spec("detection.run")
-        resource = adapter._project_resource(principal, asset["project_id"], spec)
+        resource, output_origin = self._output_resource(adapter, principal, arguments, asset)
         # 模型只要通过授权解析即可使用：默认只读模型、以及本人显式引用的
         # 跨项目模型都属于合法用法，因此不再按 project_id 硬阻断。
         model_resource = adapter.resolve(principal, "model", arguments["model_id"],
                                          ("model:read",))
         model = adapter._model_row(model_resource.id)
         blockers = []
-        cross_project_model = model_resource.project_id != asset["project_id"]
+        cross_project_model = model_resource.project_id != resource.id
         if model["status"] != 3:
             blockers.append({"code": "MODEL_NOT_PUBLISHED",
                              "message": "只能使用已发布的模型进行检测"})
@@ -742,16 +769,19 @@ class DetectionRun(BaseHandler):
             "confidence": float(arguments.get("confidence") or 0.25),
             "ignored_arguments": ignored,
             "model_source": "cross_project_readonly" if cross_project_model else "same_project",
+            "model_project_id": model_resource.project_id,
+            "output_project_id": resource.id,
+            "output_project_source": output_origin,
             "blocked": bool(blockers),
             "blocked_reasons": blockers,
-            "impact": "将上传原图（及第二模态图）、结果图并生成一条检测记录",
+            "impact": "将上传原图（及第二模态图）、结果图并在输出项目生成一条检测记录",
         }
         return resource, preview
 
     def recheck(self, adapter, principal, arguments, preview):
         asset = _asset(adapter, principal, arguments["asset_id"], {"image"})
-        return adapter._project_resource(principal, asset["project_id"],
-                                         _spec("detection.run"))
+        resource, _ = self._output_resource(adapter, principal, arguments, asset)
+        return resource
 
     def execute(self, adapter, principal, arguments, preview, resource):
         from services.detection_service import execute_detection
@@ -760,8 +790,11 @@ class DetectionRun(BaseHandler):
             raise ToolRefused("DETECTION_BLOCKED", "检测缺少必要条件",
                               preview.get("blocked_reasons") or [])
         asset = _asset(adapter, principal, arguments["asset_id"], {"image"})
-        if asset["project_id"] != resource.id:
+        original_project = (preview.get("asset") or {}).get("project_id")
+        if original_project and asset["project_id"] != original_project:
             raise ToolConflict("Source image moved to another project; prepare again")
+        if resource.id != preview.get("output_project_id"):
+            raise ToolConflict("Output project changed; prepare again")
         model = adapter._model_row(arguments["model_id"])
         secondary_path = None
         workspace = _work_dir(adapter, "detection")
@@ -807,9 +840,11 @@ class DetectionRun(BaseHandler):
             "result_image_url": result.result_image_url,
             "secondary_image_url": result.secondary_image_url,
             "secondary_image_origin": result.secondary_image_origin,
+            # 记录归输出项目；模型归属不受影响
+            "output_project_id": resource.id,
         }
         return outputs, [{"type": "record", "id": result.record_id, "version": "1",
-                          "project_id": resource.project_id,
+                          "project_id": resource.id,
                           "model_id": result.model_id}]
 
 

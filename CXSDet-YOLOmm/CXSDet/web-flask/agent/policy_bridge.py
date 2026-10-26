@@ -300,14 +300,16 @@ def iter_business_refs(event: Any) -> Iterator[Dict[str, Any]]:
 class BusinessNotifier:
     """C 的业务变更通知接收器。
 
-    只做"记账 + 唤起核对"：按业务引用找到本用户正处于等待状态的任务，追加一条
-    事件让前端刷新，**不改任务状态、不代替真实查询**。真正的接力推进与自动
-    resume 属于 INT-09。
+    只做"核实 + 记账"：按业务引用找到本用户正处于等待状态的任务，**先核实索引里
+    的真实版本确实前进了**，再追加一条事件让前端/运行时刷新。没有真实状态更新
+    （版本没动、或索引里查不到该对象）就什么都不做——任务继续等待，不凭一条通知
+    假装业务已经变了。改任务状态与自动推进仍属于后续阶段。
     """
 
     def __init__(self) -> None:
         self.received: int = 0
         self.matched_tasks: int = 0
+        self.unchanged: int = 0
         self.errors: list = []
 
     def __call__(self, principal: int, event: Dict[str, Any]) -> None:
@@ -316,6 +318,20 @@ class BusinessNotifier:
             self._deliver(principal, event)
         except Exception as exc:  # noqa: BLE001 - 通知失败不能影响业务写入
             self.errors.append(f"{type(exc).__name__}: {exc}"[:200])
+
+    @staticmethod
+    def _verified_version(ref: Dict[str, Any]) -> Optional[int]:
+        """核实该业务对象的真实版本；索引里没有就不算核实成功。"""
+        from agent import resources
+
+        kind = str(ref.get("type") or ref.get("kind") or "")
+        business_id = str(ref.get("id") or "")
+        if not kind or not business_id:
+            return None
+        state = resources.current_state(kind, business_id)
+        if state is None:
+            return None
+        return int(state["revision"])
 
     def _deliver(self, principal: int, event: Dict[str, Any]) -> None:
         from agent import tasks as task_store
@@ -333,12 +349,34 @@ class BusinessNotifier:
         for task in task_store.tasks_in_statuses(task_store.WAITING_STATUSES):
             if int(task.get("owner_id") or 0) != int(principal):
                 continue
+            task_refs = [ref for ref in (task.get("business_refs") or [])
+                         if isinstance(ref, dict)]
             mine = {
                 (str(ref.get("kind") or ref.get("type") or ""), str(ref.get("id") or ""))
-                for ref in (task.get("business_refs") or [])
-                if isinstance(ref, dict)
+                for ref in task_refs
             }
-            if not (mine & wanted):
+            overlap = mine & wanted
+            if not overlap:
+                continue
+            # 只有真实版本前进过的引用才允许接力
+            verified = []
+            for ref in task_refs:
+                key = (str(ref.get("kind") or ref.get("type") or ""), str(ref.get("id") or ""))
+                if key not in overlap:
+                    continue
+                current = self._verified_version(ref)
+                recorded = ref.get("version")
+                try:
+                    recorded_version = int(recorded) if recorded not in (None, "") else None
+                except (TypeError, ValueError):
+                    recorded_version = None
+                if current is None:
+                    continue
+                if recorded_version is not None and current <= recorded_version:
+                    continue
+                verified.append({**ref, "version": current})
+            if not verified:
+                self.unchanged += 1
                 continue
             task_store.append_event(
                 task["session_id"],
@@ -346,8 +384,8 @@ class BusinessNotifier:
                 "business.changed",
                 {
                     "tool": event.get("tool") or event.get("tool_name"),
-                    "refs": refs,
-                    "note": "业务对象已变更，请核实真实状态",
+                    "refs": verified,
+                    "note": "业务对象已变更（版本已核实），请按新版本继续",
                 },
             )
             self.matched_tasks += 1

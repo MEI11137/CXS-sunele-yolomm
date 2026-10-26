@@ -38,6 +38,10 @@ LOGGER = logging.getLogger(__name__)
 
 __all__ = ["BusinessToolAdapter", "ResourceSnapshot", "ToolConflict"]
 
+# 执行入口。人工页面与 Agent 是**两个服务端入口**，不能靠参数里的一个布尔值区分。
+ENTRY_AGENT = "agent"
+ENTRY_HUMAN_PAGE = "human_page"
+
 
 def _json(value) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -196,6 +200,7 @@ class BusinessToolAdapter:
         mcp_store=None,
         candidate_root=None,
         training_launcher: Callable | None = None,
+        model_scope_resolver: Callable[[str], list[str]] | None = None,
     ) -> None:
         if not callable(require_access) or not callable(resolve_resource):
             raise ValueError("A real access check and resource resolver are required")
@@ -225,6 +230,9 @@ class BusinessToolAdapter:
         # Starts the worker that runs the training. Defaults to a daemon
         # process around ``training_runner.run_training_job``; injected in tests.
         self.training_launcher = training_launcher
+        # 发布/归档的合法范围：``model_id -> [同一真实 owner+project 的模型 ID]``。
+        # 未注入时范围只有模型自己——不会按整表同模态去归档别人的模型。
+        self.model_scope_resolver = model_scope_resolver
         with self._connect() as conn:
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS business_tool_operations (
@@ -296,10 +304,28 @@ class BusinessToolAdapter:
             "model.publish": "Model publish",
         }.get(tool_name, tool_name)
 
+    @staticmethod
+    def _require_entry(tool_name: str, spec, entry: str) -> None:
+        """人工页面专属动作只能从人工页面入口调用。
+
+        服务端只认入口参数（由受保护的路由传 ``ENTRY_HUMAN_PAGE``），不认请求体里
+        的任何 "human=true" 标记，也不认一张普通的确认卡。
+        """
+        if spec.agent_executable:
+            return
+        if entry == ENTRY_HUMAN_PAGE:
+            return
+        raise PermissionError(
+            f"{tool_name} 只能由受保护的人工页面提交，Agent 执行入口不提供该动作"
+        )
+
     def list_tools(self, principal: int) -> list[dict]:
         self._check_access(principal, "tool:list", None)
         names = []
         for name, spec in TOOL_SPECS.items():
+            if not spec.agent_executable:
+                # 人工决定与扩权配置不进 LLM 工具清单
+                continue
             if self._dependency_error(name) is not None:
                 continue
             if spec.requires and not self._has_actions(principal, spec.requires):
@@ -377,18 +403,55 @@ class BusinessToolAdapter:
             raise FileNotFoundError("Model is not registered")
         return dict(row)
 
+    def _model_scope(self, principal: int, model_id: str) -> list[str]:
+        """发布/归档的合法范围。
+
+        ``model_scope_resolver`` 由装配层注入（按真实 owner + project 计算）。
+        没有注入时只返回模型自己：宁可"不归档任何旧模型"，也不能归档别人的。
+        范围内的每个模型都要重新判一次 ``model:publish``——范围本身不代替授权。
+        """
+        if callable(self.model_scope_resolver):
+            raw = self.model_scope_resolver(model_id) or []
+        else:
+            raw = [model_id]
+        scope = {str(item) for item in raw if item}
+        scope.add(str(model_id))
+        for candidate in sorted(scope):
+            try:
+                resource = self.resolve(principal, "model", candidate)
+            except (PermissionError, ValueError, FileNotFoundError) as exc:
+                raise PermissionError(
+                    f"归档清单里的模型 {candidate} 无权限或不存在：{exc}"
+                ) from exc
+            self._check_access(principal, "model:publish", resource)
+        return sorted(scope)
+
     def _publish_model(self, model_id: str, principal: int,
-                       expected_archived_model_ids: list[str]) -> dict:
+                       expected_archived_model_ids: list[str],
+                       scope_model_ids: list[str] | None = None) -> dict:
         from services.model_registry_service import ModelPublishConflict, publish_model
 
+        # 每次执行都重新核一遍授权；确认时的范围只能缩小，不能被参数扩大
+        authorized = self._model_scope(principal, model_id)
+        if scope_model_ids:
+            scope = sorted(set(str(item) for item in scope_model_ids) & set(authorized))
+            scope.append(str(model_id))
+            scope = sorted(set(scope))
+        else:
+            scope = authorized
         try:
             result = publish_model(
                 model_id, principal, _DatabaseHandle(self.database_path), self.storage_exists,
                 expected_archived_model_ids=expected_archived_model_ids,
+                scope_model_ids=scope,
             )
         except ModelPublishConflict as exc:
             raise ToolConflict(str(exc)) from exc
-        return {**result.to_dict(), "archived_model_ids": expected_archived_model_ids}
+        payload = result.to_dict()
+        payload["archived_model_ids"] = sorted(
+            payload.get("archived_model_ids") or expected_archived_model_ids or []
+        )
+        return payload
 
     def _read_dataset(self, dataset_id: str) -> dict:
         with self._connect() as conn:
@@ -478,8 +541,10 @@ class BusinessToolAdapter:
             "error": json.loads(row["error_json"]) if row["error_json"] else None,
         }
 
-    def prepare_tool(self, principal: int, tool_name: str, arguments: dict) -> dict:
+    def prepare_tool(self, principal: int, tool_name: str, arguments: dict,
+                     *, entry: str = ENTRY_AGENT) -> dict:
         spec = self._spec(tool_name)
+        self._require_entry(tool_name, spec, entry)
         unavailable = self._dependency_error(tool_name)
         if unavailable:
             raise ValueError(unavailable)
@@ -529,7 +594,8 @@ class BusinessToolAdapter:
             return recheck(self, principal, arguments, preview)
         return self._resource(principal, arguments[spec.id_field], spec)
 
-    def execute_tool(self, principal: int, prepared_id: str, request_key: str) -> dict:
+    def execute_tool(self, principal: int, prepared_id: str, request_key: str,
+                     *, entry: str = ENTRY_AGENT) -> dict:
         if not isinstance(request_key, str) or not 0 < len(request_key) <= 128:
             raise ValueError("request_key must contain 1 to 128 characters")
         with self._connect() as conn:
@@ -539,6 +605,7 @@ class BusinessToolAdapter:
         if prepared is None or prepared["principal_id"] != str(principal):
             raise PermissionError("Operation is not accessible")
         spec = self._spec(prepared["tool_name"])
+        self._require_entry(prepared["tool_name"], spec, entry)
         arguments = json.loads(prepared["arguments_json"])
         preview = json.loads(prepared["preview_json"] or "{}")
         prior_resource = ResourceSnapshot(**json.loads(prepared["resource_json"]))

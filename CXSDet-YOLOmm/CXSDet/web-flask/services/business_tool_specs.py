@@ -25,6 +25,9 @@ class ToolSpec:
     resource_actions: tuple[str, ...] = ()
     # Global actions that must be granted for the tool to be listed at all.
     requires: tuple[str, ...] = ()
+    # ``False`` 表示该动作只能由受保护的人工页面提交：不进 LLM 工具清单，
+    # Agent 执行入口直接拒绝。人工决定与扩权配置不能由模型代做。
+    agent_executable: bool = True
     # (adapter attribute, message) that must exist for the tool to be usable.
     deps: tuple[tuple[str, str], ...] = field(default_factory=tuple)
 
@@ -56,6 +59,7 @@ def _tool(
     resource_actions: tuple[str, ...] = (),
     requires: tuple[str, ...] = (),
     deps: tuple[tuple[str, str], ...] = (),
+    agent_executable: bool = True,
 ) -> ToolSpec:
     descriptor = {
         "name": name,
@@ -68,6 +72,8 @@ def _tool(
         "supports_preview": preview,
         "supports_status_query": status,
         "supports_cancel": cancel,
+        # 入口归属随描述一起下发：前端据此不在聊天里提示这些动作
+        "audience": "agent" if agent_executable else "human_page",
     }
     return ToolSpec(
         descriptor=descriptor,
@@ -77,6 +83,7 @@ def _tool(
         resource_actions=resource_actions,
         requires=requires,
         deps=deps,
+        agent_executable=agent_executable,
     )
 
 
@@ -278,9 +285,8 @@ _SPECS: list[ToolSpec] = [
         },
         kind="model",
         id_field="model_id",
-        global_actions=("model:publish-global",),
+        # 普通用户发布自己项目里的模型，不再要求全局发布权；范围由 owner/project 决定
         resource_actions=("model:publish",),
-        requires=("model:publish-global",),
         deps=(("storage_exists", "requires a storage existence check"),),
     ),
     _tool(
@@ -295,9 +301,8 @@ _SPECS: list[ToolSpec] = [
         },
         kind="model",
         id_field="model_id",
-        global_actions=("model:publish-global",),
+        # 普通用户发布自己项目里的模型，不再要求全局发布权；范围由 owner/project 决定
         resource_actions=("model:publish",),
-        requires=("model:publish-global",),
     ),
     _tool(
         "model.compare",
@@ -325,15 +330,18 @@ _SPECS: list[ToolSpec] = [
     # ------------------------------------------------------------ detection
     _tool(
         "detection.run",
-        "Run one image through a published model that belongs to the same "
-        "project and store a real detection record. A multimodal model without "
-        "its X-modality image stops here instead of inventing a pair.",
+        "Run one image through a readable published model and store a real "
+        "detection record in the chosen output project. The model's own "
+        "project/owner is never changed. A multimodal model without its "
+        "X-modality image stops here instead of inventing a pair.",
         _object(
             {
                 "asset_id": _ASSET,
                 "model_id": {"type": "string", "minLength": 1},
                 "confidence": {"type": "number", "minimum": 0.01, "maximum": 1},
                 "secondary_asset_id": _ASSET,
+                # 输出归属：默认取原图所在项目，可显式指定（必须可写）
+                "output_project_id": {"type": "string", "minLength": 1},
                 "title": {"type": "string", "maxLength": 200},
             },
             ["asset_id", "model_id"],
@@ -348,6 +356,7 @@ _SPECS: list[ToolSpec] = [
             "result_image_url": {"type": "string"},
             "secondary_image_url": {"type": ["string", "null"]},
             "secondary_image_origin": {"type": ["string", "null"]},
+            "output_project_id": {"type": "string"},
         },
         kind="project",
         id_field="asset_id",
@@ -447,6 +456,8 @@ _SPECS: list[ToolSpec] = [
         kind="record",
         id_field="record_id",
         resource_actions=("detection:review",),
+        # 最终人工标签只能由受保护的人工复核页面提交：模型看得到就会替人做决定
+        agent_executable=False,
     ),
     _tool(
         "feedback.add_confirmed",
@@ -509,6 +520,8 @@ _SPECS: list[ToolSpec] = [
         kind="draft",
         id_field="draft_id",
         resource_actions=("draft:update",),
+        # 样本划分是人的决定，首版不交给 Agent 代为完成
+        agent_executable=False,
     ),
     _tool(
         "draft.finalize",
@@ -751,6 +764,8 @@ _SPECS: list[ToolSpec] = [
         id_field="connection_id",
         resource_actions=("mcp:manage",),
         deps=(("mcp_store", "requires the MCP connection store"),),
+        # 连接配置（含启动命令与凭据引用）只能由用户在设置界面修改
+        agent_executable=False,
     ),
     _tool(
         "mcp.test_connection",

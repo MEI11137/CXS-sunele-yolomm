@@ -324,17 +324,21 @@ def test_human_review_then_feedback_only_accepts_confirmed_samples(fixture):
     with pytest.raises(ToolRefused):
         adapter.execute_tool(7, feedback["operation_id"], "feedback-early")
 
+    # 最终人工标签只能走人工页面入口；Agent 入口必须拒绝（见 INT-05 用例）
+    from services.business_tools import ENTRY_HUMAN_PAGE
+
     review = adapter.prepare_tool(7, "review.submit_human", {
         "record_id": record_id, "expected_version": 0, "decision": "no_defect",
         "annotations": [],
-    })
-    result = adapter.execute_tool(7, review["operation_id"], "review-submit")
+    }, entry=ENTRY_HUMAN_PAGE)
+    result = adapter.execute_tool(7, review["operation_id"], "review-submit",
+                                  entry=ENTRY_HUMAN_PAGE)
     assert result["outputs"]["human_review_status"] == "confirmed"
     assert result["outputs"]["review_version"] == 1
 
     stale = adapter.prepare_tool(7, "review.submit_human", {
         "record_id": record_id, "expected_version": 0, "decision": "rejected",
-    })
+    }, entry=ENTRY_HUMAN_PAGE)
     assert stale["preview"]["blocked"] is True
 
     accepted = adapter.prepare_tool(7, "feedback.add_confirmed", {

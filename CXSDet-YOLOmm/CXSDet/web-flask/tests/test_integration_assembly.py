@@ -27,7 +27,7 @@ if str(BACKEND_ROOT) not in sys.path:
 from flask import Flask
 
 from agent import bootstrap, permissions
-from agent.identity import load_actor
+from agent.identity import ActorContext, load_actor
 from agent.registry import register_agent, reset_registration_cache
 from agent.tools import business as business_tools
 from agent.tools import registry as tool_registry
@@ -178,9 +178,32 @@ class IntegrationAssemblyTest(unittest.TestCase):
         self.assertTrue(names, "C 适配器应能返回自己的工具描述符")
         self.assertFalse({n for n in names if n.startswith("mcp.")})
 
-    def test_plain_user_does_not_see_publish_tools(self) -> None:
+    def test_plain_user_sees_publish_tools_for_own_project(self) -> None:
+        """INT-05：发布不再依赖全局发布权，普通用户能发布自己项目里的模型。"""
         names = {tool["name"] for tool in self.adapter.list_tools(2)}
-        self.assertFalse({n for n in names if "publish" in n})
+        self.assertIn("model.publish", names)
+        self.assertIn("model.unpublish", names)
+
+    def test_human_only_tools_are_not_offered_to_the_agent(self) -> None:
+        """人工复核、样本划分、连接配置不进 LLM 工具清单。"""
+        names = {tool["name"] for tool in self.adapter.list_tools(1)}
+        for blocked in ("review.submit_human", "draft.assign_splits",
+                        "mcp.save_connection"):
+            self.assertNotIn(blocked, names)
+
+    def test_publish_scope_is_owner_and_project(self) -> None:
+        """归档范围解析走真实归属，而不是整表同模态。"""
+        from agent import resources
+
+        project = permissions.ensure_default_project(load_actor(1))
+        actor = ActorContext(user_id=1, roles=("user", "admin"), source="system")
+        for model_id in ("model-a", "model-b"):
+            permissions.register_resource(
+                actor, project_id=project["id"], kind="model",
+                display_name=model_id, source_table="models", source_id=model_id,
+            )
+        self.assertEqual(sorted(resources.model_scope_ids("model-a")),
+                         ["model-a", "model-b"])
 
 
 if __name__ == "__main__":

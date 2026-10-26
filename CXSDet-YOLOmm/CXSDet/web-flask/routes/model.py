@@ -43,6 +43,16 @@ from services.yolo_runtime import load_detector
 
 model_bp = Blueprint('model', __name__, url_prefix='/api/model')
 
+
+def _bump_agent_revision(model_id):
+    """发布/撤销发布后递增 Agent 索引版本，使旧预览与旧确认失效。"""
+    try:
+        from agent import resources
+
+        resources.bump('models', model_id)
+    except Exception:
+        pass
+
 # 全局训练进程字典，用于管理训练进程
 training_processes = {}
 
@@ -374,9 +384,14 @@ def delete_model(model_id):
 @model_bp.route('/<model_id>/publish', methods=['POST'])
 @resource_required('model', 'model_id', 'publish')
 def publish_model(model_id):
-    """原子发布模型并归档同一模态业务域中的旧版本。"""
+    """原子发布模型，只归档本人同一项目内的同模态旧版本。"""
     try:
-        result = publish_registered_model(model_id, g.user_id, db)
+        from agent.resources import model_scope_ids
+
+        result = publish_registered_model(
+            model_id, g.user_id, db, scope_model_ids=model_scope_ids(model_id),
+        )
+        _bump_agent_revision(model_id)
         return success(result.to_dict(), "模型发布成功")
     except ModelRegistryError as exc:
         return error(str(exc), 400), 400
@@ -469,6 +484,7 @@ def unpublish_model(model_id):
         ''', (MODEL_STATUS['COMPLETED'], model_id))
         
         if affected_rows > 0:
+            _bump_agent_revision(model_id)
             return success(None, "取消发布成功")
         else:
             return error("取消发布失败")

@@ -573,6 +573,92 @@ def register_refs(
     return stats
 
 
+def scope_ids(
+    source_table: str,
+    source_id: str,
+    *,
+    project_scoped: bool = True,
+) -> List[str]:
+    """同一真实归属下的业务 ID 列表（发布归档等"批量影响"动作的唯一合法范围）。
+
+    只返回 ``agent_resource`` 里已登记、且 owner（以及项目，若有）与目标一致的
+    业务 ID；目标本体始终包含在内。查不到归属就只返回自己——即"谁也不能动别人
+    的东西"，而不是退化成"整表同模态"。
+    """
+    owner_id: Optional[int] = None
+    project_id: Optional[str] = None
+    conn = connect()
+    try:
+        row = query_one(
+            conn,
+            "SELECT owner_id, project_id FROM agent_resource "
+            "WHERE source_table = ? AND source_id = ?",
+            (source_table, source_id),
+        )
+        if row:
+            owner_id = int(row["owner_id"])
+            project_id = row.get("project_id")
+    finally:
+        conn.close()
+
+    if owner_id is None:
+        # 未登记：先按真实归属补登记（幂等），登记不出来就只认自己
+        view = ensure(source_table, source_id)
+        if not view:
+            return [str(source_id)]
+        owner_id = int(view["owner_id"])
+        project_id = view.get("project_id")
+
+    conn = connect()
+    try:
+        if project_scoped and project_id:
+            rows = query_all(
+                conn,
+                "SELECT source_id FROM agent_resource WHERE source_table = ? "
+                "AND owner_id = ? AND project_id = ? AND source_id IS NOT NULL",
+                (source_table, owner_id, project_id),
+            )
+        else:
+            rows = query_all(
+                conn,
+                "SELECT source_id FROM agent_resource WHERE source_table = ? "
+                "AND owner_id = ? AND source_id IS NOT NULL",
+                (source_table, owner_id),
+            )
+    finally:
+        conn.close()
+    ids = {str(item["source_id"]) for item in rows if item.get("source_id")}
+    ids.add(str(source_id))
+    return sorted(ids)
+
+
+def model_scope_ids(model_id: str) -> List[str]:
+    """发布/归档的合法范围：本人同一项目下的模型。"""
+    return scope_ids("models", model_id, project_scoped=True)
+
+
+def current_state(kind_or_table: str, business_id: str) -> Optional[Dict[str, Any]]:
+    """索引里该业务对象当前的真实版本；未登记返回 ``None``（＝无法核实）。"""
+    table = SOURCE_TABLE_BY_KIND.get(kind_or_table, kind_or_table)
+    conn = connect()
+    try:
+        row = query_one(
+            conn,
+            "SELECT revision, owner_id, project_id, metadata_json FROM agent_resource "
+            "WHERE source_table = ? AND source_id = ?",
+            (table, business_id),
+        )
+    finally:
+        conn.close()
+    if not row:
+        return None
+    return {
+        "revision": int(row.get("revision") or 1),
+        "owner_id": row.get("owner_id"),
+        "project_id": row.get("project_id"),
+    }
+
+
 def access_check(
     kind: str,
     business_id: str,

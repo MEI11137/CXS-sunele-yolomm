@@ -13,7 +13,7 @@ import yaml
 
 from clients.file_client import FileClient
 from services.authorized_directories import DirectoryStore
-from services.business_tools import BusinessToolAdapter, ResourceSnapshot
+from services.business_tools import ENTRY_HUMAN_PAGE, BusinessToolAdapter, ResourceSnapshot
 from services.dataset_transform_service import get_candidate
 from services.file_access import FileAccess, LocalFileAssetGateway
 from services.mcp_registry import McpStore
@@ -364,11 +364,13 @@ class FakeTransport:
 
 def test_mcp_connection_is_configured_then_discovered_then_executed(fixture):
     adapter = fixture.adapter()
+    # 连接配置属于扩权设置，只能从人工设置页面入口提交（INT-05）
     saved = adapter.prepare_tool(7, "mcp.save_connection", {
         "name": "本机检索服务", "transport": "http", "endpoint": "http://127.0.0.1:9000",
         "credential_ref": "secret/mcp/local",
-    })
-    result = adapter.execute_tool(7, saved["operation_id"], "mcp-save")
+    }, entry=ENTRY_HUMAN_PAGE)
+    result = adapter.execute_tool(7, saved["operation_id"], "mcp-save",
+                                 entry=ENTRY_HUMAN_PAGE)
     connection_id = result["outputs"]["connection_id"]
     assert result["outputs"]["status"] == "configured"
 
@@ -412,9 +414,9 @@ def test_mcp_write_tool_failure_is_reported_as_unknown(fixture):
     adapter = fixture.adapter()
     saved = adapter.prepare_tool(7, "mcp.save_connection", {
         "name": "工单服务", "transport": "http", "endpoint": "http://127.0.0.1:9000",
-    })
+    }, entry=ENTRY_HUMAN_PAGE)
     connection_id = adapter.execute_tool(
-        7, saved["operation_id"], "mcp-save-2",
+        7, saved["operation_id"], "mcp-save-2", entry=ENTRY_HUMAN_PAGE,
     )["outputs"]["connection_id"]
     fixture.transport = FakeTransport(fail_write=True)
     adapter.execute_tool(

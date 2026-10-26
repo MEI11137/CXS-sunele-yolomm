@@ -77,6 +77,13 @@ class _PendingPersonalReviewClient:
         return _not_ready
 
 
+def _model_scope_resolver(model_id: str) -> list:
+    """发布/归档的合法范围：同一真实 owner + project 下的模型 ID。"""
+    from agent import resources
+
+    return resources.model_scope_ids(model_id)
+
+
 def _personal_model_client_factory(principal_getter=None):
     """零参数工厂：每次调用都按当前用户构造客户端，不持有共享 Key。"""
 
@@ -178,6 +185,9 @@ def configure_business_backend(app, *, overrides: Optional[Dict[str, Any]] = Non
             mcp_store=mcp_store,
             candidate_root=candidate_root,
             training_launcher=overrides.get("training_launcher"),
+            # 发布/归档范围按真实 owner + project 计算，不按整表同模态
+            model_scope_resolver=overrides.get("model_scope_resolver")
+            or _model_scope_resolver,
         )
         deps["model_client_factory"] = (
             "ready: per-user personal connection (structured vision review pending INT-06)"
