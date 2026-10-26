@@ -23,7 +23,8 @@ from agent.tools.contract import (
 
 PROPOSE_PLAN = "propose_plan"
 ASK_USER = "ask_user"
-CONTROL_TOOL_NAMES = {PROPOSE_PLAN, ASK_USER}
+WAIT_HUMAN = "wait_for_human"
+CONTROL_TOOL_NAMES = {PROPOSE_PLAN, ASK_USER, WAIT_HUMAN}
 
 _PLAN_STEP_SCHEMA = {
     "type": "object",
@@ -31,6 +32,8 @@ _PLAN_STEP_SCHEMA = {
         "title": {"type": "string"},
         "needs_confirmation": {"type": "boolean"},
         "needs_human": {"type": "boolean"},
+        "tool": {"type": "string", "description": "完成该步骤的实际工具名称；必须来自可用工具清单"},
+        "business_ref": {"type": "object", "properties": {"kind": {"type": "string"}, "id": {"type": "string"}}, "required": ["kind", "id"], "additionalProperties": False},
         "note": {"type": "string"},
     },
     "required": ["title"],
@@ -82,6 +85,17 @@ CONTROL_ASK_USER = ToolSpec(
 )
 
 
+CONTROL_WAIT_HUMAN = ToolSpec(
+    name=WAIT_HUMAN, title='等待人工处理',
+    description='引导用户在原页面复核标注或划分并定稿草稿。只建立等待关系，不修改人工状态；提交后查询真实结果再接力。',
+    parameters={'type': 'object', 'properties': {
+        'kind': {'type': 'string', 'enum': ['detection_record', 'draft']},
+        'id': {'type': 'string'}, 'reason': {'type': 'string'}, 'step_id': {'type': 'string'},
+    }, 'required': ['kind', 'id', 'reason'], 'additionalProperties': False},
+    risk=RISK_READ, source=SOURCE_CONTROL, supports_status=False,
+)
+
+
 class ToolRegistry:
     def __init__(self) -> None:
         self._entries: List[Dict[str, Any]] = [
@@ -122,6 +136,7 @@ class ToolRegistry:
         # 控制工具始终可用
         seen[PROPOSE_PLAN] = CONTROL_PROPOSE_PLAN
         seen[ASK_USER] = CONTROL_ASK_USER
+        seen[WAIT_HUMAN] = CONTROL_WAIT_HUMAN
         return list(seen.values())
 
     def openai_tools(self, actor, project_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -135,6 +150,8 @@ class ToolRegistry:
             return CONTROL_PROPOSE_PLAN, None, SOURCE_CONTROL
         if name == ASK_USER:
             return CONTROL_ASK_USER, None, SOURCE_CONTROL
+        if name == WAIT_HUMAN:
+            return CONTROL_WAIT_HUMAN, None, SOURCE_CONTROL
 
         stub_match: Optional[Tuple[ToolSpec, ToolProvider]] = None
         broken_sources: List[str] = []
@@ -181,7 +198,7 @@ class _ControlOnlyProvider:
     """仅提供控制工具的占位 provider。"""
 
     def list_tools(self, actor) -> List[ToolSpec]:
-        return [CONTROL_PROPOSE_PLAN, CONTROL_ASK_USER]
+        return [CONTROL_PROPOSE_PLAN, CONTROL_ASK_USER, CONTROL_WAIT_HUMAN]
 
     def execute(self, *args, **kwargs):  # pragma: no cover - 控制工具不执行
         raise AgentError(Code.VALIDATION, "控制工具不通过执行接口调用")
@@ -212,6 +229,9 @@ def get_registry() -> ToolRegistry:
     if backend is not None:
         # 本仓库业务适配层走桥接（INT-02），旧式适配层保持原样
         registry.add_provider(business.build_provider(backend), SOURCE_BUSINESS)
+        if getattr(backend, "mcp_store", None) is not None:
+            from agent.tools.mcp import McpProvider
+            registry.add_provider(McpProvider(backend), SOURCE_MCP)
     if allow_stub:
         registry.add_provider(stub.StubToolProvider(), SOURCE_STUB)
     _registry = registry

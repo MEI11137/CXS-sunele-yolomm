@@ -29,10 +29,13 @@ def register_agent(app) -> Dict[str, Any]:
         first_time = key not in _REGISTERED
 
         report = {"database": str(db_path), "first_registration": first_time}
+        needs_recovery = False
         if first_time:
-            _REGISTERED.add(key)
             conn = store.connect(str(db_path))
             conn.close()
+            from agent.process_lease import claim
+            needs_recovery = claim(db_path)
+            _REGISTERED.add(key)
             try:
                 report["builtin_manuals_added"] = manuals.ensure_builtin_manuals()
             except Exception as exc:  # noqa: BLE001 - 初始化失败不应阻断整个站点
@@ -42,13 +45,19 @@ def register_agent(app) -> Dict[str, Any]:
             except Exception as exc:  # noqa: BLE001
                 report["legacy_resources_error"] = str(exc)[:200]
             try:
-                report["startup_reconcile"] = reconcile_startup()
+                report["startup_reconcile"] = reconcile_startup() if needs_recovery else {'skipped': 'same live process'}
+                if needs_recovery:
+                    from services.training_runner import reconcile_training_jobs
+                    report['interrupted_training_jobs'] = reconcile_training_jobs(db_path)
             except Exception as exc:  # noqa: BLE001
                 report["startup_reconcile_error"] = str(exc)[:200]
 
         # 真实业务装配：失败要如实上报，不能静默降级成"看起来已接通"。
         try:
             report["business"] = configure_business_backend(app)
+            if needs_recovery:
+                backend = app.extensions['haixun_agent']['business_backend']
+                report['unknown_business_operations'] = backend.reconcile_unfinished()
         except Exception as exc:  # noqa: BLE001
             report["business_error"] = f"{type(exc).__name__}: {exc}"[:400]
 

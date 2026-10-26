@@ -196,7 +196,7 @@ class AgentPolicyBridge:
             # 账号级虚拟工作区：解析成默认项目，归属本人。
             project = permissions.ensure_default_project(actor)
             return ResourceSnapshot(
-                id=project["id"],
+                id=resource_id,
                 project_id=project["id"],
                 owner_id=int(project["owner_id"]),
                 version=str(project.get("updated_at") or project.get("created_at") or "v1"),
@@ -319,6 +319,15 @@ class BusinessNotifier:
         except Exception as exc:  # noqa: BLE001 - 通知失败不能影响业务写入
             self.errors.append(f"{type(exc).__name__}: {exc}"[:200])
 
+    def _reconcile(self, principal: int, task_id: str) -> None:
+        from agent import identity, recovery
+
+        try:
+            actor = identity.load_actor(int(principal), source="notify")
+            recovery.reconcile_task(actor, task_id, auto_continue=False, check_only=True)
+        except Exception as exc:  # noqa: BLE001 - 核实失败不能影响业务写入
+            self.errors.append(f"reconcile {task_id}: {type(exc).__name__}: {exc}"[:200])
+
     @staticmethod
     def _verified_version(ref: Dict[str, Any]) -> Optional[int]:
         """核实该业务对象的真实版本；索引里没有就不算核实成功。"""
@@ -389,3 +398,7 @@ class BusinessNotifier:
                 },
             )
             self.matched_tasks += 1
+            # 通知只负责"唤起核实"：是否真的推进由 recovery 按业务真实状态判断。
+            # 这里只做核实（不续跑模型），避免把业务写入请求拖成一次 LLM 调用；
+            # 续跑由前端/用户的显式 reconcile 触发，仍在真实状态之上。
+            self._reconcile(principal, task["id"])

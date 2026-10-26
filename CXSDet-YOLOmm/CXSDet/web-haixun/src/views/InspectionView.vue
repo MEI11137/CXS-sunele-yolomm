@@ -263,7 +263,8 @@ async function confirmRun() {
   notice.value = ''
   try {
     const taskId = task.value.id
-    const snapshot = await getAdapter().confirmPlan(taskId)
+    // 带上计划版本：期间若目标变更换了计划，后端会拒绝而不是确认新计划
+    const snapshot = await getAdapter().confirmPlan(taskId, task.value.planVersion)
     task.value = snapshot.task
     const pendingAction = snapshot.actions.find((a) => a.status === 'pending')
     if (pendingAction) {

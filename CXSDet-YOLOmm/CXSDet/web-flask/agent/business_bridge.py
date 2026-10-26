@@ -74,6 +74,23 @@ KIND_TO_RESOURCE_TYPE = {
     "draft": "draft",
 }
 
+# 业务侧数字状态编码 → B 可判断的语义状态。
+# 来源：web-flask/utils/models.py 的 MODEL_STATUS 与 DATASET_STATUS，不改业务语义，只做翻译。
+_STATUS_CODES: Dict[str, Dict[str, str]] = {
+    "model": {
+        "0": "training",   # 训练中：请求已受理，不代表训练完成
+        "1": "completed",  # 训练完成
+        "2": "failed",
+        "3": "published",  # 已发布：既是完成，也是更强状态
+        "4": "cancelled",  # 训练终止
+    },
+    "dataset": {
+        "0": "pending",    # 待验证
+        "1": "completed",  # 校验通过
+        "2": "failed",     # 校验失败
+    },
+}
+
 # 显式标题表：C 的 descriptor 没有 title 字段，不假定它存在
 TOOL_TITLES = {
     "dataset.get_state": "数据集状态",
@@ -210,12 +227,39 @@ def _to_business_ref(raw: Any) -> Optional[Dict[str, Any]]:
     ref: Dict[str, Any] = {"kind": kind, "id": str(ref_id)}
     if raw.get("version") is not None:
         ref["version"] = raw.get("version")
+    for key in ('project_id', 'display_name', 'source_file_id', 'source_dataset_id', 'parent_model_id'):
+        if raw.get(key) is not None:
+            ref[key] = raw[key]
     return ref
+
+
+# 严重度：数字越大越"不成功"。用于外层 succeeded 与逐项 partial_failed 的取舍。
+_STATUS_SEVERITY = {
+    "succeeded": 0,
+    "completed": 0,
+    "completed_with_warnings": 1,
+    "partial": 2,
+    "partial_failed": 3,
+    "failed": 4,
+}
+
+
+def _effective_status(outer: str, outputs: Dict[str, Any]) -> str:
+    """外层 operation 可能整体 succeeded，但逐项结果里已经失败。
+
+    批量核查的逐项结果在 ``outputs.items``，聚合结论在 ``outputs.status``。
+    这里取"更差"的那个：一条部分失败的批量操作不能显示为全部成功。
+    """
+    inner = str(outputs.get("status") or "").strip().lower()
+    outer_key = str(outer or "").strip().lower()
+    if not inner or inner not in _STATUS_SEVERITY or outer_key not in _STATUS_SEVERITY:
+        return outer
+    return inner if _STATUS_SEVERITY[inner] > _STATUS_SEVERITY[outer_key] else outer
 
 
 def _execution_state(status: str) -> str:
     value = str(status or "").lower()
-    if value in ("succeeded", "completed"):
+    if value in ("succeeded", "completed", "running"):
         return ExecutionState.EXECUTED
     if value in ("unknown",):
         return ExecutionState.UNKNOWN
@@ -277,6 +321,10 @@ class BusinessBackendBridge:
             return []
         specs: List[ToolSpec] = []
         for descriptor in descriptors:
+            # Connections/credentials belong to fixed settings APIs. External
+            # calls are registered individually with SOURCE_MCP and version grants.
+            if str((descriptor or {}).get("name", "")).startswith("mcp."):
+                continue
             spec = descriptor_to_spec(descriptor)
             if spec is None:
                 LOGGER.warning(
@@ -413,7 +461,7 @@ class BusinessBackendBridge:
 
         result = self._to_result(raw, spec)
         # 业务成功后再登记真实归属：失败只留痕，绝不重跑或重造业务对象。
-        if result.status in ("succeeded", "completed", "partial"):
+        if result.status in ("succeeded", "completed", "partial", "running"):
             from agent import resources
 
             project_hint = getattr(context, "project_id", None)
@@ -454,15 +502,26 @@ class BusinessBackendBridge:
         error = raw.get("error")
         if isinstance(error, str):
             error = {"message": error}
+        outputs = raw.get("outputs") or {}
+        # 逐项失败要能穿透外层的 succeeded
+        effective = _effective_status(status, outputs)
+        if (business_tool_name(spec.name) == 'training.start' or raw.get('tool_name') == 'training.start') and status in ('succeeded', 'completed') and outputs.get('state') == 'training':
+            effective = 'running'
+        if effective in ('failed', 'partial_failed') and effective != status and error is None:
+            failed = outputs.get("failed")
+            error = {
+                "code": "PARTIAL_ITEM_FAILURE",
+                "message": f"逐项结果里有 {failed} 项未成功" if failed else "逐项结果里有未成功项",
+            }
         return OperationResult(
-            status=status,
+            status=effective,
             operation_id=raw.get("operation_id"),
             business_refs=refs,
-            outputs=raw.get("outputs") or {},
+            outputs=outputs,
             item_results=raw.get("item_results") or [],
             error=error,
             is_stub=False,
-            execution_state=_execution_state(status),
+            execution_state=_execution_state(effective),
         )
 
     # ------------------------------------------------------------ 查询/取消
@@ -535,7 +594,7 @@ class BusinessBackendBridge:
             raise AgentError(Code.RESOURCE_NOT_FOUND, f"资源不存在：{exc}") from exc
         except ValueError as exc:
             raise AgentError(Code.VALIDATION, str(exc)) from exc
-        return _flatten_state(raw, str(ref_id))
+        return _flatten_state(raw, str(ref_id), kind=str(kind))
 
     def cancel_operation(self, actor: ActorContext, operation_id: str) -> OperationResult:
         """只有"预备了还没执行"的业务操作能撤销；在途训练不能这样取消。"""
@@ -625,8 +684,17 @@ def _translate_conflict(exc: Exception, title: str) -> Optional[AgentError]:
     return None
 
 
-def _flatten_state(raw: Any, ref_id: str) -> Dict[str, Any]:
-    """把业务返回的 ``{resource: {...}, state: {...}}`` 展开成 B 能判断的平铺结构。"""
+def _flatten_state(raw: Any, ref_id: str, kind: Optional[str] = None) -> Dict[str, Any]:
+    """把业务返回的 ``{resource: {...}, state: {...}}`` 展开成 B 能判断的平铺结构。
+
+    业务侧的 ``status`` 有两种形态：
+
+    * 字符串（``succeeded`` / ``failed`` …），可以直接比较；
+    * 数字编码（模型 ``0-4``、数据集 ``0-2``），必须先按资源类型映射成语义状态，
+      否则 ``3``（已发布）永远不等于 ``succeeded``，任务会一直卡在等待业务。
+
+    原始编码保留在 ``business_status`` 里，排查时仍能看到业务真实值。
+    """
     if not isinstance(raw, dict):
         return {"status": "unknown", "reason": "业务未返回状态", "resource_id": ref_id}
     resource = raw.get("resource") if isinstance(raw.get("resource"), dict) else {}
@@ -636,11 +704,19 @@ def _flatten_state(raw: Any, ref_id: str) -> Dict[str, Any]:
     flat.update(state)
     status = (
         state.get("status")
-        or state.get("workflow_status")
+        if state.get("status") is not None
+        else state.get("workflow_status")
         or state.get("publish_status")
         or resource.get("status")
     )
-    flat["status"] = str(status or "unknown")
+    code_map = _STATUS_CODES.get(str(kind or "").lower())
+    normalized = "unknown" if status is None else str(status).strip().lower()
+    if code_map is not None and normalized in code_map:
+        # 数字编码：映射成 B 能判断的语义状态，同时保留原值
+        flat["business_status"] = status
+        flat["status"] = code_map[normalized]
+    else:
+        flat["status"] = normalized or "unknown"
     flat["resource_id"] = resource.get("id") or ref_id
     if resource.get("project_id"):
         flat["project_id"] = resource.get("project_id")

@@ -239,6 +239,8 @@ def upload_project_file(project_id):
         registered = True
         return success({
             "file_id": file_id,
+            "bucket": saved['bucket'],
+            "object_key": saved['objectKey'],
             "project_id": project_id,
             "version": 1,
             "status": "uploaded",
@@ -272,6 +274,8 @@ def get_file_metadata(file_id):
         return error("没有权限读取该文件", 403), 403
     return success({
         "file_id": asset["id"],
+        "bucket": asset["bucket"],
+        "object_key": asset["object_key"],
         "project_id": asset["project_id"],
         "version": asset["version"],
         "status": asset["status"],

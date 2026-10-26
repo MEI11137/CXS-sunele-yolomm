@@ -145,6 +145,71 @@ class BridgeConversionTest(unittest.TestCase):
         self.assertEqual(_flatten_state(None, "x")["status"], "unknown")
         self.assertEqual(_flatten_state({}, "x")["status"], "unknown")
 
+    def test_model_numeric_status_is_mapped_for_recovery(self) -> None:
+        """模型 status 是 0-4 的数字编码，必须翻译成 B 能判断的语义状态。
+
+        改成数字比较之前，训练完成后 status="3"，recovery 只认 "succeeded"，
+        任务会永远停在 awaiting_business。
+        """
+        from agent.business_bridge import _flatten_state
+
+        cases = {
+            0: "training",
+            1: "completed",
+            2: "failed",
+            3: "published",
+            4: "cancelled",
+        }
+        for code, expected in cases.items():
+            with self.subTest(code=code):
+                flat = _flatten_state(
+                    {
+                        "resource": {"id": "m1", "project_id": "p1"},
+                        "state": {"status": code},
+                    },
+                    "m1",
+                    kind="model",
+                )
+                self.assertEqual(flat["status"], expected)
+                # 原始编码必须保留，排查时能看到业务真实值
+                self.assertEqual(flat["business_status"], code)
+
+    def test_model_training_state_is_not_treated_as_ready(self) -> None:
+        """status=0 是 falsy，不能被 `or` 链吞掉。"""
+        from agent.business_bridge import _flatten_state
+
+        flat = _flatten_state(
+            {"resource": {"id": "m1"}, "state": {"status": 0, "publish_status": "draft"}},
+            "m1",
+            kind="model",
+        )
+        self.assertEqual(flat["status"], "training")
+
+    def test_dataset_numeric_status_is_mapped(self) -> None:
+        from agent.business_bridge import _flatten_state
+
+        self.assertEqual(
+            _flatten_state({"resource": {"id": "d1"}, "state": {"status": 1}}, "d1", kind="dataset")[
+                "status"
+            ],
+            "completed",
+        )
+        self.assertEqual(
+            _flatten_state({"resource": {"id": "d1"}, "state": {"status": 0}}, "d1", kind="dataset")[
+                "status"
+            ],
+            "pending",
+        )
+
+    def test_string_status_survives_numeric_mapping(self) -> None:
+        """业务已经给字符串时不能被数字表改写。"""
+        from agent.business_bridge import _flatten_state
+
+        flat = _flatten_state(
+            {"resource": {"id": "m1"}, "state": {"status": "succeeded"}}, "m1", kind="model"
+        )
+        self.assertEqual(flat["status"], "succeeded")
+
     def test_principal_only_accepts_server_identity(self) -> None:
         class Actor:
             def __init__(self, user_id):

@@ -393,6 +393,10 @@ def set_plan(
                 "needs_confirmation": bool(step.get("needs_confirmation")),
                 "needs_human": bool(step.get("needs_human")),
                 "business_ref": step.get("business_ref"),
+                # 步骤可绑定具体工具；有绑定时按工具真实执行结果推进，
+                # 没有绑定时只有写操作才按顺序推进（见 runtime._advance_plan_steps）
+                "tool": str(step.get("tool") or "").strip() or None,
+                "action_id": step.get("action_id"),
             }
         )
     fields = [
@@ -422,8 +426,23 @@ def set_plan(
     return set_status(task_id, STATUS_AWAITING_PLAN, summary="等待确认整体计划", emit=True)
 
 
-def confirm_plan(task_id: str, decided_by: int) -> Dict[str, Any]:
+def confirm_plan(
+    task_id: str,
+    decided_by: int,
+    expected_version: Optional[int] = None,
+) -> Dict[str, Any]:
     task = get_task_by_id(task_id)
+    if expected_version is not None and int(expected_version) != int(task["plan_version"]):
+        # 用户看到的是旧计划：期间目标变更替换了计划，不能把新计划当作已确认
+        raise AgentError(
+            Code.ACTION_STALE,
+            "计划在你确认前已更新，请查看最新计划后再确认",
+            http_status=409,
+            details={
+                "expected": int(expected_version),
+                "current": int(task["plan_version"]),
+            },
+        )
     if task["status"] not in (STATUS_AWAITING_PLAN, STATUS_PLANNING):
         raise AgentError(
             Code.TASK_STATE_CONFLICT,
@@ -435,10 +454,13 @@ def confirm_plan(task_id: str, decided_by: int) -> Dict[str, Any]:
         raise AgentError(Code.PLAN_NOT_CONFIRMED, "任务还没有可确认的计划")
     conn = connect()
     try:
-        conn.execute(
-            "UPDATE agent_task SET plan_confirmed_at = ?, updated_at = ? WHERE id = ?",
-            (now(), now(), task_id),
+        cursor = conn.execute(
+            "UPDATE agent_task SET plan_confirmed_at = ?, updated_at = ?, status = ?, summary = ? "
+            "WHERE id = ? AND plan_version = ? AND plan_confirmed_at IS NULL AND status IN (?, ?)",
+            (now(), now(), STATUS_RUNNING, '计划已确认，开始执行', task_id, task['plan_version'], STATUS_AWAITING_PLAN, STATUS_PLANNING),
         )
+        if cursor.rowcount != 1:
+            raise AgentError(Code.ACTION_STALE, '计划已变化或已被确认，请读取最新状态', http_status=409)
         conn.commit()
     finally:
         conn.close()
@@ -448,7 +470,8 @@ def confirm_plan(task_id: str, decided_by: int) -> Dict[str, Any]:
         EVENT_PLAN_CONFIRMED,
         {"plan_version": task["plan_version"], "decided_by": decided_by},
     )
-    return set_status(task_id, STATUS_RUNNING, summary="计划已确认，开始执行")
+    append_event(task['session_id'], task_id, EVENT_STATUS_CHANGED, {'from': task['status'], 'to': STATUS_RUNNING})
+    return get_task_by_id(task_id)
 
 
 def update_steps(task_id: str, steps: List[Dict[str, Any]]) -> None:
@@ -458,6 +481,15 @@ def update_steps(task_id: str, steps: List[Dict[str, Any]]) -> None:
             "UPDATE agent_task SET steps_json = ?, updated_at = ? WHERE id = ?",
             (dumps(steps), now(), task_id),
         )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def invalidate_plan(task_id: str) -> None:
+    conn = connect()
+    try:
+        conn.execute('UPDATE agent_task SET plan_version=plan_version+1, plan_json=NULL, plan_confirmed_at=NULL, updated_at=? WHERE id=?', (now(),task_id))
         conn.commit()
     finally:
         conn.close()

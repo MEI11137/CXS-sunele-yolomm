@@ -15,7 +15,7 @@ from clients.file_client import file_client
 from utils.response import success, error
 from utils.db import db
 from utils.jwt_util import token_required
-from utils.resource_guard import register_new, resource_required, visible_ids
+from utils.resource_guard import register_new, resource_required, visible_ids, project_target_required
 from utils.models import Dataset
 from config import TEMP_DIR
 from services.dataset_import_service import DatasetImportError, import_dataset_archive
@@ -41,6 +41,7 @@ dataset_bp = Blueprint('dataset', __name__, url_prefix='/api/dataset')
 
 @dataset_bp.route('/upload', methods=['POST'])
 @token_required
+@project_target_required
 def upload_dataset():
     """上传数据集"""
     try:

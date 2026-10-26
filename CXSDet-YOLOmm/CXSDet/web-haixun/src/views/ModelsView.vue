@@ -3,6 +3,8 @@ import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getAdapter } from '@/services'
 import type { DatasetSummary, ModelSummary } from '@/types'
+import { useWorkspaceStore } from '@/stores/workspace'
+const workspace = useWorkspaceStore()
 
 const route = useRoute()
 const router = useRouter()
@@ -13,6 +15,20 @@ const loading = ref(false)
 const loadError = ref('')
 const notice = ref('')
 const noticeType = ref<'success' | 'error' | ''>('')
+const training = ref(false)
+const trainForm = ref({ parentId: '', datasetId: String(route.query.dataset || ''), epochs: 10, batchSize: 4 })
+async function train() {
+  const f = trainForm.value
+  if (training.value || !f.parentId || !f.datasetId) return
+  if (!window.confirm(`确认从模型 ${f.parentId} 创建新子模型？数据集 ${f.datasetId}，${f.epochs} 轮，批量 ${f.batchSize}。将占用本机训练资源，原模型保留。`)) return
+  training.value = true
+  try {
+    const result = await getAdapter().startTraining(f.parentId, f.datasetId, f.epochs, f.batchSize)
+    noticeType.value = 'success'; notice.value = `训练已提交：${String(result.model_id || result.id || '')}。提交成功不等于训练完成，请刷新查询状态。`
+    await load()
+  } catch (e) { noticeType.value = 'error'; notice.value = (e as Error).message }
+  finally { training.value = false }
+}
 
 const published = computed(() => models.value.filter((m) => m.is_published))
 const unpublished = computed(() => models.value.filter((m) => !m.is_published))
@@ -99,6 +115,7 @@ const publishing = ref<string>('')
 
 async function publish(m: ModelSummary) {
   if (publishing.value) return
+  if (!window.confirm(`确认发布「${m.name}」？将归档本人同项目同模态的已发布模型；默认模型和其他项目不受影响。`)) return
   publishing.value = m.id
   notice.value = ''
   try {
@@ -188,6 +205,7 @@ async function doImport() {
   notice.value = ''
   try {
     await getAdapter().importModelWeight({
+      projectId: workspace.currentId,
       name: importForm.value.name.trim() || weightFile.value.name.replace(/\.pt$/i, ''),
       description: importForm.value.description,
       datasetId: importForm.value.datasetId,
@@ -212,6 +230,15 @@ function goInspect(modelId: string) {
 
 <template>
   <div class="page">
+    <section class="panel" style="padding:16px; margin-bottom:16px">
+      <h2>增量训练</h2>
+      <select v-model="trainForm.parentId" class="select" aria-label="父模型"><option value="">选择已有权重的父模型</option><option v-for="m in models.filter(x => x.status === 1 || x.status === 3)" :key="m.id" :value="m.id">{{ m.name }}</option></select>
+      <select v-model="trainForm.datasetId" class="select" aria-label="训练数据集"><option value="">选择已定稿数据集</option><option v-for="d in datasets.filter(x => x.status === 1 && (x.record_kind === 'formal' || x.workflow_status === 'finalized'))" :key="d.id" :value="d.id">{{ d.name }}</option></select>
+      <label>轮数 <input v-model.number="trainForm.epochs" type="number" min="1" max="10000" /></label>
+      <label>批量 <input v-model.number="trainForm.batchSize" type="number" min="1" max="1024" /></label>
+      <button class="btn btn-primary" :disabled="training || !trainForm.parentId || !trainForm.datasetId" @click="train">确认参数并启动训练</button>
+      <button class="btn" :disabled="loading" @click="load">刷新真实训练状态</button>
+    </section>
     <div class="page-header">
       <h1 class="page-title">模型管理</h1>
       <div class="header-actions">

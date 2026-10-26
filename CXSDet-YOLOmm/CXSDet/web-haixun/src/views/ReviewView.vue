@@ -140,17 +140,32 @@ function parseStoredAnnotations(raw: unknown): HumanReviewAnnotation[] {
 }
 
 /** 载入当前记录：优先用上次人工标注，否则用真实检测框（像素坐标需归一化） */
+const annotationLoading = ref(false)
+let annotationGeneration = 0
 async function loadAnnotation() {
+  const token = ++annotationGeneration
   const r = currentRecord.value
   if (!r) {
     boxes.value = []
+    categories.value = []
+    annotationLoading.value = false
     return
   }
+  categories.value = r.class_names.map((name, id) => ({ id, name, label: name }))
+  editCategory.value = ''
+  annotationLoading.value = true
   // 归一化依赖原图真实尺寸，先量一次
-  naturalSize.value = await measureImage(originalImage.value)
+  const size = await measureImage(originalImage.value)
+  if (token !== annotationGeneration) return
+  naturalSize.value = size
+  if (!size.w || !size.h) {
+    boxes.value = []; annotationLoading.value = false
+    loadError.value = '原图加载失败，无法可靠核对标注坐标，请检查文件访问后刷新。'
+    return
+  }
 
   const stored = parseStoredAnnotations(r.corrected_annotations)
-  const source: HumanReviewAnnotation[] = stored.length
+  const source: HumanReviewAnnotation[] = stored.length || r.human_review_status === 'confirmed'
     ? stored
     : r.detections.map((d, index) => ({
         class_name: d.class_name,
@@ -174,11 +189,12 @@ async function loadAnnotation() {
       severity: 'medium' as const,
     }
   })
-  noDefect.value = r.human_review_status === 'no_defect'
+  noDefect.value = r.human_review_status === 'no_defect' || (r.human_review_status === 'confirmed' && !stored.length)
   expectedVersion.value = r.review_version ?? 0
   selectedBoxId.value = null
   undoStack.value = []
   zoom.value = 1
+  annotationLoading.value = false
 }
 
 watch(currentRecord, loadAnnotation)
@@ -192,6 +208,11 @@ async function loadQueue() {
     records.value = page.items.filter(
       (r) => r.human_review_status !== 'confirmed' && r.human_review_status !== 'no_defect',
     )
+    const requestedId = route.params.defectId
+    if (typeof requestedId === 'string' && !records.value.some(r => r.id === requestedId)) {
+      const requested = await getAdapter().getRecord(requestedId)
+      if (requested) records.value.unshift(requested)
+    }
     if (currentIdx.value >= records.value.length) currentIdx.value = 0
     loadAnnotation()
   } catch (e) {
@@ -203,11 +224,6 @@ async function loadQueue() {
 }
 
 onMounted(async () => {
-  try {
-    categories.value = await getAdapter().listCategories()
-  } catch {
-    categories.value = []
-  }
   await loadQueue()
   const defectId = route.params.defectId as string | undefined
   if (defectId) {
@@ -221,6 +237,7 @@ function pushUndo() {
 }
 
 function onDraw(box: BoundingBox) {
+  noDefect.value = false
   pushUndo()
   boxes.value.push(box)
   selectedBoxId.value = box.id
@@ -244,6 +261,7 @@ function selectBox(id: string | null) {
 function undo() {
   if (!undoStack.value.length) return
   boxes.value = undoStack.value.pop()!
+  if (boxes.value.length) noDefect.value = false
 }
 
 function deleteSelected() {
@@ -261,8 +279,7 @@ function applyEdit() {
 }
 
 function toggleNoDefect() {
-  noDefect.value = !noDefect.value
-  if (noDefect.value) boxes.value = []
+  if (noDefect.value) { pushUndo(); boxes.value = [] }
 }
 
 function changeZoom(delta: number) {
@@ -292,11 +309,17 @@ async function submit(decisionOverride?: 'confirmed' | 'no_defect' | 'rejected')
   }
 
   // 类别 id 必须与类别名对应，不能拿上一套数据的 id 硬凑
+  if (annotationLoading.value || !naturalSize.value.w || !naturalSize.value.h) {
+    notice.value = '请等待原图正确加载后再提交。'; noticeType.value = 'error'; return
+  }
+  if (decision === 'confirmed' && boxes.value.some(b => !categories.value.some(c => c.name === b.category))) {
+    notice.value = '类别不在本记录所属数据集的类别表中，请先核对数据集和类别。'; noticeType.value = 'error'; return
+  }
   const annotations: HumanReviewAnnotation[] = boxes.value.map((b) => {
     const cat = categories.value.find((c) => c.name === b.category)
     return {
       class_name: b.category,
-      class_id: cat ? cat.id : 0,
+      class_id: cat?.id ?? -1,
       bbox: localToRemote(b),
     }
   })
@@ -306,7 +329,7 @@ async function submit(decisionOverride?: 'confirmed' | 'no_defect' | 'rejected')
   try {
     const result = await getAdapter().submitHumanReview(r.id, {
       decision,
-      annotations: decision === 'rejected' ? [] : annotations,
+      annotations: decision === 'confirmed' ? annotations : [],
       expectedVersion: expectedVersion.value,
     })
     noticeType.value = 'success'

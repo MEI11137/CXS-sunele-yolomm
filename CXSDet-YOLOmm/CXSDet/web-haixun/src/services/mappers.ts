@@ -152,6 +152,7 @@ export function mapWaitingFor(value: unknown): WaitingFor | null {
     kind,
     refs,
     conditions: raw(obj.conditions),
+    pageHint: str(obj.page_hint) || undefined,
   }
 }
 

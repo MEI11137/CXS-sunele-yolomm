@@ -333,8 +333,29 @@ export class RealAdapter extends BaseAdapter {
     return this.snapshot(taskId)
   }
 
-  async confirmPlan(taskId: string): Promise<TaskSnapshot> {
-    await http.post<unknown>(`/api/agent/tasks/${taskId}/plan/confirm`)
+  async listTasks(projectId: string): Promise<AgentTask[]> {
+    return asArray(await http.get('/api/agent/tasks', { query: { project_id: projectId, limit: 200 } }))
+      .map(mapTask).filter((t): t is AgentTask => !!t)
+  }
+  async createFeedbackDraft(datasetId: string): Promise<Raw> {
+    return raw(await http.post(`/api/dataset/${datasetId}/feedback-version`))
+  }
+  async listDraftSamples(draftId: string, page: number): Promise<Raw> {
+    return raw(await http.get(`/api/dataset/drafts/${draftId}/samples`, { query: { page, page_size: 50 } }))
+  }
+  async assignDraftSamples(draftId: string, sampleIds: string[], split: string): Promise<Raw> {
+    return raw(await http.post(`/api/dataset/drafts/${draftId}/assign`, { sample_ids: sampleIds, split }))
+  }
+  async finalizeDraft(draftId: string): Promise<Raw> {
+    return raw(await http.post(`/api/dataset/drafts/${draftId}/finalize`))
+  }
+  async startTraining(parentId: string, datasetId: string, epochs: number, batchSize: number): Promise<Raw> {
+    return raw(await http.post(`/api/model/${parentId}/incremental`, { feedback_dataset_id: datasetId, epochs, batch_size: batchSize }))
+  }
+
+  async confirmPlan(taskId: string, planVersion?: number): Promise<TaskSnapshot> {
+    const body = planVersion === undefined ? {} : { plan_version: planVersion }
+    await http.post<unknown>(`/api/agent/tasks/${taskId}/plan/confirm`, body)
     return this.snapshot(taskId)
   }
 
@@ -384,6 +405,7 @@ export class RealAdapter extends BaseAdapter {
       return {
         name: toString(obj.name),
         title: toString(obj.title) || toString(obj.name),
+        serverId: toString(obj.server_id), version: toString(obj.version), source: toString(obj.source), billable: obj.billable === true,
         description: toString(obj.description),
         risk: toString(obj.risk),
         kind: toString(obj.kind),
@@ -412,6 +434,18 @@ export class RealAdapter extends BaseAdapter {
     const data = await http.get<unknown>('/api/agent/grants')
     return asArray(data).map(raw)
   }
+
+  async listMcpConnections(): Promise<Raw[]> { return asArray(await http.get('/api/agent/mcp/connections')).map(raw) }
+  async listDirectories(projectId: string): Promise<Raw[]> { return asArray(await http.get('/api/agent/directories', { query: { project_id: projectId } })).map(raw) }
+  async authorizeDirectory(projectId: string, root: string, label: string): Promise<Raw> { return raw(await http.post('/api/agent/directories', { project_id: projectId, root, label })) }
+  async disableDirectory(id: string): Promise<void> { await http.del(`/api/agent/directories/${id}`) }
+  async saveMcpConnection(input: Raw): Promise<Raw> { return raw(await http.post('/api/agent/mcp/connections', input)) }
+  async discoverMcp(id: string): Promise<Raw> { return raw(await http.post(`/api/agent/mcp/connections/${id}/discover`)) }
+  async grantTool(input: Raw): Promise<Raw> { return raw(await http.post('/api/agent/grants', input)) }
+  async revokeGrant(id: string): Promise<void> { await http.del(`/api/agent/grants/${id}`) }
+  async listDocuments(projectId: string): Promise<Raw[]> { return asArray(await http.get('/api/agent/documents', { query: { project_id: projectId } })).map(raw) }
+  async parseDocument(assetId: string, title: string): Promise<Raw> { return raw(await http.post('/api/agent/documents/parse', { asset_id: assetId, title })) }
+  async searchDocument(id: string, query: string): Promise<Raw> { return raw(await http.get(`/api/agent/documents/${id}/search`, { query: { q: query } })) }
 
   // ---------------------------------------------------------------- 业务
 
@@ -545,6 +579,7 @@ export class RealAdapter extends BaseAdapter {
   }
 
   async uploadDataset(input: {
+    projectId?: string
     file: File
     name: string
     description?: string
@@ -554,6 +589,7 @@ export class RealAdapter extends BaseAdapter {
   }): Promise<Record<string, unknown>> {
     const form = new FormData()
     form.append('file', input.file, input.file.name)
+    if (input.projectId) form.append('project_id', input.projectId)
     form.append('name', input.name)
     form.append('description', input.description ?? '')
     form.append('dataset_mode', input.datasetMode)
@@ -569,6 +605,7 @@ export class RealAdapter extends BaseAdapter {
   }
 
   async importModelWeight(input: {
+    projectId?: string
     name: string
     description?: string
     datasetId: string
@@ -579,6 +616,7 @@ export class RealAdapter extends BaseAdapter {
     form.append('description', input.description ?? '')
     form.append('dataset_id', input.datasetId)
     form.append('weight', input.weight, input.weight.name)
+    if (input.projectId) form.append('project_id', input.projectId)
     // 后端会真实验证权重可加载，失败即报错
     return raw(await http.upload<unknown>('/api/model/import', form))
   }

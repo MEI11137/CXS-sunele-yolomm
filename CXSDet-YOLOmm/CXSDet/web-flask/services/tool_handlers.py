@@ -1397,6 +1397,10 @@ class TrainingStart(BaseHandler):
 
 
 def _launch_training(adapter, child, parent_model_id: str) -> None:
+    from config import TEMP_DIR
+
+    # worker 必须继承当前 app 的库/存储/临时目录，否则训练结果写进另一份库
+    storage_path = getattr(adapter.storage_client, "base_path", None)
     payload = {
         "model_id": child.model_id,
         "dataset_id": child.dataset_id,
@@ -1404,6 +1408,9 @@ def _launch_training(adapter, child, parent_model_id: str) -> None:
         "epochs": child.epochs,
         "batch_size": child.batch_size,
         "parent_model_id": parent_model_id,
+        "database_path": adapter.database_path,
+        "file_store_path": str(storage_path) if storage_path else None,
+        "temp_root": str(adapter.work_dir or TEMP_DIR),
     }
     if callable(adapter.training_launcher):
         adapter.training_launcher(**payload)
@@ -1697,7 +1704,7 @@ class McpSaveConnection(BaseHandler):
         return _workspace(adapter, principal, "mcp.save_connection")
 
     def execute(self, adapter, principal, arguments, preview, resource):
-        record = adapter.mcp_store.save(principal, preview["connection"])
+        record = adapter.mcp_store.save(principal, {**arguments, "id": arguments.get("connection_id")})
         outputs = {
             "connection_id": record["id"],
             "status": record["status"],
@@ -1777,17 +1784,24 @@ class McpExecute(BaseHandler):
         }
 
     def recheck(self, adapter, principal, arguments, preview):
+        tool = adapter.mcp_store.get_tool(arguments["connection_id"], principal, arguments["tool_name"])
+        if tool is None or tool["version"] != preview["tool"]["version"]:
+            raise ToolRefused("MCP_TOOL_CHANGED", "MCP 连接或工具已变化，请重新发现并确认")
+        if not adapter.mcp_store.get(arguments["connection_id"], principal)["enabled"]:
+            raise ToolRefused("MCP_DISABLED", "MCP 连接已停用")
         return _workspace(adapter, principal, "mcp.execute")
 
     def execute(self, adapter, principal, arguments, preview, resource):
         result = adapter.mcp_store.invoke(
             principal, arguments["connection_id"], arguments["tool_name"],
             arguments.get("arguments") or {},
+            expected_version=preview['tool']['version'],
         )
         return {
             "connection_id": arguments["connection_id"],
             "tool_name": arguments["tool_name"],
             "result": result.get("result") or {},
+            "status": "failed" if (result.get("result") or {}).get("isError") else "succeeded",
             "effect": result.get("effect") or "unknown",
         }, [{"type": "mcp_connection", "id": arguments["connection_id"],
              "version": "1", "project_id": resource.project_id}]

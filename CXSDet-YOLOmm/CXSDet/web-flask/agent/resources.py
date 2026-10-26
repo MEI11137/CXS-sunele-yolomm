@@ -536,7 +536,7 @@ def register_refs(
                 business_id,
                 kind=kind,
                 owner_id=principal,
-                project_id=project_id,
+                project_id=ref.get('project_id') or project_id,
             )
         except Exception as exc:  # noqa: BLE001 - 留痕，不掩盖业务成功
             record_failure(

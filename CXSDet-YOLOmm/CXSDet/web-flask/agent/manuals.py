@@ -6,6 +6,7 @@
 """
 
 from __future__ import annotations
+import json
 
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -207,7 +208,12 @@ def list_manuals(actor: ActorContext) -> List[Dict[str, Any]]:
     return [_view(row) for row in rows]
 
 
-def get_manual(actor: ActorContext, manual_id: str) -> Dict[str, Any]:
+def _save_version(conn, row):
+    conn.execute("CREATE TABLE IF NOT EXISTS agent_manual_version (manual_id TEXT NOT NULL, version INTEGER NOT NULL, snapshot_json TEXT NOT NULL, PRIMARY KEY(manual_id,version))")
+    conn.execute("INSERT OR IGNORE INTO agent_manual_version VALUES (?,?,?)", (row['id'], row['version'], json.dumps(_view(row), ensure_ascii=False)))
+
+
+def get_manual(actor: ActorContext, manual_id: str, version: Optional[int] = None) -> Dict[str, Any]:
     conn = connect()
     try:
         row = query_one(conn, "SELECT * FROM agent_manual WHERE id = ?", (manual_id,))
@@ -217,7 +223,18 @@ def get_manual(actor: ActorContext, manual_id: str) -> Dict[str, Any]:
         raise AgentError(Code.NOT_FOUND, "手册不存在", http_status=404)
     if row.get("owner_id") not in (None, actor.user_id):
         raise AgentError(Code.NOT_FOUND, "手册不存在", http_status=404)
-    return _view(row)
+    if version is None or int(version) == int(row['version']):
+        return _view(row)
+    conn = connect()
+    try:
+        _save_version(conn, row)
+        snapshot = query_one(conn, 'SELECT snapshot_json FROM agent_manual_version WHERE manual_id=? AND version=?', (manual_id, version))
+        conn.commit()
+    finally:
+        conn.close()
+    if not snapshot:
+        raise AgentError(Code.NOT_FOUND, '任务指定的手册历史版本不存在，请明确选择手册并重新规划', http_status=409)
+    return json.loads(snapshot['snapshot_json'])
 
 
 def create_user_manual(
@@ -242,6 +259,7 @@ def create_user_manual(
             row = query_one(conn, "SELECT * FROM agent_manual WHERE id = ?", (manual_id,))
             if not row or row.get("owner_id") != actor.user_id:
                 raise AgentError(Code.NOT_FOUND, "手册不存在或不可修改", http_status=404)
+            _save_version(conn, row)
             conn.execute(
                 "UPDATE agent_manual SET name = ?, version = version + 1, summary = ?, "
                 "keywords = ?, content_md = ? WHERE id = ?",
@@ -254,6 +272,7 @@ def create_user_manual(
                 (actor.user_id, clean_name),
             )
             if existing:
+                _save_version(conn, existing)
                 conn.execute(
                     "UPDATE agent_manual SET version = version + 1, summary = ?, "
                     "keywords = ?, content_md = ? WHERE id = ?",

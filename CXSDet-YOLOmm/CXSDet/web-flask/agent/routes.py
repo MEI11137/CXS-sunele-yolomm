@@ -546,7 +546,14 @@ def get_task(task_id: str) -> Response:
 @auth_required
 def confirm_plan(task_id: str) -> Response:
     actor = _current()
-    return _ok(get_runtime().confirm_plan(actor, task_id))
+    body = _body()
+    # 版本可选：传了就校验，避免确认到用户没看过的替换计划
+    expected = _optional_int(body.get("plan_version"), "plan_version")
+    return _ok(
+        get_runtime().confirm_plan(
+            actor, task_id, expected_plan_version=expected
+        )
+    )
 
 
 @agent_bp.post("/tasks/<task_id>/stop")
@@ -674,6 +681,12 @@ def create_grant() -> Response:
     """放行"某个连接里的某个具体只读工具"，绑定工具版本，版本变化自动失效。"""
     actor = _current()
     body = _body()
+    from agent.tools.contract import SOURCE_MCP
+    spec, _, source = get_registry().resolve(_str_field(body, "tool_name", max_chars=120), actor)
+    if source != SOURCE_MCP or not spec.readonly or spec.billable or spec.server_id != body.get("server_id") or spec.version != body.get("tool_version"):
+        raise AgentError(Code.VALIDATION, "只能放行当前已发现、本人连接中的具体非计费只读工具；请重新核对版本")
+    if body.get("project_id"):
+        permissions.get_project(actor, body["project_id"])
     grant = grant_store.grant_readonly(
         actor,
         _str_field(body, "server_id", max_chars=120),
@@ -704,3 +717,6 @@ def list_tools() -> Response:
     project_id = request.args.get("project_id") or None
     specs = get_registry().specs(actor, project_id)
     return _ok([spec.to_dict() for spec in specs])
+
+
+from agent import extension_routes  # noqa: E402,F401 - register before blueprint mount

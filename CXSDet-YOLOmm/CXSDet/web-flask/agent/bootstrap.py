@@ -53,30 +53,6 @@ def _current_principal() -> Optional[int]:
         return None
 
 
-class _PendingPersonalReviewClient:
-    """个人连接已存在，但结构化视觉复核协议尚未适配（INT-06）。
-
-    这里显式报"未就绪"，而不是退回全局 Key，也不是假装成功。
-    """
-
-    def __init__(self, principal: int, gateway: Any) -> None:
-        self.principal = principal
-        self.gateway = gateway
-
-    def __getattr__(self, item):  # noqa: D105 - 只在被真正调用时才报错
-        def _not_ready(*args, **kwargs):
-            from agent.errors import AgentError, Code
-
-            raise AgentError(
-                Code.TOOL_BACKEND_UNAVAILABLE,
-                "个人视觉复核协议尚未适配（INT-06）。当前不会回退到全局 Key。",
-                http_status=409,
-                details={"principal": self.principal, "attribute": item},
-            )
-
-        return _not_ready
-
-
 def _model_scope_resolver(model_id: str) -> list:
     """发布/归档的合法范围：同一真实 owner + project 下的模型 ID。"""
     from agent import resources
@@ -105,23 +81,7 @@ def _personal_review_factory(principal_getter=None):
 
 def _personal_model_client_factory(principal_getter=None):
     """零参数工厂：每次调用都按当前用户构造客户端，不持有共享 Key。"""
-
-    def factory():
-        from agent import connections
-        from agent.errors import AgentError, Code
-        from agent.identity import load_actor
-
-        principal = principal_getter() if principal_getter else _current_principal()
-        if not principal:
-            raise AgentError(
-                Code.UNAUTHENTICATED,
-                "无法确定当前用户，不能使用个人模型连接",
-                http_status=401,
-            )
-        actor = load_actor(int(principal))
-        return _PendingPersonalReviewClient(int(principal), connections.model_client(actor))
-
-    return factory
+    return _personal_review_factory(principal_getter)
 
 
 def configure_business_backend(app, *, overrides: Optional[Dict[str, Any]] = None,
@@ -162,8 +122,9 @@ def configure_business_backend(app, *, overrides: Optional[Dict[str, Any]] = Non
         )
         directory_store = overrides.get("directory_store") or DirectoryStore(db_path)
         mcp_store = overrides.get("mcp_store")
-        if mcp_store is None and overrides.get("enable_mcp", False):
-            mcp_store = McpStore(db_path)
+        if mcp_store is None:
+            from services.mcp_transport import transport_factory, PersonalMcpSecrets
+            mcp_store = McpStore(db_path, transport_factory=transport_factory, secret_store=PersonalMcpSecrets())
 
         # 文件访问策略：C 的上传/预览/下载都读这一项，缺失时上传会直接被拒。
         app.config["PROJECT_FILE_ACCESS"] = policy.project_file_access
@@ -212,7 +173,7 @@ def configure_business_backend(app, *, overrides: Optional[Dict[str, Any]] = Non
             or _model_scope_resolver,
         )
         deps["model_client_factory"] = (
-            "ready: per-user personal connection (structured vision review pending INT-06)"
+            "ready: per-user personal connection with structured vision capability checks"
         )
         deps["training_launcher"] = (
             "ready: multiprocessing worker" if overrides.get("training_launcher") is None

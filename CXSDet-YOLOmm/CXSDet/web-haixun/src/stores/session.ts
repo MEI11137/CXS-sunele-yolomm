@@ -28,7 +28,8 @@ export const useSessionStore = defineStore('session', () => {
     if (!sessionId) return
     const target = sessions.value.find((s) => s.id === sessionId)
     if (!target) return
-    target.messages = await getAdapter().listMessages(sessionId)
+    const messages = await getAdapter().listMessages(sessionId)
+    if (!streaming.value) target.messages = messages
   }
 
   /** 切换会话时按需补拉历史 */

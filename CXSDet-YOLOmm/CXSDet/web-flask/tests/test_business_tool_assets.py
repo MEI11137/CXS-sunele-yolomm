@@ -46,7 +46,7 @@ class Fixture:
         self.mcp = McpStore(
             self.db_path,
             transport_factory=lambda config: self.transport,
-            secret_store=None,
+            secret_store=SimpleNamespace(get=lambda owner, ref: 'fixture-only-credential'),
         )
 
     def require_access(self, principal, action, resource):
@@ -281,8 +281,19 @@ def _docx(path: Path) -> Path:
 
 
 def test_pdf_pages_keep_the_real_page_number(fixture):
+    from io import BytesIO
+    from pypdf import PdfWriter
+    from pypdf.generic import DictionaryObject, NameObject, DecodedStreamObject
+    writer = PdfWriter()
+    for text in ('first page inspection rule', 'second page inspection rule'):
+        page = writer.add_blank_page(width=612, height=792)
+        font = DictionaryObject({NameObject('/Type'): NameObject('/Font'), NameObject('/Subtype'): NameObject('/Type1'), NameObject('/BaseFont'): NameObject('/Helvetica')})
+        page[NameObject('/Resources')] = DictionaryObject({NameObject('/Font'): DictionaryObject({NameObject('/F1'): writer._add_object(font)})})
+        stream = DecodedStreamObject(); stream.set_data(f'BT /F1 12 Tf 72 720 Td ({text}) Tj ET'.encode())
+        page[NameObject('/Contents')] = writer._add_object(stream)
+    data = BytesIO(); writer.write(data)
     pdf = fixture.root / "manual.pdf"
-    pdf.write_bytes(_PDF)
+    pdf.write_bytes(data.getvalue())
     asset = fixture.upload(pdf, "document", "application/pdf")
     adapter = fixture.adapter()
 
@@ -373,6 +384,7 @@ def test_mcp_connection_is_configured_then_discovered_then_executed(fixture):
                                  entry=ENTRY_HUMAN_PAGE)
     connection_id = result["outputs"]["connection_id"]
     assert result["outputs"]["status"] == "configured"
+    assert fixture.mcp.get(connection_id, 7)['credential_ref'] == 'secret/mcp/local'
 
     # No transport is configured yet: the site says so instead of pretending.
     untested = adapter.prepare_tool(7, "mcp.test_connection", {"connection_id": connection_id})

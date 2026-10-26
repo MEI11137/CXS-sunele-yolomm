@@ -59,6 +59,7 @@ export interface BusinessRef {
  * 不能退化成字符串，否则会丢掉业务引用。
  */
 export interface WaitingFor {
+  pageHint?: string
   kind: string
   refs: Array<Record<string, unknown>>
   conditions: Record<string, unknown>

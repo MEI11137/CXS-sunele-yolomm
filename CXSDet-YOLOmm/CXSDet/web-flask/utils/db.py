@@ -1,17 +1,21 @@
 
 
 import sqlite3
+from pathlib import Path
 from config import DB_PATH
 from utils.schema_migrations import run_schema_migrations
 
 class Database:
-    def __init__(self):
-        # 数据库文件路径
-        self.db_path = DB_PATH
+    def __init__(self, db_path: str | Path | None = None):
+        # 允许显式指定库路径：worker 进程必须和当前 app 用同一个库，
+        # 否则训练结果会写进默认库，页面查不到。
+        self.db_path = str(db_path) if db_path else DB_PATH
         self.initialize_db()
 
     def initialize_db(self):
         """初始化数据库，创建表结构"""
+        # 显式指定的库路径可能所在目录还不存在；先建目录再连
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         

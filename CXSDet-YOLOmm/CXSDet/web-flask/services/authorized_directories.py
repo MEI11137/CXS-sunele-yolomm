@@ -136,6 +136,8 @@ def _modality_of(parts: tuple[str, ...]) -> str:
         normalized = MODALITY_DIRS.get(part.lower())
         if normalized:
             return normalized
+        if part.lower().startswith('images_'):
+            return part.lower()[7:]
     return "rgb"
 
 
@@ -297,7 +299,7 @@ def modality_key(path: str) -> str:
 
 def _strip_modality(key: str) -> str:
     parts = Path(key).parts
-    if parts and parts[0].lower() in MODALITY_DIRS:
+    if parts and (parts[0].lower() in MODALITY_DIRS or parts[0].lower().startswith('images_')):
         return Path(*parts[1:]).as_posix()
     return key
 

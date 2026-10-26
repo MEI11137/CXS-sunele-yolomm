@@ -38,6 +38,23 @@ import {
 } from './types'
 
 export abstract class BaseAdapter implements ApiAdapter {
+  async listDirectories(_projectId: string): Promise<Array<Record<string, unknown>>> { return this.unsupported('授权目录') }
+  async authorizeDirectory(_projectId: string, _root: string, _label: string): Promise<Record<string, unknown>> { return this.unsupported('授权本机目录') }
+  async disableDirectory(_id: string): Promise<void> { return this.unsupported('停用目录') }
+  async listMcpConnections(): Promise<Array<Record<string, unknown>>> { return this.unsupported('MCP 连接') }
+  async saveMcpConnection(_input: Record<string, unknown>): Promise<Record<string, unknown>> { return this.unsupported('保存 MCP') }
+  async discoverMcp(_id: string): Promise<Record<string, unknown>> { return this.unsupported('发现 MCP 工具') }
+  async grantTool(_input: Record<string, unknown>): Promise<Record<string, unknown>> { return this.unsupported('工具授权') }
+  async revokeGrant(_id: string): Promise<void> { return this.unsupported('撤销授权') }
+  async listDocuments(_projectId: string): Promise<Array<Record<string, unknown>>> { return this.unsupported('文档列表') }
+  async parseDocument(_assetId: string, _title: string): Promise<Record<string, unknown>> { return this.unsupported('文档解析') }
+  async searchDocument(_id: string, _query: string): Promise<Record<string, unknown>> { return this.unsupported('文档检索') }
+  async listTasks(_projectId: string): Promise<AgentTask[]> { return this.unsupported('任务列表') }
+  async createFeedbackDraft(_datasetId: string): Promise<Record<string, unknown>> { return this.unsupported('生成反馈草稿') }
+  async listDraftSamples(_draftId: string, _page: number): Promise<Record<string, unknown>> { return this.unsupported('草稿样本') }
+  async assignDraftSamples(_draftId: string, _sampleIds: string[], _split: string): Promise<Record<string, unknown>> { return this.unsupported('人工划分') }
+  async finalizeDraft(_draftId: string): Promise<Record<string, unknown>> { return this.unsupported('草稿定稿') }
+  async startTraining(_parentId: string, _datasetId: string, _epochs: number, _batchSize: number): Promise<Record<string, unknown>> { return this.unsupported('增量训练') }
   abstract readonly mode: Mode
 
   protected unsupported(feature: string): never {
@@ -123,7 +140,7 @@ export abstract class BaseAdapter implements ApiAdapter {
   async getTaskSnapshot(_taskId?: string): Promise<TaskSnapshot> {
     return this.unsupported('任务快照')
   }
-  async confirmPlan(_taskId?: string): Promise<TaskSnapshot> {
+  async confirmPlan(_taskId?: string, _planVersion?: number): Promise<TaskSnapshot> {
     return this.unsupported('确认计划')
   }
   async stopTask(_taskId?: string, _reason?: string): Promise<TaskSnapshot> {

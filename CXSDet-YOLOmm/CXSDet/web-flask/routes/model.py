@@ -4,12 +4,12 @@ import uuid
 import json
 import multiprocessing
 from datetime import datetime
-from flask import Blueprint, request, g
+from flask import Blueprint, request, g, current_app
 from clients.file_client import file_client
 from utils.response import success, error
 from utils.db import db
 from utils.jwt_util import token_required
-from utils.resource_guard import register_new, resource_required, resources_required, visible_ids
+from utils.resource_guard import register_new, resource_required, resources_required, visible_ids, project_target_required
 from utils.models import Model, ModelVO, MODEL_STATUS
 from config import DB_PATH, TEMP_DIR, YOLO_CLASSES_CONFIG
 from services.dataset_contract import (
@@ -57,12 +57,15 @@ def _bump_agent_revision(model_id):
 training_processes = {}
 
 def run_training_process(
-    model_id, dataset_id, base_model, epochs, batch_size, parent_model_id=None
+    model_id, dataset_id, base_model, epochs, batch_size, parent_model_id=None,
+    database_path=None, file_store_path=None, temp_root=None,
 ):
     """在后台进程中运行模型训练（实现见 services/training_runner）。"""
     try:
         run_training_job(
             model_id, dataset_id, base_model, epochs, batch_size, parent_model_id,
+            database_path=database_path or DB_PATH,
+            file_store_path=file_store_path, temp_root=temp_root,
         )
     finally:
         # 从训练进程字典中移除已完成的进程
@@ -77,6 +80,14 @@ def _lock_db_path():
     两侧会各自持锁，"单机单训练"就不再成立。
     """
     return getattr(db, 'db_path', None) or DB_PATH
+
+
+def _worker_paths():
+    return {
+        'database_path': _lock_db_path(),
+        'file_store_path': str(current_app.config.get('FILE_STORE_PATH') or getattr(file_client, 'base_path', None)) if (current_app.config.get('FILE_STORE_PATH') or getattr(file_client, 'base_path', None)) else None,
+        'temp_root': str(current_app.config.get('TEMP_DIR') or TEMP_DIR),
+    }
 
 
 def _mark_training_taken_slot(lock_path, model_id, process):
@@ -164,7 +175,8 @@ def create_model():
             # 创建并启动训练进程
             training_process = multiprocessing.Process(
                 target=run_training_process,
-                args=(model_id, dataset_id, base_model, epochs, batch_size)
+                args=(model_id, dataset_id, base_model, epochs, batch_size),
+                kwargs=_worker_paths(),
             )
             training_process.daemon = True
             training_processes[model_id] = training_process
@@ -204,6 +216,7 @@ def create_model():
 
 @model_bp.route('/import', methods=['POST'])
 @token_required
+@project_target_required
 def import_model():
     """导入并验证外部训练得到的模型权重。"""
     try:
@@ -219,6 +232,7 @@ def import_model():
         register_new(
             'model',
             imported.to_dict().get('id'),
+            project_id=request.form.get('project_id'),
             display_name=request.form.get('name', ''),
         )
         return success(imported.to_dict(), "模型权重导入成功，请确认后发布")
@@ -425,6 +439,7 @@ def create_incremental_model(parent_model_id):
             return error(str(exc), 409), 409
         process = multiprocessing.Process(
             target=run_training_process,
+            kwargs=_worker_paths(),
             args=(
                 child.model_id,
                 child.dataset_id,

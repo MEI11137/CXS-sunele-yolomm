@@ -3,6 +3,7 @@ import { ref, onMounted } from 'vue'
 import { useGuideStore } from '@/stores/guide'
 import { getAdapter } from '@/services'
 import type { ManualInfo } from '@/services'
+import DocumentLibrary from '@/components/DocumentLibrary.vue'
 
 const guide = useGuideStore()
 
@@ -31,6 +32,7 @@ onMounted(async () => {
 
 <template>
   <div class="page">
+    <DocumentLibrary />
     <div class="page-header">
       <h1 class="page-title">资料与手册</h1>
     </div>

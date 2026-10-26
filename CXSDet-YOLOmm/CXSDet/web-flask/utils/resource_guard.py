@@ -140,6 +140,30 @@ def resources_required(checks: Iterable[Tuple[str, str, str]]):
     return decorator
 
 
+def project_target_required(func):
+    """Validate explicit project targets before the legacy page writes anything."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        from flask import request
+        from agent.identity import load_actor
+        from agent import permissions
+        from agent.errors import AgentError
+        payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            return error('请求体必须是对象', 400), 400
+        project_id = request.form.get('project_id') or payload.get('project_id')
+        if project_id:
+            try:
+                actor = load_actor(_current_user_id())
+                project = permissions.get_project(actor, str(project_id))
+                if project['owner_id'] != actor.user_id or project.get('origin') == 'system':
+                    return error('目标项目必须是本人的可写项目', 403), 403
+            except AgentError as exc:
+                return error(exc.message, exc.http_status), exc.http_status
+        return func(*args, **kwargs)
+    return wrapper
+
+
 def register_new(
     kind: str,
     business_id: str,

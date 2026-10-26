@@ -14,6 +14,7 @@ the plan reports a conflict instead of guessing.
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 import sqlite3
 import tempfile
@@ -102,6 +103,7 @@ def _dataset_scan(adapter, dataset_resource) -> tuple[dict, dict]:
     extract_dir = workspace / "source"
     root = safe_extract_dataset(str(archive), str(extract_dir))
     scan = scan_dataset_tree(root)
+    scan['_workspace'] = str(workspace)
     source = {
         "type": "dataset",
         "dataset_id": row["id"],
@@ -118,7 +120,7 @@ def _feedback_samples(adapter, dataset_id: str) -> list[dict]:
     """Human-confirmed feedback rows only, as extra sources for an explicit merge."""
     with adapter.connect() as conn:
         rows = conn.execute(
-            """SELECT fs.id AS sample_id, dr.id AS record_id, dr.corrected_annotations,
+            """SELECT fs.id AS sample_id, fs.annotation_hash, dr.id AS record_id, dr.corrected_annotations,
                       dr.original_image_bucket, dr.original_image_object_key,
                       dr.secondary_image_bucket, dr.secondary_image_object_key
                FROM feedback_samples fs
@@ -127,7 +129,57 @@ def _feedback_samples(adapter, dataset_id: str) -> list[dict]:
                ORDER BY fs.id""",
             (dataset_id,),
         ).fetchall()
-    return [dict(row) for row in rows]
+    from services.feedback_dataset_service import _canonical_annotations
+    current = []
+    for row in rows:
+        item = dict(row)
+        canonical, _ = _canonical_annotations(item['corrected_annotations'])
+        if hashlib.sha256(canonical.encode('utf-8')).hexdigest() == item['annotation_hash']:
+            current.append(item)
+    return current
+
+
+def _merge_feedback(adapter, scan, source):
+    """Materialize confirmed feedback into a private source copy before planning.
+
+    Feedback has no implicit split: an explicit split_policy is required, or
+    the planner blocks on unassigned samples. The original archive is untouched.
+    """
+    from services.feedback_dataset_service import _canonical_annotations, _yolo_label
+    from services.review_service import _validate_annotations
+    root = Path(scan['root'])
+    rows = _feedback_samples(adapter, source['dataset_id'])
+    if not rows:
+        raise ValueError('没有与当前人工标注版本一致的反馈样本，请先人工确认并加入反馈池')
+    for row in rows:
+        _, annotations = _canonical_annotations(row['corrected_annotations'])
+        _validate_annotations(annotations, scan['class_names'])
+        key = 'feedback_' + row['sample_id']
+        assets = [('images', row['original_image_bucket'], row['original_image_object_key'])]
+        if source.get('secondary_modality'):
+            assets.append(('images_' + source['secondary_modality'], row['secondary_image_bucket'], row['secondary_image_object_key']))
+        for directory, bucket, object_key in assets:
+            if not bucket or not object_key:
+                raise ValueError('反馈样本缺少所需配套图片，不能合并')
+            destination = root / directory / 'unassigned' / (key + (Path(object_key).suffix.lower() or '.jpg'))
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(adapter.storage_client.get(bucket, object_key))
+        label = root / 'labels' / 'unassigned' / (key + '.txt')
+        label.parent.mkdir(parents=True, exist_ok=True)
+        label.write_text(_yolo_label(annotations), encoding='utf-8')
+    merged = scan_dataset_tree(root)
+    merged['_workspace'] = scan['_workspace']
+    source['feedback_samples'] = [{'sample_id': r['sample_id'], 'record_id': r['record_id'], 'annotation_hash': r['annotation_hash']} for r in rows]
+    return merged
+
+
+def _input_fingerprint(scan):
+    items = []
+    for sample in sorted(scan['samples'], key=lambda s: s['key']):
+        files = [(name, hashlib.sha256(Path(path).read_bytes()).hexdigest()) for name, path in sorted(sample['modalities'].items())]
+        label = hashlib.sha256(Path(sample['label']).read_bytes()).hexdigest() if sample.get('label') else None
+        items.append([sample['key'], files, label])
+    return hashlib.sha256(json.dumps([scan['class_names'], items], sort_keys=True).encode()).hexdigest()
 
 
 def _plan(scan: dict, arguments: dict, source: dict, provided_classes: list[str] | None) -> dict:
@@ -136,6 +188,16 @@ def _plan(scan: dict, arguments: dict, source: dict, provided_classes: list[str]
         source_classes = list(provided_classes)
     conflicts: list[dict] = []
     warnings: list[dict] = []
+    if scan.get('sample_count', len(scan['samples'])) != len(scan['samples']):
+        conflicts.append({'code': 'SCAN_TRUNCATED', 'message': '源样本超过扫描上限，不能把部分扫描结果当成完整候选'})
+    for issue in scan.get('issues', []):
+        if issue.get('severity') == 'blocking' and not (provided_classes and issue.get('code') == 'CLASS_NAMES_MISSING'):
+            conflicts.append(issue)
+    for sample in scan['samples']:
+        if not sample.get('label') or 'rgb' not in sample['modalities']:
+            conflicts.append({'code': 'SAMPLE_INCOMPLETE', 'message': '样本缺少 RGB 或标签', 'key': sample['key']})
+        if source.get('secondary_modality') and source['secondary_modality'] not in sample['modalities']:
+            conflicts.append({'code': 'PAIR_MISSING', 'message': '样本缺少配套模态', 'key': sample['key']})
     if not source_classes:
         conflicts.append({"code": "CLASS_NAMES_REQUIRED",
                           "message": "源数据没有类别列表，需显式提供 class_names"})
@@ -213,6 +275,9 @@ def _plan(scan: dict, arguments: dict, source: dict, provided_classes: list[str]
             except OSError:
                 digest = None
         if digest and digest in seen_content:
+            previous = next(s for s in included if s['key'] == seen_content[digest])
+            if previous.get('label') and sample.get('label') and Path(previous['label']).read_bytes() != Path(sample['label']).read_bytes():
+                conflicts.append({'code': 'ANNOTATION_CONFLICT', 'message': '相同图片的标签不同，需人工决定，不能静默去重', 'key': sample['key']})
             skipped_duplicates.append({"key": sample["key"],
                                        "duplicate_of": seen_content[digest]})
             continue
@@ -307,7 +372,14 @@ def _plan(scan: dict, arguments: dict, source: dict, provided_classes: list[str]
 def plan_from_dataset(adapter, dataset_resource, arguments: dict) -> dict:
     _table(adapter)
     scan, source = _dataset_scan(adapter, dataset_resource)
-    plan = _plan(scan, arguments, source, arguments.get("class_names"))
+    try:
+        source['project_id'] = dataset_resource.project_id
+        if arguments.get('include_feedback'):
+            scan = _merge_feedback(adapter, scan, source)
+        plan = _plan(scan, arguments, source, arguments.get("class_names"))
+        plan['input_fingerprint'] = _input_fingerprint(scan)
+    finally:
+        shutil.rmtree(scan['_workspace'], ignore_errors=True)
     conflict = _candidate_name_taken(adapter, arguments["name"])
     if conflict:
         plan["conflicts"].append({"code": "NAME_CONFLICT",
@@ -328,6 +400,7 @@ def plan_from_directory(adapter, resource, root, arguments: dict) -> dict:
     scan = scan_dataset_tree(root)
     source = {"type": "directory", "directory_id": resource.id, "root": str(root)}
     plan = _plan(scan, arguments, source, arguments.get("class_names"))
+    plan['input_fingerprint'] = _input_fingerprint(scan)
     conflict = _candidate_name_taken(adapter, arguments["name"])
     if conflict:
         plan["conflicts"].append({"code": "NAME_CONFLICT",
@@ -530,14 +603,17 @@ def _execute(adapter, scan: dict, source: dict, arguments: dict, plan: dict,
 def build_candidate_from_dataset(adapter, dataset_resource, arguments: dict,
                                  preview: dict) -> dict:
     scan, source = _dataset_scan(adapter, dataset_resource)
-    source["project_id"] = dataset_resource.project_id
-    plan = _plan(scan, arguments, source, arguments.get("class_names"))
-    extra = []
-    if arguments.get("include_feedback"):
-        extra = [{"record_id": row["record_id"], "sample_id": row["sample_id"]}
-                 for row in _feedback_samples(adapter, dataset_resource.id)]
-    return _execute(adapter, scan, source, arguments, plan, "dataset",
-                    dataset_resource.id, extra)
+    try:
+        source["project_id"] = dataset_resource.project_id
+        if arguments.get('include_feedback'):
+            scan = _merge_feedback(adapter, scan, source)
+        plan = _plan(scan, arguments, source, arguments.get("class_names"))
+        if plan.get('blocked') or _input_fingerprint(scan) != preview.get('input_fingerprint'):
+            from services.tool_common import ToolRefused
+            raise ToolRefused('TRANSFORM_INPUT_CHANGED', '源文件、反馈或标注已变化，或存在未解决冲突，请重新预览并确认')
+        return _execute(adapter, scan, source, arguments, plan, "dataset", dataset_resource.id, source.get('feedback_samples'))
+    finally:
+        shutil.rmtree(scan['_workspace'], ignore_errors=True)
 
 
 def build_candidate_from_directory(adapter, resource, root, arguments: dict,
@@ -546,6 +622,9 @@ def build_candidate_from_directory(adapter, resource, root, arguments: dict,
     source = {"type": "directory", "directory_id": resource.id,
               "root": str(root), "project_id": resource.project_id}
     plan = _plan(scan, arguments, source, arguments.get("class_names"))
+    if plan.get('blocked') or _input_fingerprint(scan) != preview.get('input_fingerprint'):
+        from services.tool_common import ToolRefused
+        raise ToolRefused('TRANSFORM_INPUT_CHANGED', '授权目录内容已变化或存在冲突，请重新预览并确认')
     return _execute(adapter, scan, source, arguments, plan, "directory", resource.id, None)
 
 

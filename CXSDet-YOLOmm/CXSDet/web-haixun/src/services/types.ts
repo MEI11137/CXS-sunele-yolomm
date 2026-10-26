@@ -68,6 +68,10 @@ export interface TaskSnapshot {
 }
 
 export interface ToolInfo {
+  serverId?: string
+  version?: string
+  source?: string
+  billable?: boolean
   name: string
   title: string
   description: string
@@ -185,7 +189,14 @@ export interface ApiAdapter {
 
   // -------------------------------------------------------------- 任务
   getTaskSnapshot(taskId: string): Promise<TaskSnapshot>
-  confirmPlan(taskId: string): Promise<TaskSnapshot>
+  listTasks(projectId: string): Promise<AgentTask[]>
+  createFeedbackDraft(datasetId: string): Promise<Record<string, unknown>>
+  listDraftSamples(draftId: string, page: number): Promise<Record<string, unknown>>
+  assignDraftSamples(draftId: string, sampleIds: string[], split: string): Promise<Record<string, unknown>>
+  finalizeDraft(draftId: string): Promise<Record<string, unknown>>
+  startTraining(parentId: string, datasetId: string, epochs: number, batchSize: number): Promise<Record<string, unknown>>
+  /** planVersion 传了就校验：防止确认到用户没看过的替换计划 */
+  confirmPlan(taskId: string, planVersion?: number): Promise<TaskSnapshot>
   stopTask(taskId: string, reason?: string): Promise<TaskSnapshot>
   reconcileTask(taskId: string): Promise<TaskSnapshot>
   getTaskNote(taskId: string): Promise<Record<string, unknown>>
@@ -198,6 +209,17 @@ export interface ApiAdapter {
   listTools(projectId?: string): Promise<ToolInfo[]>
   listManuals(): Promise<ManualInfo[]>
   listGrants(): Promise<Array<Record<string, unknown>>>
+  listMcpConnections(): Promise<Array<Record<string, unknown>>>
+  listDirectories(projectId: string): Promise<Array<Record<string, unknown>>>
+  authorizeDirectory(projectId: string, root: string, label: string): Promise<Record<string, unknown>>
+  disableDirectory(id: string): Promise<void>
+  saveMcpConnection(input: Record<string, unknown>): Promise<Record<string, unknown>>
+  discoverMcp(connectionId: string): Promise<Record<string, unknown>>
+  grantTool(input: Record<string, unknown>): Promise<Record<string, unknown>>
+  revokeGrant(id: string): Promise<void>
+  listDocuments(projectId: string): Promise<Array<Record<string, unknown>>>
+  parseDocument(assetId: string, title: string): Promise<Record<string, unknown>>
+  searchDocument(id: string, query: string): Promise<Record<string, unknown>>
 
   // -------------------------------------------------------------- 业务
   listRecords(query?: PageQuery & { projectId?: string }): Promise<PageResult<DetectionRecordSummary>>
@@ -222,6 +244,7 @@ export interface ApiAdapter {
   listDatasets(query?: PageQuery): Promise<PageResult<DatasetSummary>>
   /** 上传一个 YOLO 结构 ZIP 并登记为数据集（后端校验结构后才算成功） */
   uploadDataset(input: {
+    projectId?: string
     file: File
     name: string
     description?: string
@@ -237,6 +260,7 @@ export interface ApiAdapter {
   publishModel(modelId: string): Promise<Record<string, unknown>>
   /** 导入外部训练好的 .pt 权重，登记为草稿模型（需选来源数据集） */
   importModelWeight(input: {
+    projectId?: string
     name: string
     description?: string
     datasetId: string

@@ -106,12 +106,13 @@ class IntegrationAssemblyTest(unittest.TestCase):
     def test_project_file_access_policy_is_installed(self) -> None:
         self.assertTrue(callable(self.app.config.get("PROJECT_FILE_ACCESS")))
 
-    def test_missing_mcp_transport_is_reported_not_faked(self) -> None:
+    def test_mcp_transport_is_wired_but_no_connection_is_faked(self) -> None:
         deps = self.app.extensions[bootstrap.EXTENSION_KEY]["report"]["dependencies"]
         self.assertIn("mcp_store", deps)
-        self.assertIn("not_ready", deps["mcp_store"])
-        # 没有真实传输时，MCP store 不交给工具层
-        self.assertIsNone(self.app.extensions[bootstrap.EXTENSION_KEY]["mcp_store"])
+        self.assertEqual("ready", deps["mcp_store"])
+        store = self.app.extensions[bootstrap.EXTENSION_KEY]["mcp_store"]
+        self.assertTrue(callable(store.transport_factory))
+        self.assertEqual([], store.list(1))
 
     def test_reconfiguration_is_idempotent(self) -> None:
         again = bootstrap.configure_business_backend(self.app)
@@ -176,7 +177,9 @@ class IntegrationAssemblyTest(unittest.TestCase):
     def test_adapter_exposes_real_tools_for_a_real_principal(self) -> None:
         names = {tool["name"] for tool in self.adapter.list_tools(1)}
         self.assertTrue(names, "C 适配器应能返回自己的工具描述符")
-        self.assertFalse({n for n in names if n.startswith("mcp.")})
+        self.assertIn('mcp.execute', names)  # internal C contract
+        from agent.business_bridge import BusinessBackendBridge
+        self.assertFalse(any(s.name.startswith('business_mcp') for s in BusinessBackendBridge(self.adapter).list_tools(load_actor(1))))
 
     def test_plain_user_sees_publish_tools_for_own_project(self) -> None:
         """INT-05：发布不再依赖全局发布权，普通用户能发布自己项目里的模型。"""

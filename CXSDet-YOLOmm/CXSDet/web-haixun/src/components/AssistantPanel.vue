@@ -4,6 +4,7 @@ import { useSessionStore } from '@/stores/session'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { getAdapter } from '@/services'
 import type { ChatMessage, Attachment, ResourceKind } from '@/types'
+import AgentProgress from './AgentProgress.vue'
 
 const props = defineProps<{ open: boolean; mobile?: boolean }>()
 const emit = defineEmits<{ toggle: [] }>()
@@ -107,9 +108,11 @@ async function send() {
 // 停止只中断本次等待，并同步请求后端停止任务（不假装已经停下）
 async function stop() {
   abortCtrl.value?.abort()
-  const taskId = session.lastTurn?.task?.id
-  if (!taskId) return
   try {
+    const tasks = await getAdapter().listTasks(workspace.currentId)
+    const active = tasks.find(t => t.session_id === session.currentId && !['completed','stopped','failed','partial_failed'].includes(t.status))
+    const taskId = active?.id
+    if (!taskId) { attachNotice.value = '没有查到可停止的活动任务，请核对执行状态。'; return }
     await getAdapter().stopTask(taskId, '用户在助手面板停止')
   } catch (e) {
     attachNotice.value = '中断已发送，但后端停止失败：' + (e as Error).message
@@ -284,6 +287,7 @@ onMounted(scrollToBottom)
       </div>
 
       <div ref="listEl" class="assistant-messages">
+        <AgentProgress />
         <div v-if="!messages.length" class="assistant-empty">
           <p>我是海巡智检巡检助手，可以协助你发起巡检、核对计划和处理复核。</p>
         </div>
@@ -367,6 +371,7 @@ onMounted(scrollToBottom)
           </button>
         </header>
         <div ref="listEl" class="assistant-messages">
+          <AgentProgress />
           <div v-for="msg in messages" :key="msg.id" class="msg" :class="msg.role">
             <div class="msg-bubble">
               <div class="msg-text">{{ msg.content }}</div>

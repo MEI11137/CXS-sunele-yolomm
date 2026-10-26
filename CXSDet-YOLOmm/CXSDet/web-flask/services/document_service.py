@@ -17,6 +17,7 @@ permission check upstream.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import re
 import sqlite3
@@ -30,7 +31,7 @@ from xml.etree import ElementTree
 WORD = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 SUPPORTED = {
-    ".pdf": ("pdf", "pdf-content-stream"),
+    ".pdf": ("pdf", "pypdf"),
     ".docx": ("docx", "ooxml-word"),
 }
 CONVERT_HINT = "旧版 .doc 请先另存为 .docx 再解析"
@@ -182,30 +183,19 @@ def _content_text(content: bytes) -> str:
 
 
 def parse_pdf(data: bytes) -> dict:
-    objects = _pdf_objects(data)
-    pages: list[tuple[int, bytes]] = []
-    for number, body in objects.items():
-        if re.search(rb"/Type\s*/Page(?![a-zA-Z])", body):
-            pages.append((number, body))
-    pages.sort(key=lambda item: item[0])
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise ValueError("PDF 解析需要安装 requirements-agent.txt 中的 pypdf") from exc
+    reader = PdfReader(io.BytesIO(data), strict=False)
+    if reader.is_encrypted and not reader.decrypt(""):
+        raise ValueError("PDF 已加密，请先提供可读取的副本")
+    pages = reader.pages
     blocks: list[dict] = []
     warnings: list[str] = []
     empty_pages: list[int] = []
-    for page_index, (_, body) in enumerate(pages, start=1):
-        references = [int(value) for value in
-                      re.findall(rb"/Contents\s+(\d+)\s+\d+\s+R", body)]
-        if not references:
-            array = re.search(rb"/Contents\s*\[(.*?)\]", body, re.S)
-            if array:
-                references = [int(value) for value in
-                              re.findall(rb"(\d+)\s+\d+\s+R", array.group(1))]
-        text_parts = []
-        for reference in references:
-            content = objects.get(reference)
-            if content is None:
-                continue
-            text_parts.append(_content_text(_pdf_stream(content)))
-        text = "\n".join(part for part in text_parts if part).strip()
+    for page_index, page in enumerate(pages, start=1):
+        text = (page.extract_text() or "").strip()
         if text:
             blocks.append({"block_type": "text", "page_no": page_index,
                            "paragraph_no": None, "table_no": None, "text": text})
@@ -396,8 +386,16 @@ def get_document(database_path: str | Path, document_id: str) -> dict:
     if row is None:
         raise FileNotFoundError("文档未解析或不存在")
     record = dict(row)
+    record['document_id'] = record['id']
     record["warnings"] = json.loads(record.get("warnings_json") or "[]")
     return record
+
+
+def list_documents(database_path, owner_id, project_id):
+    with _connect(database_path) as conn:
+        _ensure_tables(conn)
+        ids = [r[0] for r in conn.execute("SELECT id FROM documents WHERE owner_id=? AND project_id=? ORDER BY created_at DESC", (owner_id, project_id))]
+    return [get_document(database_path, item) for item in ids]
 
 
 def search_document(database_path: str | Path, document_id: str, query: str,
@@ -427,6 +425,9 @@ def search_document(database_path: str | Path, document_id: str, query: str,
         start = max(0, position - 80)
         excerpt = text[start:start + 240]
         hits.append({
+            "document_id": document_id,
+            "document_version": document["sha256"],
+            "source_file_id": document["asset_id"],
             "block": row["ordinal"],
             "block_type": row["block_type"],
             "page_no": row["page_no"],

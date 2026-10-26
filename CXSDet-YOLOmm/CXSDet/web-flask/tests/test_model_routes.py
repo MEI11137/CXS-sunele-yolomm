@@ -93,9 +93,10 @@ def test_create_model_persists_dataset_modality_and_version(monkeypatch, tmp_pat
             return 1
 
     class FakeProcess:
-        def __init__(self, target, args):
+        def __init__(self, target, args, **options):
             captured["target"] = target
             captured["args"] = args
+            captured['worker_paths'] = options.get('kwargs')
             self.daemon = False
 
         def start(self):
@@ -130,6 +131,8 @@ def test_create_model_persists_dataset_modality_and_version(monkeypatch, tmp_pat
     assert body["data"]["model_mode"] == "multimodal"
     assert body["data"]["secondary_modality"] == "edge"
     assert body["data"]["version"] == 1
+    assert captured['worker_paths']['database_path']
+    assert captured['worker_paths']['temp_root']
     assert "model_mode" in captured["sql"]
     assert "model_yaml" in captured["sql"]
     assert "publish_status" in captured["sql"]

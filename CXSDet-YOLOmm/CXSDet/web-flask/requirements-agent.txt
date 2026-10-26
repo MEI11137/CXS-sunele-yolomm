@@ -1,0 +1,4 @@
+# Optional Agent document/MCP capabilities. Base backend dependencies: requirements.txt
+# MCP v1 API, verified with stdio and Streamable HTTP (not legacy SSE-only).
+mcp==1.26.0
+pypdf==6.6.0

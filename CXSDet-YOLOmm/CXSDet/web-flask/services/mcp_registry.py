@@ -17,9 +17,9 @@ Separation of concerns, deliberately:
   ``failed``; a write tool failure leaves the outcome to the external service,
   so it is raised as an unexpected error and the adapter marks it ``unknown``.
 
-The site never installs or starts a service on the user's behalf, and it does
-not claim to sandbox the external process: the external service's own access
-rules apply.
+The site never installs a service. It starts only the stdio program explicitly
+saved by the user, and does not claim to sandbox that external process: the
+external service's own access rules apply.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 class McpUnavailable(ValueError):
@@ -80,6 +81,8 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (connection_id, name)
         )"""
     )
+    if "revision" not in {row[1] for row in conn.execute("PRAGMA table_info(mcp_connections)")}:
+        conn.execute("ALTER TABLE mcp_connections ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
 
 
 class McpStore:
@@ -105,6 +108,18 @@ class McpStore:
         name = str(payload.get("name") or "").strip()
         if not name:
             raise ValueError("连接名称不能为空")
+        if len(name) > 120 or ('enabled' in payload and not isinstance(payload['enabled'], bool)):
+            raise ValueError('连接名称过长或启用状态不是布尔值')
+        if payload.get("transport") not in ("stdio", "http"):
+            raise ValueError("transport 只能为 stdio 或 http（Streamable HTTP）")
+        if not isinstance(payload.get("arguments", []), list) or any(not isinstance(a, str) for a in payload.get("arguments", [])):
+            raise ValueError("arguments 必须是字符串数组")
+        if not payload.get("command" if payload["transport"] == "stdio" else "endpoint"):
+            raise ValueError("请填写本机程序或网络地址")
+        if payload['transport'] == 'http':
+            parts = urlsplit(payload['endpoint'])
+            if parts.scheme not in ('http','https') or not parts.hostname or parts.username or parts.password or parts.query or parts.fragment:
+                raise ValueError('地址须为不含凭据、查询参数和片段的 HTTP(S) MCP 地址；凭据请单独填写')
         connection_id = payload.get("id") or str(uuid.uuid4())
         args = [str(value) for value in (payload.get("arguments") or [])]
         with _connect(self.database_path) as conn:
@@ -130,7 +145,7 @@ class McpStore:
             else:
                 conn.execute(
                     "UPDATE mcp_connections SET name=?, transport=?, endpoint=?, command=?, "
-                    "args_json=?, credential_ref=?, enabled=?, updated_at=? WHERE id=?",
+                    "args_json=?, credential_ref=?, enabled=?, updated_at=?, revision=revision+1, tools_version=NULL, status='configured' WHERE id=?",
                     (
                         name, payload["transport"], payload.get("endpoint"),
                         payload.get("command"), json.dumps(args),
@@ -139,6 +154,7 @@ class McpStore:
                         connection_id,
                     ),
                 )
+                conn.execute("DELETE FROM mcp_tools WHERE connection_id=?", (connection_id,))
         return self.get(connection_id, owner_id)
 
     def get(self, connection_id: str, owner_id: int) -> dict:
@@ -178,7 +194,7 @@ class McpStore:
         reference = record.get("credential_ref")
         if reference:
             if self.secret_store is None:
-                raise McpUnavailable("认证信息需要工作区凭据存储，而当前未注入")
+                raise McpUnavailable("认证信息需要工作区凭据存储，而当前尚未配置")
             config["credential"] = self.secret_store.get(record["owner_id"], reference)
         return config
 
@@ -219,9 +235,9 @@ class McpStore:
             return {"connection_id": connection_id, "connected": False,
                     "server": {}, "error": str(exc)}
         except Exception as exc:
-            self._mark(connection_id, "error", f"{type(exc).__name__}: {exc}")
+            self._mark(connection_id, "error", type(exc).__name__)
             return {"connection_id": connection_id, "connected": False,
-                    "server": {}, "error": f"{type(exc).__name__}: {exc}"}
+                    "server": {}, "error": type(exc).__name__}
         self._mark(connection_id, "connected", None)
         return {"connection_id": connection_id, "connected": True,
                 "server": server or {}, "error": None}
@@ -232,8 +248,8 @@ class McpStore:
         try:
             advertised = transport.list_tools()
         except Exception as exc:
-            self._mark(connection_id, "error", f"{type(exc).__name__}: {exc}")
-            raise McpUnavailable(f"工具发现失败: {exc}") from exc
+            self._mark(connection_id, "error", type(exc).__name__)
+            raise McpUnavailable(f"工具发现失败: {type(exc).__name__}") from exc
 
         tools = []
         for item in advertised:
@@ -250,7 +266,7 @@ class McpStore:
                 "effects_declared": declared,
             })
         fingerprint = hashlib.sha256(
-            json.dumps([[tool["name"], tool["schema"]] for tool in tools],
+            json.dumps([record["revision"], sorted(tools, key=lambda t: t["name"])],
                        sort_keys=True, ensure_ascii=False).encode("utf-8")
         ).hexdigest()[:16]
         previous = record.get("tools_version")
@@ -295,24 +311,32 @@ class McpStore:
         return record
 
     def invoke(self, owner_id: int, connection_id: str, tool_name: str,
-               arguments: dict) -> dict:
+               arguments: dict, expected_version: str | None = None) -> dict:
         record = self.get(connection_id, owner_id)
         tool = self.get_tool(connection_id, owner_id, tool_name)
         if tool is None:
             raise McpUnavailable("该工具不在最近一次工具发现结果中")
+        if expected_version is not None and expected_version != tool['version']:
+            raise McpUnavailable('MCP 工具版本已变化，请重新确认')
         transport = self._transport(record)
         try:
             result = transport.call_tool(tool_name, arguments)
         except Exception as exc:
-            self._mark(connection_id, "error", f"{type(exc).__name__}: {exc}")
-            if tool["writes"] and not tool["idempotent"]:
+            self._mark(connection_id, "error", type(exc).__name__)
+            if tool["writes"] or tool["billable"]:
                 # The external service may already have applied the change.
                 raise RuntimeError(
                     f"外部工具执行结果未知，未自动重发: {type(exc).__name__}"
                 ) from exc
-            raise McpUnavailable(f"外部工具执行失败: {exc}") from exc
+            raise McpUnavailable(f"外部工具执行失败: {type(exc).__name__}") from exc
         self._mark(connection_id, "connected", None)
         return {
             "result": result if isinstance(result, dict) else {"value": result},
             "effect": "write" if tool["writes"] else "read",
         }
+
+    def list_tools(self, owner_id: int, connection_id: str) -> list[dict]:
+        self.get(connection_id, owner_id)
+        with _connect(self.database_path) as conn:
+            names = [r[0] for r in conn.execute("SELECT name FROM mcp_tools WHERE connection_id=? ORDER BY name", (connection_id,))]
+        return [self.get_tool(connection_id, owner_id, name) for name in names]

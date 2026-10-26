@@ -2,6 +2,8 @@
 import { ref, onMounted } from 'vue'
 import { getAdapter } from '@/services'
 import type { ToolInfo } from '@/services'
+import McpSettings from '@/components/McpSettings.vue'
+import DirectorySettings from '@/components/DirectorySettings.vue'
 
 // 这里只展示后端真实提供的工具与授权记录。
 // MCP 服务器的连接管理（握手、发现工具、逐工具放行）目前**没有 HTTP 接口**，
@@ -33,16 +35,18 @@ function shortName(name: string): string {
 }
 
 function riskLabel(risk: string): string {
-  return risk === 'write' ? '写入' : risk === 'external' ? '外部调用' : '只读'
+  return risk === 'critical' ? '训练 / 发布' : risk === 'write' ? '写入' : risk === 'external' ? '外部调用' : '只读'
 }
 
 function riskClass(risk: string): string {
-  return risk === 'write' ? 'tag-warn' : risk === 'external' ? 'tag-error' : 'tag-success'
+  return risk === 'critical' ? 'tag-error' : risk === 'write' ? 'tag-warn' : risk === 'external' ? 'tag-error' : 'tag-success'
 }
 </script>
 
 <template>
   <div class="page">
+    <McpSettings @changed="load" />
+    <DirectorySettings />
     <div class="page-header">
       <h1 class="page-title">扩展与连接</h1>
       <span class="tag num">{{ tools.length }} 个工具 · {{ grants.length }} 条授权</span>
@@ -84,8 +88,7 @@ function riskClass(risk: string): string {
       <div v-if="!grants.length" class="empty panel">
         <div class="empty-title">暂无授权记录</div>
         <div class="empty-desc">
-          外部 MCP 工具需要逐个放行已核对的只读工具；当前后端尚未提供 MCP 连接管理接口，
-          因此这里不会出现"已连接"的假状态。
+          外部工具默认逐次确认；可在上方核对并放行具体只读工具。
         </div>
       </div>
       <div v-else class="panel table-wrap">
@@ -110,12 +113,11 @@ function riskClass(risk: string): string {
       <div class="panel notice-block">
         <ul class="cap-list">
           <li>
-            <strong>MCP 服务器连接</strong>：后端只有工具授权（grants）与注册接口，
-            缺少真实传输、握手与工具发现，所以本页不提供"连接"入口，避免出现假连接。
+            <strong>MCP 服务器</strong>：需自行准备本机程序或网络服务，再在上方保存、连接与发现。
           </li>
           <li>
             <strong>受控目录授权</strong>：目录类工具（inspect / search / transform）由助手在对话中按授权目录调用，
-            页面暂未提供可视化选择器。
+            可在上方填写完整路径并授权，候选写入须另行确认。
           </li>
         </ul>
       </div>

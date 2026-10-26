@@ -1,8 +1,20 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRouter, useRoute } from 'vue-router'
 import { getAdapter } from '@/services'
 import type { DatasetSummary, DetectionRecordSummary } from '@/types'
+import DraftEditor from '@/components/DraftEditor.vue'
+import { useWorkspaceStore } from '@/stores/workspace'
+const workspace = useWorkspaceStore()
+const editingDraft = ref(String(useRoute().query.draft || ''))
+const creatingDraft = ref(false)
+async function createDraft(d: DatasetSummary) {
+  if (creatingDraft.value || !window.confirm(`从「${d.name}」已人工确认的反馈生成新草稿？草稿仅包含反馈样本，不合并原训练集。`)) return
+  creatingDraft.value = true
+  try { await getAdapter().createFeedbackDraft(d.id); noticeType.value = 'success'; notice.value = '反馈草稿已生成，请人工划分后定稿。'; tab.value = 'drafts'; await load() }
+  catch (e) { noticeType.value = 'error'; notice.value = (e as Error).message }
+  finally { creatingDraft.value = false }
+}
 
 const router = useRouter()
 
@@ -87,6 +99,7 @@ async function doImport() {
   notice.value = ''
   try {
     const result = await getAdapter().uploadDataset({
+      projectId: workspace.currentId,
       file: importFile.value,
       name: importForm.value.name.trim(),
       description: importForm.value.description,
@@ -135,6 +148,7 @@ function useForTraining(datasetId: string) {
 
 <template>
   <div class="page">
+    <DraftEditor v-if="editingDraft" :draft-id="editingDraft" @finalized="editingDraft = ''; load()" />
     <div class="page-header">
       <h1 class="page-title">数据集</h1>
       <div class="header-actions">
@@ -188,6 +202,7 @@ function useForTraining(datasetId: string) {
             <td class="num">{{ d.upload_time?.slice(0, 19).replace('T', ' ') || '—' }}</td>
             <td>
               <button class="btn btn-sm" :disabled="d.status !== 1" @click="useForTraining(d.id)">用于训练</button>
+              <button class="btn btn-sm" :disabled="creatingDraft || d.status !== 1" @click="createDraft(d)">生成反馈草稿</button>
             </td>
           </tr>
         </tbody>
@@ -243,6 +258,7 @@ function useForTraining(datasetId: string) {
               <button class="btn btn-sm" :disabled="d.workflow_status !== 'finalized'" @click="useForTraining(d.id)">
                 用于训练
               </button>
+              <button class="btn btn-sm" @click="editingDraft = d.id">人工划分 / 定稿</button>
             </td>
           </tr>
         </tbody>

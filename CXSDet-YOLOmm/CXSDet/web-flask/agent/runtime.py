@@ -33,6 +33,7 @@ from agent.tools.contract import (
 )
 from agent.tools.registry import (
     ASK_USER,
+    WAIT_HUMAN,
     PROPOSE_PLAN,
     ToolRegistry,
     get_registry,
@@ -308,12 +309,20 @@ class AgentRuntime:
         response["events_after"] = sequence_before
         return response
 
-    def confirm_plan(self, actor: ActorContext, task_id: str) -> Dict[str, Any]:
+    def confirm_plan(
+        self,
+        actor: ActorContext,
+        task_id: str,
+        *,
+        expected_plan_version: Optional[int] = None,
+    ) -> Dict[str, Any]:
         task = task_store.get_task(actor, task_id)
         session = session_store.get_session(actor, task["session_id"])
         project = permissions.get_project(actor, task["project_id"])
         sequence_before = task_store.latest_sequence(session["id"])
-        task = task_store.confirm_plan(task_id, actor.user_id)
+        task = task_store.confirm_plan(
+            task_id, actor.user_id, expected_version=expected_plan_version
+        )
         response = self._run_loop(actor, session, project, task)
         response["events_after"] = sequence_before
         return response
@@ -419,6 +428,9 @@ class AgentRuntime:
             )
 
         for _ in range(max(1, cfg.max_steps)):
+            latest = task_store.get_task_by_id(task["id"])
+            if latest["status"] == task_store.STATUS_STOPPED or latest.get("plan_version") != task.get("plan_version"):
+                return {"session_id": session["id"], "task": task_store.snapshot(latest), "status": latest["status"], "reply": "任务已停止或计划已变更，未继续执行旧请求。", "action": None, "plan": latest.get("plan")}
             if time.monotonic() - state.started > cfg.time_budget_seconds:
                 state.budget_exceeded = True
                 task_store.append_event(
@@ -445,6 +457,9 @@ class AgentRuntime:
             )
             tools = self.registry.openai_tools(actor, project["id"])
             turn = gateway.complete(messages, tools)
+            latest = task_store.get_task_by_id(task["id"])
+            if latest["status"] == task_store.STATUS_STOPPED or latest.get("plan_version") != task.get("plan_version"):
+                return {"session_id": session["id"], "task": task_store.snapshot(latest), "status": latest["status"], "reply": "任务已停止或计划已变更，已丢弃旧模型回复。", "action": None, "plan": latest.get("plan")}
 
             if not turn.tool_calls:
                 reply = turn.text or "（模型没有返回内容）"
@@ -478,7 +493,10 @@ class AgentRuntime:
                 )
                 if outcome is not None:
                     return outcome
-                task = task_store.get_task_by_id(task["id"])
+                latest = task_store.get_task_by_id(task["id"])
+                if latest['status'] == task_store.STATUS_STOPPED or latest.get('plan_version') != task.get('plan_version'):
+                    return {'session_id':session['id'], 'task':task_store.snapshot(latest), 'status':latest['status'], 'reply':'任务已停止或目标已变化，保留已经返回的真实结果，未执行旧回复中的后续操作。', 'action':None, 'plan':latest.get('plan')}
+                task = latest
 
         # 达到循环上限
         task_store.append_event(
@@ -528,6 +546,28 @@ class AgentRuntime:
                 "action": None,
                 "plan": task.get("plan"),
             }
+
+        if spec.name == WAIT_HUMAN:
+            arguments = validate_arguments(spec, call.arguments)
+            ref = {'kind': arguments['kind'], 'id': arguments['id']}
+            resource = permissions.resolve_resource(actor, ref)
+            permissions.require_access(actor, resource, 'write')
+            # Resolve to the actual business ID, not the Agent index ID.
+            ref['id'] = resource.get('source_id') or resource['id']
+            steps = list(task.get('steps') or [])
+            if arguments.get('step_id'):
+                matched = next((s for s in steps if s['id'] == arguments['step_id'] and s.get('needs_human')), None)
+                if matched is None:
+                    raise AgentError(Code.VALIDATION, '人工步骤必须引用当前计划中的人工步骤 ID')
+                matched.update(business_ref=ref, status='running')
+                task_store.update_steps(task['id'], steps)
+            page = '/review/' + ref['id'] if ref['kind'] == 'detection_record' else '/datasets?draft=' + ref['id']
+            task_store.add_business_ref(task['id'], ref)
+            task_store.set_waiting(task['id'], kind='human', reason=arguments['reason'], refs=[ref], page_hint=page)
+            task_store.set_status(task['id'], task_store.STATUS_AWAITING_HUMAN, summary=arguments['reason'])
+            reply = arguments['reason'] + '。请在对应页面提交，系统核实后继续。'
+            session_store.append_message(session['id'], session_store.ROLE_ASSISTANT, reply, task_id=task['id'])
+            return {'session_id': session['id'], 'task': task_store.snapshot(task_store.get_task_by_id(task['id'])), 'status': task_store.STATUS_AWAITING_HUMAN, 'reply': reply, 'action': None, 'plan': task.get('plan')}
 
         if spec.name == ASK_USER:
             arguments = validate_arguments(spec, call.arguments)
@@ -680,6 +720,9 @@ class AgentRuntime:
                 f"工具 {spec.name} 尚未接入，无法执行",
                 http_status=409,
             )
+        latest = task_store.get_task_by_id(task["id"])
+        if latest["status"] == task_store.STATUS_STOPPED or latest.get("plan_version") != task.get("plan_version"):
+            raise AgentError(Code.TASK_STATE_CONFLICT, "任务已停止或计划已变更，未执行旧操作", http_status=409)
         revisions, _, _ = self._guard_arguments(actor, arguments)
         key = request_key or actions.build_request_key(
             task["id"], spec.name, spec.version, arguments, revisions
@@ -830,8 +873,17 @@ class AgentRuntime:
 
         memory.refresh(task["id"])
 
+        latest = task_store.get_task_by_id(task['id'])
+        if latest['status'] == task_store.STATUS_STOPPED or latest.get('plan_version') != task.get('plan_version'):
+            return {'long_running':False, 'reply':'', 'result':payload}
         if result.status == "running":
             reference = (result.business_refs or [{}])[0]
+            steps = list(task_store.get_task_by_id(task["id"]).get("steps") or [])
+            for step in steps:
+                if step.get("tool") == spec.name and step.get("status") in ("pending", "paused", "running"):
+                    step.update(status="running", business_ref=reference, action_id=action_id)
+                    task_store.update_steps(task["id"], steps)
+                    break
             task_store.set_waiting(
                 task["id"],
                 kind="business",
@@ -861,7 +913,56 @@ class AgentRuntime:
                 force=False,
             )
 
+        # 真实执行成功才推进计划步骤：不靠模型最后一句"已完成"
+        self._advance_plan_steps(task["id"], spec, result)
+
         return {"long_running": False, "reply": "", "result": payload}
+
+    @staticmethod
+    def _advance_plan_steps(task_id: str, spec: Any, result: Any) -> None:
+        """按真实执行结果推进计划步骤。
+
+        规则（宁少标、不虚标）：
+
+        1. 步骤显式声明 ``tool`` 且等于本次工具 → 标 done，并把动作/操作记进步骤；
+        2. 没有显式绑定时不猜测步骤归属；
+        3. 失败或未知的执行不推进任何步骤；
+        4. ``needs_human`` / 带 ``business_ref`` 的等待步骤不靠工具推进，
+           由 recovery 在核实到真实业务/人工状态后标记。
+        """
+        if str(result.status) not in ("succeeded", "completed"):
+            return
+        task = task_store.get_task_by_id(task_id)
+        steps = list(task.get("steps") or [])
+        if not steps:
+            return
+
+        def _open(step: Dict[str, Any]) -> bool:
+            return step.get("status") in ("pending", "running", "paused")
+
+        target = None
+        for step in steps:
+            if not _open(step):
+                continue
+            if step.get("needs_human") or step.get("business_ref"):
+                continue
+            bound = str(step.get("tool") or "").strip()
+            if bound and bound == spec.name:
+                target = step
+                break
+
+        if target is None:
+            return
+        try:
+            task_store.mark_step(
+                task_id,
+                str(target["id"]),
+                "done",
+                note=f"工具 {spec.name} 已返回 {result.status}",
+            )
+        except AgentError:
+            # 步骤已被并发改动：不覆盖别人的状态
+            return
 
     def _should_retry(
         self, spec: ToolSpec, exc: AgentError, attempt: int, limit: int
@@ -1006,10 +1107,10 @@ class AgentRuntime:
                     },
                 )
             return None
-        # 已经有过一次写入动作（确认或已执行）但从未提出计划 → 必须先规划
-        prior = len(actions.list_actions(task["id"])) + len(
-            operations.list_for_task(task["id"])
-        )
+        # 已经有过写入动作（确认卡）但从未提出计划 → 必须先规划。
+        # 只数写操作的确认卡：只读查询也会留下 operation，用"任意 operation 数量"
+        # 判断会把纯查询任务误判成复杂写入，也会让多步写入在第二次才被要求规划。
+        prior = len(actions.list_actions(task["id"]))
         if prior >= 1:
             return (
                 "feedback",
@@ -1057,8 +1158,10 @@ class AgentRuntime:
         if not manual_id:
             return None
         try:
-            return get_manual(actor, manual_id)
+            return get_manual(actor, manual_id, version=task.get('manual_version'))
         except AgentError:
+            if task.get('manual_version'):
+                raise
             return None
 
     def _decide_final_status(self, task: Dict[str, Any]) -> str:
@@ -1080,7 +1183,7 @@ class AgentRuntime:
             # 有计划但还有未完成步骤：不能算完成
             if current in task_store.WAITING_STATUSES:
                 return current
-            return task_store.STATUS_PARTIAL_FAILED
+            return task_store.STATUS_RUNNING
         if current in task_store.WAITING_STATUSES:
             return current
         return task_store.STATUS_COMPLETED
@@ -1159,6 +1262,7 @@ class AgentRuntime:
     def _apply_change(self, task: Dict[str, Any]) -> None:
         """目标变更：暂停未开始步骤、作废旧确认、要求重新规划。"""
         superseded = actions.supersede_pending(task["id"], "用户改变了目标或参数")
+        task_store.invalidate_plan(task['id'])
         steps = task.get("steps") or []
         for step in steps:
             if step.get("status") in ("pending",):

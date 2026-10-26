@@ -17,6 +17,7 @@ import os
 import shutil
 import sqlite3
 import uuid
+import psutil
 from datetime import datetime
 from pathlib import Path
 
@@ -55,25 +56,34 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
             acquired_at TEXT NOT NULL
         )"""
     )
+    if 'holder_started' not in {r[1] for r in conn.execute('PRAGMA table_info(training_lock)')}:
+        conn.execute('ALTER TABLE training_lock ADD COLUMN holder_started REAL')
 
 
-def _process_alive(pid: int | None) -> bool:
+def _process_alive(pid: int | None, started: float | None = None) -> bool:
     if not pid:
         return False
     try:
-        os.kill(int(pid), 0)
-    except OSError:
+        process = psutil.Process(int(pid))
+        return process.is_running() and (started is None or abs(process.create_time() - started) < .01)
+    except psutil.NoSuchProcess:
         return False
-    except Exception:  # pragma: no cover - platform specific
+    except psutil.AccessDenied:
         return True
-    return True
+
+
+def _process_started(pid):
+    try:
+        return psutil.Process(int(pid)).create_time() if pid else None
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+        return None
 
 
 def read_lock(database_path: str | Path = DB_PATH) -> dict | None:
     with _connect(database_path) as conn:
         _ensure_table(conn)
         row = conn.execute("SELECT * FROM training_lock WHERE lock_id=1").fetchone()
-    return dict(row) if row else None
+    return dict(row) if row and _process_alive(row['holder_pid'], row['holder_started']) else None
 
 
 def acquire_training_lock(
@@ -84,14 +94,14 @@ def acquire_training_lock(
         _ensure_table(conn)
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT * FROM training_lock WHERE lock_id=1").fetchone()
-        if row is not None and _process_alive(row["holder_pid"]):
+        if row is not None and _process_alive(row["holder_pid"], row['holder_started']):
             raise TrainingBusy(dict(row))
         conn.execute(
-            "INSERT INTO training_lock (lock_id, owner, holder_pid, acquired_at) "
-            "VALUES (1, ?, ?, ?) ON CONFLICT(lock_id) DO UPDATE SET "
+            "INSERT INTO training_lock (lock_id, owner, holder_pid, acquired_at, holder_started) "
+            "VALUES (1, ?, ?, ?, ?) ON CONFLICT(lock_id) DO UPDATE SET "
             "owner=excluded.owner, holder_pid=excluded.holder_pid, "
-            "acquired_at=excluded.acquired_at",
-            (str(owner), holder_pid, datetime.now().isoformat()),
+            "acquired_at=excluded.acquired_at, holder_started=excluded.holder_started",
+            (str(owner), holder_pid, datetime.now().isoformat(), _process_started(holder_pid)),
         )
 
 
@@ -100,8 +110,8 @@ def set_lock_holder(database_path: str | Path, owner: str, pid: int) -> None:
     with _connect(database_path) as conn:
         _ensure_table(conn)
         conn.execute(
-            "UPDATE training_lock SET holder_pid=? WHERE lock_id=1 AND owner=?",
-            (int(pid), str(owner)),
+            "UPDATE training_lock SET holder_pid=?,holder_started=? WHERE lock_id=1 AND owner=?",
+            (int(pid), _process_started(pid), str(owner)),
         )
 
 
@@ -122,6 +132,27 @@ def release_training_lock(database_path: str | Path, owner: str) -> None:
         conn.execute("DELETE FROM training_lock WHERE lock_id=1 AND owner=?", (str(owner),))
 
 
+def reconcile_training_jobs(database_path):
+    """A dead worker means interrupted; never restart training automatically."""
+    changed = 0
+    with _connect(database_path) as conn:
+        _ensure_table(conn)
+        columns = {r[1] for r in conn.execute('PRAGMA table_info(models)')}
+        if not {'id','status','train_result','complete_time'} <= columns:
+            return 0
+        lock = conn.execute('SELECT * FROM training_lock WHERE lock_id=1').fetchone()
+        alive = lock and _process_alive(lock['holder_pid'], lock['holder_started'])
+        for row in conn.execute('SELECT id FROM models WHERE status=0').fetchall():
+            if alive and lock['owner'] == row['id']:
+                continue
+            conn.execute('UPDATE models SET status=4,complete_time=?,train_result=? WHERE id=? AND status=0',
+                         (datetime.now().isoformat(), json.dumps({'error':'后端启动核实：未发现对应训练进程，训练已中断；未自动重做'}, ensure_ascii=False), row['id']))
+            changed += 1
+        if lock and not alive:
+            conn.execute('DELETE FROM training_lock WHERE lock_id=1')
+    return changed
+
+
 def run_training_job(
     model_id: str,
     dataset_id: str,
@@ -130,18 +161,25 @@ def run_training_job(
     batch_size: int,
     parent_model_id: str | None = None,
     database_path: str | Path = DB_PATH,
+    file_store_path: str | Path | None = None,
+    temp_root: str | Path | None = None,
 ) -> dict:
     """Execute one run for an already registered model row.
 
     Runs in a worker process, so it opens its own database connection and its
     own storage client. Every outcome is persisted; nothing is retried.
+
+    三个路径都必须与启动 worker 的 app 保持一致：``database_path`` 决定结果写进
+    哪个库，``file_store_path`` 决定权重与数据集从哪读，``temp_root`` 决定解压目录。
+    用模块默认值会在 app 覆盖了配置（测试/多实例）时把训练结果写到另一份库里。
     """
     from clients.file_client import FileClient
     from utils.db import Database
 
-    database = Database()
-    storage = FileClient()
-    temp_dir = os.path.join(TEMP_DIR, f"model_training_{model_id}_{uuid.uuid4().hex[:8]}")
+    database = Database(database_path)
+    storage = FileClient(base_path=file_store_path) if file_store_path else FileClient()
+    base_temp = str(temp_root or TEMP_DIR)
+    temp_dir = os.path.join(base_temp, f"model_training_{model_id}_{uuid.uuid4().hex[:8]}")
     outcome: dict = {"model_id": model_id, "status": "failed"}
     try:
         database.execute(

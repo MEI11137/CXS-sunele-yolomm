@@ -20,15 +20,17 @@ from agent.errors import AgentError, Code
 from agent.identity import ActorContext
 from agent.tools.registry import ToolRegistry, get_registry
 
-MET_BUSINESS = {"succeeded", "completed", "completed_with_warnings"}
+# 业务侧的"已达成"状态。published 是比 completed 更强的完成态（模型已发布），
+# 在等"训练完成"的任务里同样算达成。
+MET_BUSINESS = {"succeeded", "completed", "completed_with_warnings", "published"}
 FAILED_BUSINESS = {"failed", "cancelled", "aborted", "partial_failed"}
-MET_HUMAN = {"confirmed", "completed", "approved", "done", "submitted"}
+MET_HUMAN = {"confirmed", "completed", "approved", "done", "submitted", "no_defect"}
 
 
 def _provider_for(actor: ActorContext, task_id: str, registry: Optional[ToolRegistry]):
     reg = registry or get_registry()
     ops = operations.list_for_task(task_id)
-    tool_name = ops[-1]["tool_name"] if ops else "query_project_overview"
+    tool_name = ops[-1]["tool_name"] if ops else "business_dataset_get_state"
     try:
         spec, provider, source = reg.resolve(tool_name, actor)
     except AgentError:
@@ -48,12 +50,52 @@ def _query_state(provider: Any, actor: ActorContext, ref: Dict[str, Any]) -> Dic
     return state or {"status": "unknown", "reason": "业务未返回状态"}
 
 
+def _complete_waiting_steps(task_id: str, kind: str) -> None:
+    """等待条件已满足时推进对应步骤。
+
+    优先匹配 ``business_ref`` / ``needs_human`` 的步骤；这类步骤不能靠工具执行
+    推进（它们的完成依据是业务或人工的真实状态），所以只能在这里标完成。
+    """
+    task = task_store.get_task_by_id(task_id)
+    steps = list(task.get("steps") or [])
+    if not steps:
+        return
+
+    def _open(step: Dict[str, Any]) -> bool:
+        return step.get("status") in ("pending", "running", "paused")
+
+    target = None
+    waiting_refs = (task.get("waiting_for") or {}).get("refs") or []
+    for step in steps:
+        if not _open(step):
+            continue
+        ref = step.get("business_ref")
+        matches = ref and any(
+            str(ref.get("id")) == str(item.get("id"))
+            and ref.get("kind") == item.get("kind") for item in waiting_refs
+        )
+        if matches and (kind != "human" or step.get("needs_human")):
+            target = step
+            break
+    if target is None:
+        return
+    note = "人工处理已确认" if kind == "human" else "业务状态已满足等待条件"
+    try:
+        task_store.mark_step(task_id, str(target["id"]), "done", note=note)
+    except AgentError:
+        return
+
+
 def _verdict(kind: str, state: Dict[str, Any]) -> str:
     status = str(state.get("status") or "").lower()
     if kind == "human":
+        if state.get('workflow_status') == 'finalized':
+            return 'met'
         human = str(state.get("human_review_status") or "").lower()
         if human in MET_HUMAN:
             return "met"
+        if human:
+            return 'not_met'
         if status in ("unknown", ""):
             return "unknown"
         return "not_met"
@@ -72,6 +114,7 @@ def reconcile_task(
     *,
     registry: Optional[ToolRegistry] = None,
     auto_continue: bool = True,
+    check_only: bool = False,
 ) -> Dict[str, Any]:
     """核对任务等待的业务状态；满足条件则自动接力继续。"""
     task = task_store.get_task(actor, task_id)
@@ -156,6 +199,10 @@ def reconcile_task(
         }
 
     if verdicts == {"met"}:
+        if check_only:
+            return {'session_id': task['session_id'], 'task': task_store.snapshot(task), 'status': task['status'], 'reply': '等待条件已核实，等待前端续接', 'changed': False, 'checks': checks, 'ready': True}
+        # 等待条件由真实状态满足：把对应步骤标完成，避免计划永远停在 pending
+        _complete_waiting_steps(task_id, kind)
         task_store.clear_waiting(task_id)
         task_store.append_event(
             task["session_id"],
