@@ -697,13 +697,13 @@ class DetectionRun(BaseHandler):
         asset = _asset(adapter, principal, arguments["asset_id"], {"image"})
         spec = _spec("detection.run")
         resource = adapter._project_resource(principal, asset["project_id"], spec)
+        # 模型只要通过授权解析即可使用：默认只读模型、以及本人显式引用的
+        # 跨项目模型都属于合法用法，因此不再按 project_id 硬阻断。
         model_resource = adapter.resolve(principal, "model", arguments["model_id"],
                                          ("model:read",))
         model = adapter._model_row(model_resource.id)
         blockers = []
-        if model_resource.project_id != asset["project_id"]:
-            blockers.append({"code": "MODEL_PROJECT_MISMATCH",
-                             "message": "模型不属于该文件所在项目"})
+        cross_project_model = model_resource.project_id != asset["project_id"]
         if model["status"] != 3:
             blockers.append({"code": "MODEL_NOT_PUBLISHED",
                              "message": "只能使用已发布的模型进行检测"})
@@ -720,9 +720,11 @@ class DetectionRun(BaseHandler):
             else:
                 secondary = _asset(adapter, principal, arguments["secondary_asset_id"],
                                    {"image"})
-                if secondary["project_id"] != asset["project_id"]:
+                if (secondary["project_id"] != asset["project_id"]
+                        and secondary["owner_id"] != asset["owner_id"]):
+                    # 同一用户显式跨项目可以，别人的图片仍必须拒绝
                     blockers.append({"code": "SECONDARY_PROJECT_MISMATCH",
-                                     "message": "第二模态图片不属于同一项目"})
+                                     "message": "第二模态图片不属于同一项目且不是本人资源"})
         elif arguments.get("secondary_asset_id"):
             ignored.append("secondary_asset_id")
 
@@ -739,6 +741,7 @@ class DetectionRun(BaseHandler):
             },
             "confidence": float(arguments.get("confidence") or 0.25),
             "ignored_arguments": ignored,
+            "model_source": "cross_project_readonly" if cross_project_model else "same_project",
             "blocked": bool(blockers),
             "blocked_reasons": blockers,
             "impact": "将上传原图（及第二模态图）、结果图并生成一条检测记录",

@@ -185,6 +185,20 @@ def configure_business_backend(app, *, overrides: Optional[Dict[str, Any]] = Non
             else "ready: injected launcher"
         )
 
+        # 历史数据的归属迁移（幂等）：已确认的默认资源按共享只读登记，其余按原
+        # 提交者/管理员登记为私有；判定不出归属的不公开。
+        from agent import legacy
+
+        try:
+            migrated = legacy.migrate_legacy_resources()
+            report["legacy_migration"] = migrated
+        except Exception as exc:  # noqa: BLE001 - 迁移失败要如实报告，不静默跳过
+            report["legacy_migration"] = {"error": f"{type(exc).__name__}: {exc}"}
+        try:
+            report["system_default_manifest"] = legacy.system_default_manifest()
+        except Exception as exc:  # noqa: BLE001
+            report["system_default_manifest"] = {"error": f"{type(exc).__name__}: {exc}"}
+
         app.extensions[EXTENSION_KEY] = {
             "business_backend": adapter,
             "policy": policy,
@@ -207,7 +221,8 @@ def configure_business_backend(app, *, overrides: Optional[Dict[str, Any]] = Non
                 "project_file_access": "installed",
                 "dependencies": deps,
                 "notes": [
-                    "业务工具已装配，但新数据集/模型/记录的归属登记与版本递增属于 INT-03",
+                    "新数据集/模型/记录/草稿在业务成功后按真实归属登记，状态变化递增版本（INT-03）",
+                    "历史数据按原提交者/管理员登记，未判定归属的不公开；清单见 system_default_manifest",
                     "工具清单是否可见取决于本次请求的真实 principal",
                 ],
             }

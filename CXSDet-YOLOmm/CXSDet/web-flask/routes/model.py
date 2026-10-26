@@ -8,7 +8,8 @@ from flask import Blueprint, request, g
 from clients.file_client import file_client
 from utils.response import success, error
 from utils.db import db
-from utils.jwt_util import admin_required, token_required
+from utils.jwt_util import token_required
+from utils.resource_guard import register_new, resource_required, resources_required, visible_ids
 from utils.models import Model, ModelVO, MODEL_STATUS
 from config import DB_PATH, TEMP_DIR, YOLO_CLASSES_CONFIG
 from services.dataset_contract import (
@@ -81,7 +82,7 @@ def _mark_training_taken_slot(lock_path, model_id, process):
         release_training_lock(lock_path, model_id)
 
 @model_bp.route('/create', methods=['POST'])
-@admin_required
+@token_required
 def create_model():
     """创建新模型并开始训练"""
     try:
@@ -111,6 +112,13 @@ def create_model():
         ''', (dataset_id,), fetchone=True)
         if not dataset_data:
             return error("选择的数据集不存在")
+
+        # 训练用的是别人的数据集也算越权：先按公共规则确认可读
+        from utils.resource_guard import check_resource
+
+        blocked = check_resource('dataset', dataset_id, 'read')
+        if blocked is not None:
+            return blocked
 
         model_mode = dataset_data.get('dataset_mode') or 'single'
         primary_modality = dataset_data.get('primary_modality') or 'rgb'
@@ -157,7 +165,9 @@ def create_model():
                 db.execute('DELETE FROM models WHERE id = ?', (model_id,))
                 raise
             _mark_training_taken_slot(lock_path, model_id, training_process)
-            
+
+            register_new('model', model_id, display_name=name)
+
             return success({
                 'id': model_id,
                 'name': name,
@@ -183,7 +193,7 @@ def create_model():
 
 
 @model_bp.route('/import', methods=['POST'])
-@admin_required
+@token_required
 def import_model():
     """导入并验证外部训练得到的模型权重。"""
     try:
@@ -195,6 +205,11 @@ def import_model():
             db,
             file_client,
             load_detector,
+        )
+        register_new(
+            'model',
+            imported.to_dict().get('id'),
+            display_name=request.form.get('name', ''),
         )
         return success(imported.to_dict(), "模型权重导入成功，请确认后发布")
     except ModelImportError as exc:
@@ -214,6 +229,14 @@ def list_models():
         # 构建查询条件
         conditions = []
         params = []
+
+        # 普通用户只看本人（及系统默认只读）模型；管理员不过滤
+        allowed = visible_ids('model')
+        if allowed is not None:
+            if not allowed:
+                return success({'models': [], 'total': 0, 'page': page, 'page_size': page_size})
+            conditions.append('m.id IN (%s)' % ','.join('?' for _ in allowed))
+            params.extend(sorted(allowed))
         
         if search:
             conditions.append("(m.name LIKE ? OR m.description LIKE ?)")
@@ -256,7 +279,7 @@ def list_models():
         return error(f"获取模型列表失败: {str(e)}")
 
 @model_bp.route('/<model_id>', methods=['GET'])
-@admin_required
+@resource_required('model', 'model_id', 'read')
 def get_model(model_id):
     """获取模型详情"""
     try:
@@ -279,7 +302,7 @@ def get_model(model_id):
         return error(f"获取模型详情失败: {str(e)}")
 
 @model_bp.route('/<model_id>', methods=['PUT'])
-@admin_required
+@resource_required('model', 'model_id', 'write')
 def update_model(model_id):
     """更新模型信息"""
     try:
@@ -315,7 +338,7 @@ def update_model(model_id):
         return error(f"更新模型信息失败: {str(e)}")
 
 @model_bp.route('/<model_id>', methods=['DELETE'])
-@admin_required
+@resource_required('model', 'model_id', 'write')
 def delete_model(model_id):
     """删除模型"""
     try:
@@ -349,7 +372,7 @@ def delete_model(model_id):
         return error(f"删除模型失败: {str(e)}")
 
 @model_bp.route('/<model_id>/publish', methods=['POST'])
-@admin_required
+@resource_required('model', 'model_id', 'publish')
 def publish_model(model_id):
     """原子发布模型并归档同一模态业务域中的旧版本。"""
     try:
@@ -362,7 +385,7 @@ def publish_model(model_id):
 
 
 @model_bp.route('/<parent_model_id>/incremental', methods=['POST'])
-@admin_required
+@resource_required('model', 'parent_model_id', 'read')
 def create_incremental_model(parent_model_id):
     """创建独立子模型记录，并从父权重启动反馈数据集训练。"""
     try:
@@ -413,7 +436,7 @@ def create_incremental_model(parent_model_id):
 
 
 @model_bp.route('/<parent_model_id>/compare/<child_model_id>', methods=['GET'])
-@admin_required
+@resources_required([('model','parent_model_id','read'), ('model','child_model_id','read')])
 def compare_model_versions(parent_model_id, child_model_id):
     """比较父子模型指标；缺失值保持 unknown。"""
     try:
@@ -425,7 +448,7 @@ def compare_model_versions(parent_model_id, child_model_id):
         return error(f"模型指标比较失败: {str(exc)}")
 
 @model_bp.route('/<model_id>/unpublish', methods=['POST'])
-@admin_required
+@resource_required('model', 'model_id', 'publish')
 def unpublish_model(model_id):
     """取消发布模型"""
     try:
@@ -454,7 +477,7 @@ def unpublish_model(model_id):
         return error(f"取消发布模型失败: {str(e)}")
 
 @model_bp.route('/base-models', methods=['GET'])
-@admin_required
+@token_required
 def list_base_models():
     """获取可用的基础模型列表"""
     try:

@@ -79,6 +79,26 @@ def get_project(actor: ActorContext, project_id: str) -> Dict[str, Any]:
     return _project_view(row)
 
 
+def find_project(project_id: str) -> Optional[Dict[str, Any]]:
+    """不做归属过滤地读项目行，供权限桥判断项目策略时使用。"""
+    if not project_id:
+        return None
+    conn = connect()
+    try:
+        row = query_one(conn, "SELECT * FROM agent_project WHERE id = ?", (project_id,))
+    finally:
+        conn.close()
+    return _project_view(row) if row else None
+
+
+def project_access_policy(project: Dict[str, Any]) -> str:
+    """项目可见性：系统默认资源项目对登录用户只读，其余项目私有。"""
+    origin = str(project.get("origin") or ORIGIN_USER)
+    if origin == ORIGIN_SYSTEM:
+        return POLICY_SHARED_READONLY
+    return POLICY_PRIVATE
+
+
 def list_projects(actor: ActorContext) -> List[Dict[str, Any]]:
     conn = connect()
     try:
@@ -192,7 +212,16 @@ def register_resource(
     metadata: Optional[Dict[str, Any]] = None,
     owner_id: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """登记业务资源归属。第三人新建数据集/模型/记录后必须调用本函数。"""
+    """登记业务资源归属。第三人新建数据集/模型/记录后必须调用本函数。
+
+    调用约定（INT-03）：
+
+    * 本函数是**服务端内部接口**，不接受把请求体原样透传；``source_table`` /
+      ``source_id`` 只能由已授权的业务服务传入（HTTP 边界的拦截在
+      :mod:`agent.routes` 的登记端点里）；
+    * 命中"已存在的来源"时先做可见性判断再返回，不能借幂等返回把别人的索引
+      元数据（项目、名称、版本）透露出去。
+    """
     project = get_project(actor, project_id)  # 顺带校验项目归属
     target_owner = int(project["owner_id"])
     if owner_id is not None and actor.source != "http":
@@ -207,7 +236,15 @@ def register_resource(
                 (source_table, source_id),
             )
             if existing:
-                return _resource_view(existing)
+                view = _resource_view(existing)
+                try:
+                    require_access(actor, view, "read")
+                except AgentError:
+                    # 别人已登记的同源资源对当前账号等同于不存在
+                    raise AgentError(
+                        Code.RESOURCE_NOT_FOUND, "引用的资源不存在", http_status=404
+                    ) from None
+                return view
         resource_id = new_id("res")
         stamp = now()
         conn.execute(

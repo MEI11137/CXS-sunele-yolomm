@@ -29,7 +29,6 @@ class AgentReviewBoundaries(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
 
-    @unittest.expectedFailure
     def test_same_source_must_not_disclose_another_users_private_resource(self):
         f = self.fixture
         private = permissions.register_resource(
@@ -49,7 +48,6 @@ class AgentReviewBoundaries(unittest.TestCase):
         )
         self.assertIn(response.status_code, (403, 404))
 
-    @unittest.expectedFailure
     def test_http_must_not_bind_an_unverified_business_source(self):
         f = self.fixture
         client, token = f._client()

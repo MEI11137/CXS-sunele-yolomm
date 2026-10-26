@@ -204,3 +204,62 @@ def migrate_legacy_resources() -> Dict[str, int]:
     finally:
         conn.close()
     return result
+
+
+def system_default_manifest() -> Dict[str, Any]:
+    """核对"对登录用户只读开放"的资源清单（INT-03 第 8 条）。
+
+    只输出可核实的数字与 ID，不依赖人工记忆：
+
+    * ``shared``：当前以共享只读登记的默认资源；
+    * ``missing``：索引里有、业务表里已经没有的悬空条目；
+    * ``unregistered``：业务表里有、索引里没有的行数（这些资源**不公开**）。
+    """
+    tables = {
+        "dataset": "datasets",
+        "model": "models",
+        "detection_record": "detection_records",
+        "draft": "dataset_drafts",
+    }
+    conn = connect()
+    try:
+        rows = query_all(
+            conn,
+            "SELECT kind, source_table, source_id, owner_id FROM agent_resource "
+            "WHERE access_policy = ? ORDER BY kind, source_id",
+            (POLICY_SHARED_READONLY,),
+        )
+        shared = [dict(row) for row in rows]
+
+        missing: List[Dict[str, Any]] = []
+        for entry in shared:
+            table = entry.get("source_table")
+            if not table or not _table_exists(conn, str(table)):
+                missing.append(entry)
+                continue
+            found = query_one(
+                conn, 'SELECT id FROM "%s" WHERE id = ?' % table, (entry["source_id"],)
+            )
+            if not found:
+                missing.append(entry)
+
+        registered = {
+            (str(row["source_table"]), str(row["source_id"]))
+            for row in query_all(
+                conn,
+                "SELECT source_table, source_id FROM agent_resource "
+                "WHERE source_id IS NOT NULL",
+            )
+        }
+        unregistered: Dict[str, int] = {}
+        for kind, table in tables.items():
+            if not _table_exists(conn, table):
+                continue
+            count = 0
+            for row in query_all(conn, 'SELECT id FROM "%s"' % table):
+                if (table, str(row["id"])) not in registered:
+                    count += 1
+            unregistered[kind] = count
+        return {"shared": shared, "missing": missing, "unregistered": unregistered}
+    finally:
+        conn.close()

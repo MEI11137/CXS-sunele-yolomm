@@ -411,7 +411,26 @@ class BusinessBackendBridge:
                 raise translated from exc
             raise
 
-        return self._to_result(raw, spec)
+        result = self._to_result(raw, spec)
+        # 业务成功后再登记真实归属：失败只留痕，绝不重跑或重造业务对象。
+        if result.status in ("succeeded", "completed", "partial"):
+            from agent import resources
+
+            project_hint = getattr(context, "project_id", None)
+            stats = resources.register_refs(
+                principal,
+                result.business_refs,
+                project_id=project_hint,
+                state_changed=str(spec.risk or "read") != "read",
+            )
+            if stats.get("failed"):
+                LOGGER.warning(
+                    "resource_registration_failed tool=%s principal=%s failed=%s",
+                    business_name,
+                    principal,
+                    stats["failed"],
+                )
+        return result
 
     def _to_result(self, raw: Any, spec: ToolSpec) -> OperationResult:
         if not isinstance(raw, dict):

@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # 旧库补列清单：表 -> {列名: 列定义}。只有加法，可重复执行。
 _COLUMN_MIGRATIONS: Dict[str, Dict[str, str]] = {
@@ -354,6 +354,26 @@ _SCHEMA_STATEMENTS = [
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_tool_grant "
     "ON agent_tool_grant(user_id, server_id, tool_name) "
     "WHERE revoked_at IS NULL",
+    # INT-03：业务写入成功但归属登记失败时留痕，便于核实与重试。
+    # 不能因为登记失败就把业务成果丢掉，也不能假装登记成功。
+    """
+    CREATE TABLE IF NOT EXISTS agent_registration_failure (
+        id TEXT PRIMARY KEY,
+        source_table TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        kind TEXT,
+        principal INTEGER,
+        project_id TEXT,
+        error TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        resolved_at TEXT
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_registration_pending "
+    "ON agent_registration_failure(source_table, source_id) "
+    "WHERE resolved_at IS NULL",
 ]
 
 

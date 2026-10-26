@@ -9,31 +9,23 @@ C 的业务工具层要求注入两个回调：
 资源 kind 命名都不一样。本模块做显式映射，**不做参数顺序交换**，也不给未知动作
 兜底放行：任何没在表里声明的动作都按拒绝处理。
 
-本模块只负责"能不能做"的判断，不负责登记业务资源本身；新数据集/模型/记录/草稿
-的归属登记与版本递增属于 INT-03。
+本模块只负责"能不能做"的判断；真实归属登记、版本递增与登记失败留痕在
+:mod:`agent.resources`（INT-03），解析时遇到尚未登记的业务行会按业务行的
+真实归属补登记一次，不采信调用方声明的归属。
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, Iterator, Optional
 
-from agent import permissions
+from agent import permissions, resources
 from agent.errors import AgentError, Code
 from agent.identity import ActorContext, load_actor
 
 # C 的 kind → B 索引里的 source_table。``record`` 与 ``detection_record`` 是同一个
-# 业务对象的两种叫法，统一映射到 detection_records。
-KIND_TO_SOURCE_TABLE: Dict[str, str] = {
-    "dataset": "datasets",
-    "model": "models",
-    "record": "detection_records",
-    "detection_record": "detection_records",
-    "draft": "dataset_drafts",
-    "document": "documents",
-    "file": "file_assets",
-    "directory": "authorized_directories",
-    "mcp_connection": "mcp_connections",
-}
+# 业务对象的两种叫法，统一映射到 detection_records。映射表放在 resources 里，
+# 让"登记"和"解析"用的是同一份定义。
+KIND_TO_SOURCE_TABLE: Dict[str, str] = dict(resources.SOURCE_TABLE_BY_KIND)
 
 # C 的动作 → B 的读/写语义。B 只认 read/list/query 与
 # write/update/execute/publish/train/delete，这里显式翻译。
@@ -48,7 +40,10 @@ ACTION_TO_B_OPERATION: Dict[str, str] = {
     "directory:read": "read",
     "dataset:create": "write",
     "dataset:update": "write",
+    "dataset:delete": "write",
     "model:create": "write",
+    "model:update": "write",
+    "model:delete": "write",
     "model:publish": "publish",
     "draft:create": "write",
     "draft:update": "write",
@@ -57,6 +52,11 @@ ACTION_TO_B_OPERATION: Dict[str, str] = {
     "detection:review": "write",
     "training:create": "train",
     "document:create": "write",
+    "document:update": "write",
+    "file:create": "write",
+    "file:update": "write",
+    "file:delete": "write",
+    "directory:manage": "write",
     "mcp:manage": "write",
     "mcp:execute": "execute",
 }
@@ -77,6 +77,18 @@ ACCOUNT_LEVEL_ACTIONS = {"tool:list"} | {
 # 需要全局权限的动作。普通用户发布自己的模型不应依赖它（INT-05 会移除该依赖），
 # 在这里先按真实语义只给管理员。
 ADMIN_ONLY_ACTIONS = {"model:publish-global"}
+
+# 文件动作 → 读/写语义。C 的 FileAccess 用 "file:create"/"file:read" 调这里，
+# 未列出的动作按写处理（更严格）。
+_FILE_ACTIONS: Dict[str, str] = {
+    "file:read": "read",
+    "file:preview": "read",
+    "file:download": "read",
+    "file:list": "read",
+    "file:create": "write",
+    "file:update": "write",
+    "file:delete": "write",
+}
 
 
 def _snapshot_owner(snapshot: Any) -> int:
@@ -204,6 +216,12 @@ class AgentPolicyBridge:
 
         row = self._index_row(table, resource_id)
         if row is None:
+            # 业务已写入但还没登记（历史数据或刚创建）：按业务行的真实归属补登记。
+            # 归属推不出来就不登记，也不放行。
+            if resources.ensure_kind(kind, resource_id) is None:
+                return None
+            row = self._index_row(table, resource_id)
+        if row is None:
             return None
         owner_id = int(row["owner_id"])
         policy = row.get("access_policy") or permissions.POLICY_PRIVATE
@@ -234,9 +252,14 @@ class AgentPolicyBridge:
     # ------------------------------------------------------- C 的文件访问策略
 
     def project_file_access(self, user_id: int, project_id: str, action: str) -> bool:
-        """``app.config['PROJECT_FILE_ACCESS']`` 的实现：文件上传/预览/下载共用。
+        """``app.config['PROJECT_FILE_ACCESS']`` 的实现：上传/预览/下载共用同一策略。
 
-        只允许项目归属人操作；共享只读项目只放行读动作。
+        规则与资源索引一致，不再"只有管理员能传文件"：
+
+        * 项目归属人：读写都允许；
+        * 系统默认资源项目（``origin=system``）：登录用户只读，不能写入；
+        * 管理员：用于维护历史资源；
+        * 其他：拒绝。
         """
         if not project_id:
             return False
@@ -244,12 +267,18 @@ class AgentPolicyBridge:
             actor = load_actor(int(user_id))
         except Exception:  # noqa: BLE001 - 未登录或停用账号一律拒绝
             return False
-        try:
-            project = permissions.get_project(actor, project_id)
-        except AgentError:
+
+        project = permissions.find_project(project_id)
+        if project is None:
             return False
+
+        operation = _FILE_ACTIONS.get(str(action or "").lower(), "write")
         if int(project["owner_id"]) == actor.user_id:
             return True
+        if actor.is_admin:
+            return True
+        if permissions.project_access_policy(project) == permissions.POLICY_SHARED_READONLY:
+            return operation == "read"
         return False
 
     # ------------------------------------------------------------- 装配报告用

@@ -264,13 +264,20 @@ def register_resource(project_id: str) -> Response:
     metadata = body.get("metadata")
     if metadata is not None and not isinstance(metadata, dict):
         raise AgentError(Code.VALIDATION, "metadata 必须是 JSON 对象")
+    if body.get("source_table") or body.get("source_id"):
+        # 业务来源只能由服务端在业务成功后登记，客户端不能自己认领别人的业务行
+        raise AgentError(
+            Code.FORBIDDEN,
+            "业务来源由服务端登记，请求不能自报 source_table/source_id",
+            http_status=403,
+        )
     resource = permissions.register_resource(
         actor,
         project_id=project_id,
         kind=_str_field(body, "kind", max_chars=40),
         display_name=_str_field(body, "display_name", max_chars=200),
-        source_table=_str_field(body, "source_table", required=False) or None,
-        source_id=_str_field(body, "source_id", required=False) or None,
+        source_table=None,
+        source_id=None,
         access_policy=_str_field(
             body, "access_policy", required=False, default="private"
         ),
