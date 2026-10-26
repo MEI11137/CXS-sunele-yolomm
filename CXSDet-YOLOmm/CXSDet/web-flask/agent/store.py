@@ -18,7 +18,12 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# 旧库补列清单：表 -> {列名: 列定义}。只有加法，可重复执行。
+_COLUMN_MIGRATIONS: Dict[str, Dict[str, str]] = {
+    "agent_action": {"prepared_id": "TEXT"},
+}
 
 _PREPARED_PATHS: set = set()
 
@@ -279,6 +284,9 @@ _SCHEMA_STATEMENTS = [
         result_json TEXT,
         error_code TEXT,
         execution_state TEXT NOT NULL DEFAULT 'not_executed',
+        -- 业务侧预备记录 ID（C 的 operation_id@prepared）；确认后执行必须复用它，
+        -- 与执行产出 operation_id 是两个不同 ID，不能混用。
+        prepared_id TEXT,
         operation_id TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -356,8 +364,23 @@ def ensure_schema(conn: sqlite3.Connection, path: Optional[str] = None) -> None:
         return
     for statement in _SCHEMA_STATEMENTS:
         conn.execute(statement)
+    _apply_column_migrations(conn)
     conn.commit()
     _PREPARED_PATHS.add(key)
+
+
+def _apply_column_migrations(conn: sqlite3.Connection) -> None:
+    """给已存在的旧表补列：``CREATE TABLE IF NOT EXISTS`` 不会新增列。
+
+    只做加法（ADD COLUMN），不改类型、不删列，可重复执行。
+    """
+    for table, columns in _COLUMN_MIGRATIONS.items():
+        existing = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(%s)" % table)
+        }
+        for name, ddl in columns.items():
+            if name not in existing:
+                conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, name, ddl))
 
 
 def reset_schema_cache() -> None:

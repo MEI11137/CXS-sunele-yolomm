@@ -42,6 +42,10 @@ class Code:
     ACTION_REQUEST_KEY_CONFLICT = "AGENT_ACTION_REQUEST_KEY_CONFLICT"
     ACTION_TARGET_CHANGED = "AGENT_ACTION_TARGET_CHANGED"
 
+    # 业务预检未通过：不得生成"确认后即可执行"的动作
+    PREPARE_BLOCKED = "AGENT_PREPARE_BLOCKED"
+    PREPARE_FAILED = "AGENT_PREPARE_FAILED"
+
     PLAN_NOT_CONFIRMED = "AGENT_PLAN_NOT_CONFIRMED"
     PLAN_REQUIRED_FOR_MULTI_WRITE = "AGENT_PLAN_REQUIRED_FOR_MULTI_WRITE"
 
@@ -74,6 +78,8 @@ DEFAULT_MESSAGES: Dict[str, str] = {
     Code.TOOL_UNKNOWN: "模型请求了不存在的工具",
     Code.TOOL_ARGS_INVALID: "工具参数不符合约定结构",
     Code.ACTION_STALE: "该确认已失效，请按最新目标重新确认",
+    Code.PREPARE_BLOCKED: "业务预检未通过，该操作不能执行",
+    Code.PREPARE_FAILED: "业务预检失败，未生成可确认的操作",
     Code.PLAN_NOT_CONFIRMED: "该任务需要先确认整体计划",
     Code.EXECUTION_UNKNOWN: "执行结果未能核实",
 }

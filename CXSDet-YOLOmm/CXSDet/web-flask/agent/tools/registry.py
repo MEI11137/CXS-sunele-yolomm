@@ -193,7 +193,8 @@ def get_registry() -> ToolRegistry:
 
     registry = ToolRegistry()
     if backend is not None:
-        registry.add_provider(business.BusinessToolProvider(backend), SOURCE_BUSINESS)
+        # 本仓库业务适配层走桥接（INT-02），旧式适配层保持原样
+        registry.add_provider(business.build_provider(backend), SOURCE_BUSINESS)
     if allow_stub:
         registry.add_provider(stub.StubToolProvider(), SOURCE_STUB)
     _registry = registry

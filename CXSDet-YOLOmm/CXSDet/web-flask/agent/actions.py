@@ -77,7 +77,13 @@ def create_action(
     target_projects: Optional[List[str]] = None,
     resource_revisions: Optional[Dict[str, Any]] = None,
     revision: int = 1,
+    prepared_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """创建确认卡。
+
+    ``prepared_id`` 是业务侧（C）在 prepare 阶段生成的预备记录 ID。确认后
+    执行必须复用它，不能重新预备一份不同预览；这里随动作一起持久化。
+    """
     task = task_store.get_task(actor, task_id)
     revisions = resource_revisions or {}
     request_key = build_request_key(
@@ -109,8 +115,8 @@ def create_action(
             "(id, task_id, session_id, project_id, owner_id, tool_name, tool_version, "
             " parameters_json, parameters_summary, preview_json, target_projects_json, "
             " resource_revisions_json, status, revision, request_key, execution_state, "
-            " created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " prepared_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 action_id,
                 task_id,
@@ -128,6 +134,7 @@ def create_action(
                 revision,
                 request_key,
                 ExecutionState.NOT_EXECUTED,
+                prepared_id,
                 stamp,
                 stamp,
             ),
@@ -448,6 +455,7 @@ def _action_view(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "result": loads(row.get("result_json")),
         "error_code": row.get("error_code"),
         "execution_state": row["execution_state"],
+        "prepared_id": row.get("prepared_id"),
         "operation_id": row.get("operation_id"),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],

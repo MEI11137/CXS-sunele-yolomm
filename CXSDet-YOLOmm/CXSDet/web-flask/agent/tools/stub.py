@@ -217,6 +217,7 @@ class StubToolProvider:
         *,
         request_key: str,
         context,
+        prepared_id: Optional[str] = None,
     ) -> OperationResult:
         if request_key in _OPERATIONS:
             cached = _OPERATIONS[request_key]

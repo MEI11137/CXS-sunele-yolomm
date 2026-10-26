@@ -21,6 +21,11 @@ SOURCE_MCP = "mcp"
 SOURCE_STUB = "stub"
 SOURCE_CONTROL = "control"
 
+# 取消范围：业务侧只允许取消"尚未执行"的预备记录
+CANCEL_SCOPE_NONE = ""
+CANCEL_SCOPE_PREPARED = "prepared_only"
+CANCEL_SCOPE_RUNNING = "running"
+
 # 模型不得自行提供的参数：身份、授权、审批标记一律由程序生成
 RESERVED_ARGUMENTS = {
     "approved",
@@ -60,6 +65,9 @@ class ToolSpec:
     supports_preview: bool = False
     supports_status: bool = True
     supports_cancel: bool = False
+    # 取消范围元数据。``prepared_only`` 只表示"预备了还没执行"可以撤回，
+    # 不能当作"运行中也能取消"。
+    cancel_scope: str = CANCEL_SCOPE_NONE
 
     @property
     def readonly(self) -> bool:
@@ -102,6 +110,7 @@ class ToolSpec:
             "supports_preview": self.supports_preview,
             "supports_status": self.supports_status,
             "supports_cancel": self.supports_cancel,
+            "cancel_scope": self.cancel_scope,
         }
 
 
@@ -194,7 +203,14 @@ def validate_arguments(spec: ToolSpec, arguments: Dict[str, Any]) -> Dict[str, A
 
 
 class ToolProvider:
-    """第三人适配层需要实现的接口（鸭子类型即可，不强制继承）。"""
+    """第三人适配层需要实现的接口（鸭子类型即可，不强制继承）。
+
+    ``prepare`` 返回的字典约定：
+
+    * ``preview``：给用户看的影响范围；
+    * ``prepared_id``：业务侧预备记录 ID（有就必须返回），确认后执行复用它，
+      不允许在执行时重新预备一份不同的预览。
+    """
 
     def list_tools(self, actor) -> List[ToolSpec]:  # pragma: no cover - 接口声明
         raise NotImplementedError
@@ -210,6 +226,7 @@ class ToolProvider:
         *,
         request_key: str,
         context,
+        prepared_id: Optional[str] = None,
     ) -> OperationResult:  # pragma: no cover - 接口声明
         raise NotImplementedError
 

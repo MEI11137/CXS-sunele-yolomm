@@ -252,6 +252,8 @@ class AgentRuntime:
                 action["parameters"],
                 action_id=action["id"],
                 request_key=action["request_key"],
+                # 执行必须复用确认卡绑定的那条业务预备记录
+                prepared_id=action.get("prepared_id"),
             )
         except AgentError as exc:
             actions.mark_result(
@@ -295,6 +297,7 @@ class AgentRuntime:
         self, actor: ActorContext, action_id: str, reason: str = ""
     ) -> Dict[str, Any]:
         action = actions.reject(actor, action_id, reason)
+        self._release_prepared(actor, action)
         task = task_store.get_task(actor, action["task_id"])
         session_store.append_message(
             task["session_id"],
@@ -315,7 +318,11 @@ class AgentRuntime:
         self, actor: ActorContext, task_id: str, reason: str = "用户要求停止"
     ) -> Dict[str, Any]:
         task = task_store.get_task(actor, task_id)
+        pending_actions = actions.list_actions(task_id, [actions.STATUS_PENDING])
         superseded = actions.supersede_pending(task_id, reason)
+        for pending in pending_actions:
+            # 作废的确认卡不再执行，顺带撤销业务侧预备记录
+            self._release_prepared(actor, pending)
         cancel_notes: List[str] = []
         for pending_action in actions.list_executing(task_id):
             spec, provider, source = self.registry.resolve(pending_action["tool_name"], actor)
@@ -558,12 +565,21 @@ class AgentRuntime:
         )
         if need_confirm:
             preview: Dict[str, Any] = {}
+            prepared_id: Optional[str] = None
             if spec.supports_preview and provider is not None:
                 try:
-                    prepared = provider.prepare(actor, spec, arguments, None)
-                    preview = prepared.get("preview", prepared) if prepared else {}
+                    prepared = provider.prepare(actor, spec, arguments, None) or {}
                 except AgentError as exc:
-                    preview = {"preview_error": exc.message}
+                    # 预检失败或被业务拦截：不能生成"确认后即可执行"的动作
+                    self._feedback_tool_error(
+                        session, task, spec, exc.message, code=exc.code
+                    )
+                    return None
+                preview = prepared.get("preview") or {}
+                prepared_id = prepared.get("prepared_id")
+                if prepared_id:
+                    # 预备记录 ID 随确认卡落库，确认后复用它执行
+                    preview.setdefault("prepared_id", prepared_id)
             if unverified:
                 preview.setdefault("unverified_refs", unverified)
             action = actions.create_action(
@@ -576,6 +592,7 @@ class AgentRuntime:
                 preview=preview,
                 target_projects=[project["id"]],
                 resource_revisions=revisions,
+                prepared_id=prepared_id,
             )
             task = task_store.get_task_by_id(task["id"])
             return {
@@ -620,6 +637,7 @@ class AgentRuntime:
         *,
         action_id: Optional[str] = None,
         request_key: Optional[str] = None,
+        prepared_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         if provider is None:
             raise AgentError(
@@ -652,8 +670,11 @@ class AgentRuntime:
                     actor,
                     spec,
                     arguments,
-                    request_key=key if attempt == 0 else f"{key}_{attempt}",
+                    # 同一个用户动作始终保持同一个 request_key：
+                    # 业务侧靠它做幂等，改键重发等于绕过防重。
+                    request_key=key,
                     context=tool_context,
+                    prepared_id=prepared_id,
                 )
                 break
             except AgentError as exc:
@@ -829,6 +850,25 @@ class AgentRuntime:
             return actions.STATUS_UNKNOWN
         return actions.STATUS_FAILED
 
+    def _release_prepared(self, actor: ActorContext, action: Dict[str, Any]) -> None:
+        """确认卡被拒绝/作废后，撤销业务侧那条预备记录。
+
+        只有业务侧确实预备过（``prepared_id`` 非空）才需要清理；清理失败不影响
+        用户已经做出的决定，也不改变动作状态。
+        """
+        prepared_id = (action or {}).get("prepared_id")
+        if not prepared_id:
+            return
+        try:
+            _spec, provider, _source = self.registry.resolve(
+                action.get("tool_name") or "", actor
+            )
+        except AgentError:
+            return
+        release = getattr(provider, "release_prepared", None)
+        if callable(release):
+            release(actor, prepared_id)
+
     # ------------------------------------------------------------------ #
     # 门禁与辅助
     # ------------------------------------------------------------------ #
@@ -901,11 +941,13 @@ class AgentRuntime:
         task: Dict[str, Any],
         spec: ToolSpec,
         message: str,
+        *,
+        code: str = Code.PLAN_REQUIRED_FOR_MULTI_WRITE,
     ) -> None:
         """把程序侧的拒绝理由作为工具错误写回对话，模型据此调整。"""
         payload = {
             "status": "failed",
-            "error": {"code": Code.PLAN_REQUIRED_FOR_MULTI_WRITE, "message": message},
+            "error": {"code": code, "message": message},
             "execution_state": ExecutionState.NOT_EXECUTED,
         }
         session_store.append_message(
@@ -921,7 +963,7 @@ class AgentRuntime:
             task_store.EVENT_TOOL_ERROR,
             {
                 "tool": spec.name,
-                "code": Code.PLAN_REQUIRED_FOR_MULTI_WRITE,
+                "code": code,
                 "message": message,
                 "execution_state": ExecutionState.NOT_EXECUTED,
             },

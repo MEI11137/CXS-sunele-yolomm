@@ -74,6 +74,41 @@ def _require_backend() -> Any:
     return _backend
 
 
+def uses_principal_contract(backend: Any) -> bool:
+    """判断后端是本仓库业务适配层（``list_tools(principal)``）还是旧式适配层。
+
+    这里按签名显式区分，不用"捕获 TypeError 再换一种调法"的兜底——那样会把
+    真实内部异常也吞掉。签名不匹配就是契约不匹配，必须明确走哪条路。
+    """
+    import inspect
+
+    handler = getattr(backend, "list_tools", None)
+    if not callable(handler):
+        return False
+    try:
+        params = list(inspect.signature(handler).parameters.values())
+    except (TypeError, ValueError):  # 内建/无签名可查：按旧式处理
+        return False
+    positional = [
+        p
+        for p in params
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                      inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    return bool(positional) and positional[0].name == "principal"
+
+
+def build_provider(backend: Any) -> Optional[Any]:
+    """按后端契约返回对应 provider；``None`` 表示没有业务后端。"""
+    if backend is None:
+        return None
+    if uses_principal_contract(backend):
+        from agent.business_bridge import BusinessBackendBridge
+
+        return BusinessBackendBridge(backend)
+    return BusinessToolProvider(backend)
+
+
 def _as_result(raw: Any) -> OperationResult:
     if isinstance(raw, OperationResult):
         return raw
@@ -109,6 +144,7 @@ class BusinessToolProvider:
         *,
         request_key: str,
         context,
+        prepared_id: Optional[str] = None,
     ) -> OperationResult:
         backend = _require_backend()
         handler = getattr(backend, "execute_tool", None)
@@ -118,13 +154,17 @@ class BusinessToolProvider:
                 "业务工具缺少执行接口，无法执行该动作",
                 http_status=409,
             )
-        raw = handler(
-            actor=actor,
-            spec=spec,
-            arguments=arguments,
-            request_key=request_key,
-            context=context,
-        )
+        kwargs: Dict[str, Any] = {
+            "actor": actor,
+            "spec": spec,
+            "arguments": arguments,
+            "request_key": request_key,
+            "context": context,
+        }
+        if prepared_id is not None:
+            # 只有业务侧确实预备过才传，避免给旧适配层塞它不认识的关键字
+            kwargs["prepared_id"] = prepared_id
+        raw = handler(**kwargs)
         return _as_result(raw)
 
     def get_operation(self, actor, operation_id: str) -> OperationResult:
