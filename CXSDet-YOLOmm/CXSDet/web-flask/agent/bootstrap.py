@@ -84,6 +84,25 @@ def _model_scope_resolver(model_id: str) -> list:
     return resources.model_scope_ids(model_id)
 
 
+def _personal_review_factory(principal_getter=None):
+    """零参数复核客户端工厂：本人连接 + 视觉能力校验，不做全局回退。"""
+
+    def factory():
+        from agent.errors import AgentError, Code
+        from agent.identity import load_actor
+        from services.personal_review_client import create_personal_review_client
+
+        principal = principal_getter() if principal_getter else _current_principal()
+        if not principal:
+            raise AgentError(
+                Code.UNAUTHENTICATED,
+                "无法确定当前用户，不能使用本人模型连接做复核",
+            )
+        return create_personal_review_client(load_actor(int(principal)))
+
+    return factory
+
+
 def _personal_model_client_factory(principal_getter=None):
     """零参数工厂：每次调用都按当前用户构造客户端，不持有共享 Key。"""
 
@@ -178,6 +197,9 @@ def configure_business_backend(app, *, overrides: Optional[Dict[str, Any]] = Non
             storage_client=storage,
             model_client_factory=overrides.get("model_client_factory")
             or _personal_model_client_factory(),
+            # 复核走同一份本人连接，但先过视觉能力校验（认证成功≠能看图）
+            review_client_factory=overrides.get("review_client_factory")
+            or _personal_review_factory(),
             detector_loader=overrides.get("detector_loader"),
             notify=overrides.get("notify") or notifier,
             work_dir=work_dir,

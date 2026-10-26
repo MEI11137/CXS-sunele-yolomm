@@ -192,6 +192,7 @@ class BusinessToolAdapter:
         file_assets=None,
         storage_client=None,
         model_client_factory: Callable | None = None,
+        review_client_factory: Callable | None = None,
         detector_loader: Callable | None = None,
         detector_predictor: Callable | None = None,
         notify: Callable | None = None,
@@ -217,6 +218,9 @@ class BusinessToolAdapter:
         # The current user's own model client; supplied per call by the
         # workspace so no shared key is ever held here.
         self.model_client_factory = model_client_factory
+        # 复核专用：零参数工厂，返回实现了 ``review_detection_structured`` 的客户端。
+        # 由装配层按当前用户注入（含视觉能力校验）；未注入时退回 model_client_factory。
+        self.review_client_factory = review_client_factory
         self.detector_loader = detector_loader
         # Inference entry point; injected by tests or by a deployment that wraps
         # the runtime differently.
@@ -287,7 +291,9 @@ class BusinessToolAdapter:
 
     def _dependency_error(self, tool_name: str) -> str | None:
         spec = self._spec(tool_name)
-        if tool_name == "review.ai" and not callable(self.model_client_factory):
+        if tool_name == "review.ai" and not (
+            callable(self.review_client_factory) or callable(self.model_client_factory)
+        ):
             return "review.ai requires the current user's personal model client"
         for attribute, message in spec.deps:
             value = getattr(self, attribute, None)
@@ -403,7 +409,7 @@ class BusinessToolAdapter:
             raise FileNotFoundError("Model is not registered")
         return dict(row)
 
-    def _model_scope(self, principal: int, model_id: str) -> list[str]:
+    def _authorised_model_scope(self, principal: int, model_id: str) -> list[str]:
         """发布/归档的合法范围。
 
         ``model_scope_resolver`` 由装配层注入（按真实 owner + project 计算）。
@@ -432,13 +438,10 @@ class BusinessToolAdapter:
         from services.model_registry_service import ModelPublishConflict, publish_model
 
         # 每次执行都重新核一遍授权；确认时的范围只能缩小，不能被参数扩大
-        authorized = self._model_scope(principal, model_id)
+        scope = set(self._authorised_model_scope(principal, model_id))
         if scope_model_ids:
-            scope = sorted(set(str(item) for item in scope_model_ids) & set(authorized))
-            scope.append(str(model_id))
-            scope = sorted(set(scope))
-        else:
-            scope = authorized
+            scope &= {str(item) for item in scope_model_ids}
+        scope = sorted(scope)
         try:
             result = publish_model(
                 model_id, principal, _DatabaseHandle(self.database_path), self.storage_exists,

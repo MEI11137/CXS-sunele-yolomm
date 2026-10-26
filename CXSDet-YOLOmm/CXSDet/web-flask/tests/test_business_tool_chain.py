@@ -289,7 +289,7 @@ def test_ai_review_is_one_paid_call_per_record_with_per_item_results(fixture):
         def __init__(self):
             self.calls = 0
 
-        def review_detection_structured(self, image_bytes, detections):
+        def review_detection_structured(self, image_bytes, detections, **kwargs):
             self.calls += 1
             return {"decision": "needs_human_review", "summary": "存在疑点",
                     "suspicions": [{"bbox": [0.1, 0.1, 0.2, 0.2], "reason": "边缘模糊"}]}

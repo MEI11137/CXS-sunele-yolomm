@@ -561,7 +561,7 @@ def _preview_model_publish(adapter, principal: int, model_id: str) -> dict:
     if adapter.storage_exists(model["model_bucket"], model["model_object_key"]) is not True:
         raise ToolRefused("MODEL_WEIGHT_MISSING", "文件服务中找不到模型权重")
     # 归档范围只认真实 owner/project 内的模型，并且逐个重新授权
-    scope = adapter._model_scope(principal, model_id)
+    scope = adapter._authorised_model_scope(principal, model_id)
     with adapter.connect() as conn:
         dataset = conn.execute(
             "SELECT dataset_mode, secondary_modality FROM datasets WHERE id=?",
@@ -598,7 +598,7 @@ class ModelUnpublish(BaseHandler):
         model = adapter._model_row(resource.id)
         if model["status"] != 3:
             raise ToolRefused("MODEL_NOT_PUBLISHED", "只能取消发布已发布的模型")
-        scope = adapter._model_scope(principal, resource.id)
+        scope = adapter._authorised_model_scope(principal, resource.id)
         placeholders = ", ".join("?" for _ in scope)
         with adapter.connect() as conn:
             archived = conn.execute(
@@ -620,7 +620,7 @@ class ModelUnpublish(BaseHandler):
 
     def execute(self, adapter, principal, arguments, preview, resource):
         # 执行前重新核一次归档范围授权：默认共享模型（owner 为系统）不可被普通用户撤销
-        adapter._model_scope(principal, resource.id)
+        adapter._authorised_model_scope(principal, resource.id)
         with adapter.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             current = conn.execute(
@@ -710,18 +710,12 @@ class DetectionRun(BaseHandler):
         模型归属不参与这里的判断：跨项目只读引用模型是允许的，检测结果只落在
         用户能写的那个项目里。
         """
-        output_project_id = str(arguments.get("output_project_id") or "").strip()
-        spec = _spec("detection.run")
-        if not output_project_id:
-            return adapter._project_resource(principal, asset["project_id"], spec), "asset_project"
-        if output_project_id == asset["project_id"]:
-            return adapter._project_resource(principal, output_project_id, spec), "explicit"
-        # 显式指定了另一个项目：必须能写（detection:create），否则直接拒绝
-        return adapter._project_resource(principal, output_project_id, spec), "explicit"
+        explicit = str(arguments.get("output_project_id") or "").strip()
+        project_id = explicit or asset["project_id"]
+        resource = adapter._project_resource(principal, project_id, _spec("detection.run"))
+        return resource, "explicit" if explicit else "asset_project"
 
     def prepare(self, adapter, principal, arguments):
-        from services.detection_service import resolve_inference_inputs  # noqa: F401
-
         asset = _asset(adapter, principal, arguments["asset_id"], {"image"})
         resource, output_origin = self._output_resource(adapter, principal, arguments, asset)
         # 模型只要通过授权解析即可使用：默认只读模型、以及本人显式引用的
@@ -895,7 +889,8 @@ def _json_obj(value) -> dict | None:
 @handler("review.ai")
 class ReviewAI(BaseHandler):
     def prepare(self, adapter, principal, arguments):
-        if not callable(adapter.model_client_factory):
+        if not (callable(adapter.review_client_factory)
+                or callable(adapter.model_client_factory)):
             raise ValueError("review.ai requires the current user's personal model client")
         record_ids = [str(value).strip() for value in arguments["record_ids"]]
         snapshots = _records(adapter, principal, record_ids)
@@ -943,6 +938,19 @@ class ReviewAI(BaseHandler):
         record_ids = [snapshot.id for snapshot in snapshots]
         # Authorization already happened per record through the policy service,
         # so the batch runner must not re-apply the page's owner-only rule.
+        from services.personal_review_client import PersonalReviewClient
+
+        def client_factory():
+            # 零参数闭包：优先用装配层注入的本人复核客户端（含视觉能力校验），
+            # 退路是用本人网关现包一层——两者都只持有当前用户那份凭据。
+            if callable(adapter.review_client_factory):
+                return adapter.review_client_factory()
+            client = adapter.model_client_factory()
+            # 注入的也可能是已经实现复核协议的客户端：不要二次包装
+            if hasattr(client, "review_detection_structured"):
+                return client
+            return PersonalReviewClient(client)
+
         summary = run_batch_ai_reviews(
             record_ids=record_ids,
             user_id=principal,
@@ -950,12 +958,20 @@ class ReviewAI(BaseHandler):
             database=adapter.database(),
             storage_client=adapter.storage_client,
             review_runner=review_detection,
-            client_factory=adapter.model_client_factory,
+            client_factory=client_factory,
         )
+        failed = int(summary.get("failed", 0))
+        succeeded = int(summary.get("succeeded", 0))
         outputs = {
             "requested": summary.get("requested", len(record_ids)),
-            "succeeded": summary.get("succeeded", 0),
-            "failed": summary.get("failed", 0),
+            "succeeded": succeeded,
+            "failed": failed,
+            # 外层 Operation 可能整体 succeeded，但逐项失败必须能被看见
+            "status": (
+                "failed" if failed and not succeeded
+                else "partial_failed" if failed
+                else "succeeded"
+            ),
             "items": summary.get("items") or [],
         }
         return outputs, [{"type": "record", "id": snapshot.id,

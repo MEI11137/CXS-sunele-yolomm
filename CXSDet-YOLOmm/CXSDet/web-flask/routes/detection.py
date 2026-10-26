@@ -16,7 +16,14 @@ from utils.security_utils import is_admin
 from config import TEMP_DIR, YOLO_CLASSES_CONFIG
 from services.detection_service import execute_detection
 from services.yolo_runtime import MissingModalityError
-from services.ai_review_service import AIReviewError, check_vl_health, review_detection
+from agent.identity import load_actor
+from services.personal_review_client import create_personal_review_client
+from services.ai_review_service import (
+    AIReviewError,
+    AIReviewInputError,
+    check_vl_health,
+    review_detection,
+)
 from services.review_service import (
     ReviewConflictError,
     ReviewValidationError,
@@ -531,8 +538,12 @@ def review_detection_record(record_id):
         )
         if not record or (record.get('user_id') != g.user_id and not is_admin()):
             return error("识别记录不存在或无权访问", 404)
-        review = review_detection(record_id, LLMVLClient(), db, file_client)
+        review = review_detection(
+            record_id, _personal_review_client(), db, file_client
+        )
         return success(review.to_dict(), "AI辅助复核完成，请人工确认")
+    except AIReviewInputError as exc:
+        return error(exc.public_message, 400), 400
     except AIReviewError as exc:
         return error(exc.public_message, 502), 502
     except Exception as exc:
@@ -552,11 +563,13 @@ def batch_review_detection_records():
             database=db,
             storage_client=file_client,
             review_runner=review_detection,
-            client_factory=LLMVLClient,
+            client_factory=_personal_review_client,
         )
         return success(result, "批量AI辅助复核已完成，请逐条人工确认")
     except BatchValidationError as exc:
         return error(str(exc), 400), 400
+    except AgentError as exc:
+        return error(exc.message, exc.http_status), exc.http_status
     except Exception as exc:
         return error(f"批量AI辅助复核失败: {type(exc).__name__}")
 
@@ -566,9 +579,13 @@ def batch_review_detection_records():
 def llm_health():
     """验证当前用户配置的大模型和模型可见性，不返回凭据。"""
     try:
-        return success(check_vl_health(LLMVLClient()))
+        return success(check_vl_health(_personal_review_client()))
+    except AIReviewInputError as exc:
+        return error(exc.public_message, 400), 400
     except AIReviewError as exc:
         return error(exc.public_message, 502), 502
+    except AgentError as exc:
+        return error(exc.message, exc.http_status), exc.http_status
     except Exception as exc:
         return error(f"大模型连接检查失败: {type(exc).__name__}")
 
@@ -582,6 +599,11 @@ def _record_is_accessible(record_id):
         fetchone=True,
     )
     return bool(record)
+
+
+def _personal_review_client():
+    """每次调用都按**当前用户**构造：不持有共享 Key，也没有全局回退。"""
+    return create_personal_review_client(load_actor(g.user_id))
 
 
 def _publish_review_change(user_id, record_id, result):

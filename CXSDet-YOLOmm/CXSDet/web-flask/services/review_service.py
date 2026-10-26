@@ -34,7 +34,11 @@ class ReviewResult:
         return asdict(self)
 
 
-def _validate_annotations(annotations: Any, class_names: list[str]) -> list[dict[str, Any]]:
+def _validate_annotations(
+    annotations: Any, class_names: list[str] | None
+) -> list[dict[str, Any]]:
+    """校验人工标注。``class_names=None`` 表示**没有真实类别表**（老库/极简库），
+    此时只校验几何与结构，不拿一份默认类别表去猜。"""
     if not isinstance(annotations, list):
         raise ReviewValidationError("annotations 必须是数组")
     normalized: list[dict[str, Any]] = []
@@ -43,10 +47,11 @@ def _validate_annotations(annotations: Any, class_names: list[str]) -> list[dict
             raise ReviewValidationError(f"第 {index + 1} 个标注格式错误")
         class_name = str(item.get("class_name") or "")
         class_id = item.get("class_id", item.get("class"))
-        if class_name not in class_names:
-            raise ReviewValidationError(f"未知类别: {class_name}")
-        if not isinstance(class_id, int) or class_id != class_names.index(class_name):
-            raise ReviewValidationError(f"类别编号与类别名称不匹配: {class_name}")
+        if class_names is not None:
+            if class_name not in class_names:
+                raise ReviewValidationError(f"未知类别: {class_name}")
+            if not isinstance(class_id, int) or class_id != class_names.index(class_name):
+                raise ReviewValidationError(f"类别编号与类别名称不匹配: {class_name}")
         bbox = item.get("bbox")
         if not isinstance(bbox, list) or len(bbox) != 4:
             raise ReviewValidationError("bbox 必须是 [x1, y1, x2, y2]")

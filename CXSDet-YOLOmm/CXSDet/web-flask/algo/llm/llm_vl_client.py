@@ -16,8 +16,22 @@ class LLMResponseError(RuntimeError):
     """Raised when a structured completion cannot safely be consumed."""
 
 
+class LLMNotConfigured(RuntimeError):
+    """本机没有可用的模型地址/密钥；调用前就要提示去配置，而不是发出去等 401。"""
+
+
+# 没有密钥时占位用：SDK 不接受空串，但这里不假装"配置好了"，
+# 真正发请求前由 ``configured`` 拦住（见 health_check）。
+_UNCONFIGURED_KEY = "unconfigured"
+
+
 class LLMVLClient:
-    """多模态大语言模型客户端（用于光伏板缺陷检测图片分析）"""
+    """多模态大语言模型客户端（用于光伏板缺陷检测图片分析）
+
+    注意：这个类的凭据来自本机 ``algo/llm/config.local.json`` 或环境变量，
+    只是**兼容旧调用方**的传输层。页面与 Agent 的复核已改走
+    ``services.personal_review_client``（本人连接），不再依赖这里的 Key。
+    """
 
     def __init__(self, model_name: str = None):
         """
@@ -39,8 +53,9 @@ class LLMVLClient:
             raise ValueError(f"不支持的模型: {requested_model}")
 
         self.config = VL_MODEL_CONFIGS[config_key]
+        self.configured = bool(self.config['api_key'])
         self.client = OpenAI(
-            api_key=self.config['api_key'],
+            api_key=self.config['api_key'] or _UNCONFIGURED_KEY,
             base_url=self.config['api_url']
         )
 
@@ -54,11 +69,21 @@ class LLMVLClient:
         encoded = base64.b64encode(buffered.getvalue()).decode()
         return f"data:image/jpeg;base64,{encoded}"
 
-    def review_detection_structured(self, image_bytes: bytes, detection_results: list) -> str:
+    def review_detection_structured(
+        self,
+        image_bytes: bytes,
+        detection_results: list,
+        *,
+        class_names=None,
+        secondary_image_bytes: bytes = None,
+        secondary_modality: str = None,
+    ) -> str:
         """Ask the configured VLM for a strict, machine-readable second opinion."""
         prompt = f"""
 你是光伏板缺陷检测复核员。请对照图片与YOLO检测框进行第二意见复核。
 YOLO结果：{json.dumps(detection_results or [], ensure_ascii=False)}
+类别表：{json.dumps(list(class_names or []), ensure_ascii=False)}
+{("第二张图是同一位置的" + (secondary_modality or "第二模态") + "配图，请结合两张图判断。") if secondary_image_bytes else "本记录只有RGB一张图。"}
 
 只返回一个JSON对象，不要Markdown，不要额外解释。字段必须为：
 {{
@@ -72,16 +97,19 @@ possible_false_positives中的检测框序号必须使用YOLO结果数组从0开
 possible_missed_detections和attention_regions的bbox必须使用相对原始图片的0到1归一化坐标。
 AI只能给出复核建议，不能声称已修改模型或训练标签。
         """.strip()
+        content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": self._image_data_url(image_bytes)}},
+        ]
+        if secondary_image_bytes:
+            content.append(
+                {"type": "image_url",
+                 "image_url": {"url": self._image_data_url(secondary_image_bytes)}}
+            )
         completion = self.client.chat.completions.create(
             model=self.config['model'],
             response_format={"type": "json_object"},
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": self._image_data_url(image_bytes)}}
-                ]
-            }]
+            messages=[{"role": "user", "content": content}]
         )
         choices = getattr(completion, "choices", None) or []
         if not choices:
@@ -107,6 +135,10 @@ AI只能给出复核建议，不能声称已修改模型或训练标签。
 
     def health_check(self) -> dict:
         """Check authentication/model visibility without returning credentials."""
+        if not self.configured:
+            raise LLMNotConfigured(
+                "本机未配置视觉模型密钥，请先在模型设置中填写连接并执行能力检查"
+            )
         models = self.client.models.list()
         model_ids = {getattr(item, 'id', None) for item in getattr(models, 'data', [])}
         configured = self.config['model']

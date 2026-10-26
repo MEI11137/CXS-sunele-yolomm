@@ -573,17 +573,12 @@ def register_refs(
     return stats
 
 
-def scope_ids(
-    source_table: str,
-    source_id: str,
-    *,
-    project_scoped: bool = True,
-) -> List[str]:
+def scope_ids(source_table: str, source_id: str) -> List[str]:
     """同一真实归属下的业务 ID 列表（发布归档等"批量影响"动作的唯一合法范围）。
 
-    只返回 ``agent_resource`` 里已登记、且 owner（以及项目，若有）与目标一致的
-    业务 ID；目标本体始终包含在内。查不到归属就只返回自己——即"谁也不能动别人
-    的东西"，而不是退化成"整表同模态"。
+    只返回 ``agent_resource`` 里已登记、且 owner + project 与目标一致的业务 ID；
+    目标本体始终包含在内。查不到归属就只返回自己——即"谁也不能动别人的东西"，
+    而不是退化成"整表同模态"。
     """
     owner_id: Optional[int] = None
     project_id: Optional[str] = None
@@ -611,7 +606,7 @@ def scope_ids(
 
     conn = connect()
     try:
-        if project_scoped and project_id:
+        if project_id:
             rows = query_all(
                 conn,
                 "SELECT source_id FROM agent_resource WHERE source_table = ? "
@@ -634,7 +629,7 @@ def scope_ids(
 
 def model_scope_ids(model_id: str) -> List[str]:
     """发布/归档的合法范围：本人同一项目下的模型。"""
-    return scope_ids("models", model_id, project_scoped=True)
+    return scope_ids("models", model_id)
 
 
 def current_state(kind_or_table: str, business_id: str) -> Optional[Dict[str, Any]]:

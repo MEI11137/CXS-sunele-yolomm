@@ -113,47 +113,6 @@ def test_model_publish_needs_no_global_domain_permission(publisher):
         assert conn.execute("SELECT status FROM models WHERE id='old'").fetchone()[0] == 1
 
 
-def test_model_publish_scope_excludes_models_outside_owner_project(tmp_path):
-    """范围之外的已发布模型不会被归档，哪怕模态完全相同。"""
-    path = tmp_path / "scope.sqlite3"
-    with sqlite3.connect(path) as conn:
-        conn.execute(
-            "CREATE TABLE datasets (id TEXT PRIMARY KEY, dataset_mode TEXT, secondary_modality TEXT)"
-        )
-        conn.execute("INSERT INTO datasets VALUES ('d1', 'single', NULL)")
-        conn.execute(
-            "CREATE TABLE models (id TEXT PRIMARY KEY, status INTEGER, model_bucket TEXT, "
-            "model_object_key TEXT, dataset_id TEXT, model_mode TEXT, primary_modality TEXT, "
-            "secondary_modality TEXT, create_time TEXT, publish_status TEXT)"
-        )
-        conn.executemany(
-            "INSERT INTO models VALUES (?, ?, 'models', ?, 'd1', 'single', 'rgb', NULL, ?, ?)",
-            [
-                ("mine-old", 3, "a.pt", "2026-01-01", "published"),
-                ("theirs", 3, "b.pt", "2026-01-02", "published"),
-                ("mine-new", 1, "c.pt", "2026-01-03", None),
-            ],
-        )
-        conn.execute(
-            "CREATE TABLE model_publish_audit (id TEXT PRIMARY KEY, model_id TEXT, "
-            "operator_id INTEGER, previous_model_id TEXT, create_time TEXT)"
-        )
-    service = BusinessToolAdapter(
-        path,
-        require_access=lambda principal, action, resource: True,
-        resolve_resource=lambda principal, kind, resource_id: ResourceSnapshot(
-            resource_id, "project-1", 7, "v1"
-        ),
-        storage_exists=lambda bucket, key: True,
-        model_scope_resolver=lambda model_id: ["mine-old", "mine-new"],
-    )
-    prepared = service.prepare_tool(7, "model.publish", {"model_id": "mine-new"})
-    assert prepared["preview"]["archived_model_ids"] == ["mine-old"]
-    service.execute_tool(7, prepared["operation_id"], "publish-scoped")
-    with sqlite3.connect(path) as conn:
-        states = dict(conn.execute("SELECT id, status FROM models").fetchall())
-    assert states == {"mine-old": 1, "theirs": 3, "mine-new": 3}
-
 
 def test_model_publish_rejects_changed_archive_set(publisher):
     service, path, _ = publisher

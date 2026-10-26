@@ -38,7 +38,7 @@ def test_ai_review_parses_fenced_json_and_updates_same_record():
     from services.ai_review_service import review_detection
 
     class FakeClient:
-        def review_detection_structured(self, image_bytes, detections):
+        def review_detection_structured(self, image_bytes, detections, **kwargs):
             return """```json
             {
               "status": "possible_false_positive",
@@ -59,8 +59,10 @@ def test_ai_review_parses_fenced_json_and_updates_same_record():
     assert "possible_false_positive" in database.updated[1]
 
 
-def test_parse_failure_retries_once_then_persists_success():
-    from services.ai_review_service import review_detection
+def test_parse_failure_does_not_call_the_model_again():
+    """INT-06：格式错误只报失败，不自动再发一次付费请求。"""
+    import pytest
+    from services.ai_review_service import AIReviewParseError, review_detection
 
     class FakeClient:
         config = {"model": "vision-test"}
@@ -72,18 +74,17 @@ def test_parse_failure_retries_once_then_persists_success():
             ])
             self.calls = 0
 
-        def review_detection_structured(self, image_bytes, detections):
+        def review_detection_structured(self, image_bytes, detections, **kwargs):
             self.calls += 1
             return next(self.responses)
 
     client = FakeClient()
     database = FakeDatabase(_record())
-    result = review_detection("record-1", client, database, FakeStorage())
+    with pytest.raises(AIReviewParseError, match="AI返回格式异常"):
+        review_detection("record-1", client, database, FakeStorage())
 
-    assert client.calls == 2
-    assert result.status == "consistent"
-    assert result.summary == "second attempt worked"
-    assert json.loads(database.updated[1][1])["status"] == "consistent"
+    assert client.calls == 1
+    assert json.loads(database.updated[1][1])["status"] == "needs_human_review"
 
 
 def test_repeated_parse_failure_persists_fallback_then_raises():
@@ -96,7 +97,7 @@ def test_repeated_parse_failure_persists_fallback_then_raises():
         def __init__(self):
             self.calls = 0
 
-        def review_detection_structured(self, image_bytes, detections):
+        def review_detection_structured(self, image_bytes, detections, **kwargs):
             self.calls += 1
             return "still-not-json"
 
@@ -107,12 +108,12 @@ def test_repeated_parse_failure_persists_fallback_then_raises():
         review_detection("record-1", client, database, FakeStorage())
 
     persisted = json.loads(database.updated[1][1])
-    assert client.calls == 2
+    assert client.calls == 1
     assert persisted["status"] == "needs_human_review"
     assert persisted["summary"] == "AI返回格式异常，需要人工复核"
 
 
-def test_malformed_optional_field_retries_then_persists_parse_fallback():
+def test_malformed_optional_field_fails_once_without_retry():
     import pytest
     from services.ai_review_service import AIReviewParseError, review_detection
 
@@ -122,7 +123,7 @@ def test_malformed_optional_field_retries_then_persists_parse_fallback():
         def __init__(self):
             self.calls = 0
 
-        def review_detection_structured(self, image_bytes, detections):
+        def review_detection_structured(self, image_bytes, detections, **kwargs):
             self.calls += 1
             return '{"status":"consistent","possible_false_positives":null}'
 
@@ -133,7 +134,7 @@ def test_malformed_optional_field_retries_then_persists_parse_fallback():
         review_detection("record-1", client, database, FakeStorage())
 
     assert isinstance(error.value.__cause__, AIReviewParseError)
-    assert client.calls == 2
+    assert client.calls == 1
     persisted = json.loads(database.updated[1][1])
     assert persisted["status"] == "needs_human_review"
     assert persisted["summary"] == "AI返回格式异常，需要人工复核"
@@ -161,7 +162,7 @@ def test_upstream_failure_persists_fallback_without_retry():
         def __init__(self):
             self.calls = 0
 
-        def review_detection_structured(self, image_bytes, detections):
+        def review_detection_structured(self, image_bytes, detections, **kwargs):
             self.calls += 1
             raise UpstreamFailure("provider body must stay private")
 
@@ -189,7 +190,7 @@ def test_upstream_failure_logs_categories_without_provider_secrets(caplog):
     class FakeClient:
         config = {"model": "vision-test", "api_key": "SECRET-API-KEY"}
 
-        def review_detection_structured(self, image_bytes, detections):
+        def review_detection_structured(self, image_bytes, detections, **kwargs):
             raise ProviderFailure("SECRET-MESSAGE")
 
     with caplog.at_level(logging.WARNING, logger="services.ai_review_service"):
@@ -221,7 +222,7 @@ def test_parse_failure_logs_metadata_without_sensitive_values(caplog):
             "api_key": "SECRET-API-KEY",
         }
 
-        def review_detection_structured(self, image_bytes, detections):
+        def review_detection_structured(self, image_bytes, detections, **kwargs):
             assert image_bytes == b"image"
             return "SECRET-RAW-RESPONSE"
 
@@ -232,8 +233,7 @@ def test_parse_failure_logs_metadata_without_sensitive_values(caplog):
 
     assert "record-1" in caplog.text
     assert "vision-test" in caplog.text
-    assert "attempt=1" in caplog.text
-    assert "attempt=2" in caplog.text
+    assert "attempt=" not in caplog.text
     assert "raw_type=str" in caplog.text
     assert "raw_length=19" in caplog.text
     assert "SECRET-API-KEY" not in caplog.text

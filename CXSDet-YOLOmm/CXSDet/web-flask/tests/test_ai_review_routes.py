@@ -22,7 +22,7 @@ def test_record_ai_review_returns_structured_result(monkeypatch):
     }
     monkeypatch.setattr(detection_route, "db", FakeDb())
     monkeypatch.setattr(detection_route, "is_admin", lambda: False)
-    monkeypatch.setattr(detection_route, "LLMVLClient", lambda: object(), raising=False)
+    monkeypatch.setattr(detection_route, "_personal_review_client", lambda: object())
     monkeypatch.setattr(
         detection_route,
         "review_detection",
@@ -47,7 +47,7 @@ def test_ai_health_never_returns_credentials(monkeypatch):
     import utils.security_utils as security_utils
 
     monkeypatch.setattr(security_utils, "is_admin", lambda: True)
-    monkeypatch.setattr(detection_route, "LLMVLClient", lambda: object(), raising=False)
+    monkeypatch.setattr(detection_route, "_personal_review_client", lambda: object())
     monkeypatch.setattr(
         detection_route,
         "check_vl_health",
@@ -110,7 +110,7 @@ def test_record_ai_review_returns_real_http_502_for_typed_failure(monkeypatch):
 
     monkeypatch.setattr(detection_route, "db", FakeDb())
     monkeypatch.setattr(detection_route, "is_admin", lambda: False)
-    monkeypatch.setattr(detection_route, "LLMVLClient", lambda: object(), raising=False)
+    monkeypatch.setattr(detection_route, "_personal_review_client", lambda: object())
     monkeypatch.setattr(detection_route, "review_detection", fail_review, raising=False)
 
     app = Flask(__name__)
