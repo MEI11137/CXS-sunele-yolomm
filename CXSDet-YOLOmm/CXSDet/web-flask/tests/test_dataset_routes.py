@@ -1,5 +1,6 @@
 import io
 import json
+import sqlite3
 import zipfile
 from types import SimpleNamespace
 
@@ -7,6 +8,42 @@ import yaml
 from flask import Flask
 
 from utils.jwt_util import generate_token
+
+
+def _dataset_db(tmp_path):
+    """Minimal datasets table so the shared import service can register."""
+
+    class TempDatabase:
+        def __init__(self, path):
+            self.path = str(path)
+            with sqlite3.connect(self.path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE datasets (
+                        id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT,
+                        zip_bucket TEXT NOT NULL, zip_object_key TEXT NOT NULL,
+                        structure_info TEXT, upload_time TEXT NOT NULL,
+                        file_size INTEGER, status INTEGER DEFAULT 0,
+                        dataset_mode TEXT NOT NULL DEFAULT 'single',
+                        primary_modality TEXT NOT NULL DEFAULT 'rgb',
+                        secondary_modality TEXT, runtime_mapping TEXT
+                    )
+                    """
+                )
+
+        def get_connection(self):
+            return sqlite3.connect(self.path)
+
+        def query(self, sql, params=(), fetchone=False):
+            with sqlite3.connect(self.path) as conn:
+                cursor = conn.execute(sql, params)
+                return cursor.fetchone() if fetchone else cursor.fetchall()
+
+        def execute(self, sql, params=()):
+            with sqlite3.connect(self.path) as conn:
+                return conn.execute(sql, params).rowcount
+
+    return TempDatabase(tmp_path / "routes.sqlite3")
 
 
 def _valid_single_zip() -> io.BytesIO:
@@ -43,26 +80,19 @@ def _valid_multi_zip_without_yaml() -> io.BytesIO:
     return buffer
 
 
-def test_upload_persists_selected_dataset_mode_and_runtime_mapping(monkeypatch):
+def test_upload_persists_selected_dataset_mode_and_runtime_mapping(monkeypatch, tmp_path):
     import routes.dataset as dataset_route
     import utils.security_utils as security_utils
 
+    database = _dataset_db(tmp_path)
     captured = {}
-
-    class FakeDb:
-        def query(self, sql, params=(), fetchone=False):
-            return None
-
-        def execute(self, sql, params=()):
-            captured["sql"] = sql
-            captured["params"] = params
-            return 1
 
     class FakeFileClient:
         def upload(self, bucket, file_path):
+            captured["bucket"] = bucket
             return {"bucket": bucket, "objectKey": "uploaded.zip"}
 
-    monkeypatch.setattr(dataset_route, "db", FakeDb())
+    monkeypatch.setattr(dataset_route, "db", database)
     monkeypatch.setattr(dataset_route, "file_client", FakeFileClient())
     monkeypatch.setattr(security_utils, "is_admin", lambda: True)
 
@@ -85,10 +115,20 @@ def test_upload_persists_selected_dataset_mode_and_runtime_mapping(monkeypatch):
     assert body["code"] == 200
     assert body["data"]["dataset_mode"] == "single"
     assert body["data"]["primary_modality"] == "rgb"
-    assert "dataset_mode" in captured["sql"]
-    assert "runtime_mapping" in captured["sql"]
-    assert "single" in captured["params"]
-    assert "rgb" in captured["params"]
+    assert body["data"]["class_names"] == ["crack"]
+    assert body["data"]["samples"] == 2
+    assert captured["bucket"] == "datasets"
+    with sqlite3.connect(database.path) as conn:
+        row = conn.execute(
+            "SELECT dataset_mode, primary_modality, runtime_mapping, structure_info, "
+            "zip_object_key, status FROM datasets WHERE name='single-v2'"
+        ).fetchone()
+    assert row[0] == "single"
+    assert row[1] == "rgb"
+    assert json.loads(row[2])["rgb_directory"] == "images"
+    assert json.loads(row[3])["names"] == ["crack"]
+    assert row[4] == "uploaded.zip"
+    assert row[5] == 1
 
 
 def test_upload_rejects_missing_mode_before_file_storage(monkeypatch):
@@ -116,18 +156,11 @@ def test_upload_rejects_missing_mode_before_file_storage(monkeypatch):
     assert "数据集类型" in body["msg"]
 
 
-def test_upload_generates_yaml_for_multimodal_archive_when_fields_are_supplied(monkeypatch):
+def test_upload_generates_yaml_for_multimodal_archive_when_fields_are_supplied(monkeypatch, tmp_path):
     import routes.dataset as dataset_route
     import utils.security_utils as security_utils
 
     captured = {}
-
-    class FakeDb:
-        def query(self, sql, params=(), fetchone=False):
-            return None
-
-        def execute(self, sql, params=()):
-            return 1
 
     class FakeFileClient:
         def upload(self, bucket, file_path):
@@ -135,7 +168,7 @@ def test_upload_generates_yaml_for_multimodal_archive_when_fields_are_supplied(m
                 captured["yaml"] = yaml.safe_load(archive.read("nested/data.yaml"))
             return {"bucket": bucket, "objectKey": "generated.zip"}
 
-    monkeypatch.setattr(dataset_route, "db", FakeDb())
+    monkeypatch.setattr(dataset_route, "db", _dataset_db(tmp_path))
     monkeypatch.setattr(dataset_route, "file_client", FakeFileClient())
     monkeypatch.setattr(security_utils, "is_admin", lambda: True)
 

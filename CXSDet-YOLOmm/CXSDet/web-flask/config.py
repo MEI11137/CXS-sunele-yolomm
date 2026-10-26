@@ -27,7 +27,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)  # 创建临时文件目录
 # 文件存储配置
 FILE_STORE_CONFIG = {
     'base_path': os.environ.get('FILE_STORE_PATH', os.path.join(get_application_root(), 'file_store')),
-    'access_url': f'http://{HOST}:{PORT}/api/file',  # 文件访问URL前缀
+    'access_url': os.environ.get('FILE_PUBLIC_URL', f'http://{HOST}:{PORT}/api/file').rstrip('/'),
     'allowed_types': [  # 支持的文件类型
         # 图片类型
         'image/jpeg',            # JPG/JPEG图片 (.jpg, .jpeg)
