@@ -78,12 +78,15 @@ src/
 
 ## 素材与许可
 
-演示用风机/叶片照片来自 [Unsplash](https://unsplash.com)（免费商用许可，`public/images/`）：
+演示用**海上风电场**照片来自 [Wikimedia Commons](https://commons.wikimedia.org)（CC BY-SA 3.0，可商用需署名，`public/images/`）：
 
-- `turbine-sea.jpg` — 海上风机场景
-- `windfarm-aerial.jpg` — 风电场阵列
-- `blade-closeup.jpg` — 叶片近景
-- `scene-windfarm.jpg` — 风力发电机近景
+- `offshore-barrow.jpg` — 爱尔兰海 Barrow 海上风场（特色图片，作者 Andy Dingley / Muhammad Mahdi Karim）
+- `offshore-burbo.jpg` — Burbo 海上风场（Crosby）
+- `offshore-kent.jpg` — Kent 海岸海上风场
+- `offshore-nordsee.jpg` — 北海 Nordsee One 海上风场
+- `blade-near-1/2/3.jpg` — 由 Barrow 原图裁切的海上风机近景
+
+署名信息：上述图片均遵循 [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/)，使用时需保留作者署名与许可链接；本仓库作为演示素材引用，正式发布前请按许可要求补充完整署名页。
 
 这些是**演示占位素材**，不冒充真实业务影像；接入真实后端后由实际巡检影像 URL 替换。字体优先 Geist，未捆绑时回退微软雅黑/系统无衬线。
 
