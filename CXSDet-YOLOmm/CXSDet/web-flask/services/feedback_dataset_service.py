@@ -54,9 +54,15 @@ def add_confirmed_record(record_id: str, target_dataset_id: str, database) -> Fe
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("BEGIN IMMEDIATE")
-        dataset = conn.execute("SELECT id, structure_info FROM datasets WHERE id = ?", (target_dataset_id,)).fetchone()
+        dataset = conn.execute(
+            "SELECT * FROM datasets WHERE id = ?", (target_dataset_id,)
+        ).fetchone()
         if dataset is None:
             raise FeedbackValidationError("目标反馈数据集不存在")
+        # 老库可能没有 structure_info 列：缺列时按"无类别表"处理，不整条失败
+        structure_info = (
+            dataset["structure_info"] if "structure_info" in dataset.keys() else None
+        )
         record = conn.execute(
             """
             SELECT id, human_review_status, corrected_annotations
@@ -70,7 +76,10 @@ def add_confirmed_record(record_id: str, target_dataset_id: str, database) -> Fe
             raise FeedbackValidationError("只有人工确认的记录才能加入反馈数据集")
         canonical, annotations = _canonical_annotations(record["corrected_annotations"])
         try:
-            _validate_annotations(annotations, dataset_class_names(dataset["structure_info"]))
+            _validate_annotations(
+                annotations,
+                None if structure_info is None else dataset_class_names(structure_info),
+            )
         except ReviewValidationError as exc:
             raise FeedbackValidationError(f"人工标注与目标数据集类别不一致，请重新人工复核：{exc}") from exc
         annotation_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()

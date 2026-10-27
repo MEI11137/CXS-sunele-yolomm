@@ -4,13 +4,14 @@ import uuid
 import json
 import multiprocessing
 from datetime import datetime
-from flask import Blueprint, request, g
+from flask import Blueprint, request, g, current_app
 from clients.file_client import file_client
 from utils.response import success, error
 from utils.db import db
-from utils.jwt_util import admin_required, token_required
+from utils.jwt_util import token_required
+from utils.resource_guard import register_new, resource_required, resources_required, visible_ids, project_target_required
 from utils.models import Model, ModelVO, MODEL_STATUS
-from config import TEMP_DIR, YOLO_CLASSES_CONFIG
+from config import DB_PATH, TEMP_DIR, YOLO_CLASSES_CONFIG
 from services.dataset_contract import (
     build_runtime_yaml,
     safe_extract_dataset,
@@ -20,6 +21,13 @@ from services.training_service import (
     MULTIMODAL_BASELINE_YAML,
     TrainingRun,
     run_training,
+)
+from services.training_runner import (
+    TrainingBusy,
+    acquire_training_lock,
+    release_training_lock,
+    run_training_job,
+    set_lock_holder,
 )
 from services.model_registry_service import (
     ModelRegistryError,
@@ -35,153 +43,67 @@ from services.yolo_runtime import load_detector
 
 model_bp = Blueprint('model', __name__, url_prefix='/api/model')
 
+
+def _bump_agent_revision(model_id):
+    """发布/撤销发布后递增 Agent 索引版本，使旧预览与旧确认失效。"""
+    try:
+        from agent import resources
+
+        resources.bump('models', model_id)
+    except Exception:
+        pass
+
 # 全局训练进程字典，用于管理训练进程
 training_processes = {}
 
 def run_training_process(
-    model_id, dataset_id, base_model, epochs, batch_size, parent_model_id=None
+    model_id, dataset_id, base_model, epochs, batch_size, parent_model_id=None,
+    database_path=None, file_store_path=None, temp_root=None,
 ):
-    """在后台进程中运行模型训练"""
-    # 预先定义temp_dir，确保在finally块中能够访问
-    temp_dir = os.path.join(TEMP_DIR, f"model_training_{model_id}_{uuid.uuid4().hex[:8]}")
-    
+    """在后台进程中运行模型训练（实现见 services/training_runner）。"""
     try:
-        # 在子进程中重新创建数据库连接
-        from utils.db import Database
-        process_db = Database()
-        
-        # 更新模型状态为训练中
-        process_db.execute('''
-            UPDATE models SET status = ?, start_time = ?
-            WHERE id = ?
-        ''', (MODEL_STATUS['TRAINING'], datetime.now().isoformat(), model_id))
-        
-        # 获取数据集信息
-        dataset_data = process_db.query('''
-            SELECT zip_bucket, zip_object_key, dataset_mode, primary_modality,
-                   secondary_modality
-            FROM datasets WHERE id = ?
-        ''', (dataset_id,), fetchone=True)
-        
-        if not dataset_data:
-            raise Exception("数据集不存在")
-        
-        # 下载数据集到临时目录
-        dataset_content = file_client.get(dataset_data['zip_bucket'], dataset_data['zip_object_key'])
-        
-        # 创建临时目录（不使用自动删除）
-        os.makedirs(temp_dir, exist_ok=True)
-        
-        try:
-            # 保存数据集文件
-            dataset_path = os.path.join(temp_dir, 'dataset.zip')
-            with open(dataset_path, 'wb') as f:
-                f.write(dataset_content)
-            
-            extract_dir = os.path.join(temp_dir, 'dataset')
-            model_mode = dataset_data.get('dataset_mode') or 'single'
-            validation = validate_dataset_archive(dataset_path, model_mode)
-            extracted_root = safe_extract_dataset(dataset_path, extract_dir)
-            data_yaml_path = build_runtime_yaml(
-                extracted_root,
-                validation,
-                os.path.join(temp_dir, 'data.runtime.yaml')
-            )
-
-            output_dir = os.path.join(temp_dir, 'output')
-            if parent_model_id:
-                parent = process_db.query('''
-                    SELECT model_bucket, model_object_key, model_mode, model_yaml
-                    FROM models WHERE id = ?
-                ''', (parent_model_id,), fetchone=True)
-                if not parent or not parent.get('model_object_key'):
-                    raise Exception("父模型权重不存在")
-                if (parent.get('model_mode') or 'single') != model_mode:
-                    raise Exception("父模型与反馈数据集模式不一致")
-                parent_weight = file_client.get(
-                    parent['model_bucket'], parent['model_object_key']
-                )
-                model_source = os.path.join(temp_dir, 'parent_model.pt')
-                with open(model_source, 'wb') as weight_file:
-                    weight_file.write(parent_weight)
-                model_yaml = parent.get('model_yaml')
-            elif model_mode == 'multimodal':
-                model_source = str(MULTIMODAL_BASELINE_YAML)
-                model_yaml = model_source
-            else:
-                model_source = os.path.join(os.path.dirname(__file__), '..', 'weights', base_model)
-                model_source = os.path.abspath(model_source)
-                model_yaml = None
-                if not os.path.exists(model_source):
-                    raise Exception(f"基础模型文件不存在: {model_source}")
-
-            training_result = run_training(TrainingRun(
-                model_mode=model_mode,
-                model_source=model_source,
-                model_yaml=model_yaml,
-                runtime_yaml=data_yaml_path,
-                epochs=epochs,
-                batch_size=batch_size,
-                output_dir=output_dir,
-                secondary_modality=dataset_data.get('secondary_modality')
-            ))
-
-            best_model_path = training_result.best_weight_path
-            upload_result = file_client.upload('models', best_model_path)
-
-            train_result = {
-                'final_epoch': epochs,
-                'results_dict': training_result.metrics,
-                'training_metrics': []
-            }
-
-            process_db.execute('''
-                UPDATE models SET status = ?, complete_time = ?, model_bucket = ?,
-                       model_object_key = ?, train_result = ?, metrics_json = ?
-                WHERE id = ?
-            ''', (
-                MODEL_STATUS['COMPLETED'],
-                datetime.now().isoformat(),
-                upload_result['bucket'],
-                upload_result['objectKey'],
-                json.dumps(train_result),
-                json.dumps(training_result.metrics),
-                model_id
-            ))
-        finally:
-            # 训练完成后清理临时目录
-            import shutil
-            try:
-                # 直接尝试删除，不预先检查是否存在（避免竞态条件）
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            except Exception:
-                # 完全忽略删除错误，不影响主流程
-                pass
-            
-    except Exception as e:
-        # 在子进程中重新创建数据库连接（如果之前没有创建）
-        if 'process_db' not in locals():
-            from utils.db import Database
-            process_db = Database()
-            
-        # 更新模型状态为训练失败
-        error_result = {'error': str(e)}
-        process_db.execute('''
-            UPDATE models SET status = ?, complete_time = ?, train_result = ?
-            WHERE id = ?
-        ''', (
-            MODEL_STATUS['FAILED'], 
-            datetime.now().isoformat(),
-            json.dumps(error_result),
-            model_id
-        ))
+        run_training_job(
+            model_id, dataset_id, base_model, epochs, batch_size, parent_model_id,
+            database_path=database_path or DB_PATH,
+            file_store_path=file_store_path, temp_root=temp_root,
+        )
     finally:
         # 从训练进程字典中移除已完成的进程
-        if model_id in training_processes:
-            del training_processes[model_id]
+        training_processes.pop(model_id, None)
+
+
+def _lock_db_path():
+    """训练占用必须记录在本次请求实际写入的数据库上。
+
+    Agent 侧（``services/business_tools``）与页面侧共用同一张
+    ``training_lock`` 表；若这里固定用模块级 ``DB_PATH``，测试或换库部署时
+    两侧会各自持锁，"单机单训练"就不再成立。
+    """
+    return getattr(db, 'db_path', None) or DB_PATH
+
+
+def _worker_paths():
+    return {
+        'database_path': _lock_db_path(),
+        'file_store_path': str(current_app.config.get('FILE_STORE_PATH') or getattr(file_client, 'base_path', None)) if (current_app.config.get('FILE_STORE_PATH') or getattr(file_client, 'base_path', None)) else None,
+        'temp_root': str(current_app.config.get('TEMP_DIR') or TEMP_DIR),
+    }
+
+
+def _mark_training_taken_slot(lock_path, model_id, process):
+    """把占用指向真正的训练进程，便于崩溃后按 pid 回收。
+
+    拿不到 worker pid 时（进程对象未暴露 pid）无法在异常后判断占用是否还活着，
+    此时释放占用而不是留下一个回收不了的死锁。
+    """
+    worker_pid = getattr(process, 'pid', None)
+    if worker_pid:
+        set_lock_holder(lock_path, model_id, worker_pid)
+    else:
+        release_training_lock(lock_path, model_id)
 
 @model_bp.route('/create', methods=['POST'])
-@admin_required
+@token_required
 def create_model():
     """创建新模型并开始训练"""
     try:
@@ -212,6 +134,13 @@ def create_model():
         if not dataset_data:
             return error("选择的数据集不存在")
 
+        # 训练用的是别人的数据集也算越权：先按公共规则确认可读
+        from utils.resource_guard import check_resource
+
+        blocked = check_resource('dataset', dataset_id, 'read')
+        if blocked is not None:
+            return blocked
+
         model_mode = dataset_data.get('dataset_mode') or 'single'
         primary_modality = dataset_data.get('primary_modality') or 'rgb'
         secondary_modality = dataset_data.get('secondary_modality')
@@ -233,15 +162,34 @@ def create_model():
         ))
         
         if affected_rows > 0:
+            lock_path = _lock_db_path()
+            # 单机单训练占用：忙时明确拒绝，不排队
+            try:
+                acquire_training_lock(lock_path, model_id, os.getpid())
+            except TrainingBusy as exc:
+                try:
+                    db.execute('DELETE FROM models WHERE id = ?', (model_id,))
+                except Exception:
+                    pass
+                return error(str(exc), 409), 409
             # 创建并启动训练进程
             training_process = multiprocessing.Process(
-                target=run_training_process, 
-                args=(model_id, dataset_id, base_model, epochs, batch_size)
+                target=run_training_process,
+                args=(model_id, dataset_id, base_model, epochs, batch_size),
+                kwargs=_worker_paths(),
             )
             training_process.daemon = True
             training_processes[model_id] = training_process
-            training_process.start()
-            
+            try:
+                training_process.start()
+            except Exception:
+                release_training_lock(lock_path, model_id)
+                db.execute('DELETE FROM models WHERE id = ?', (model_id,))
+                raise
+            _mark_training_taken_slot(lock_path, model_id, training_process)
+
+            register_new('model', model_id, display_name=name)
+
             return success({
                 'id': model_id,
                 'name': name,
@@ -267,7 +215,8 @@ def create_model():
 
 
 @model_bp.route('/import', methods=['POST'])
-@admin_required
+@token_required
+@project_target_required
 def import_model():
     """导入并验证外部训练得到的模型权重。"""
     try:
@@ -279,6 +228,12 @@ def import_model():
             db,
             file_client,
             load_detector,
+        )
+        register_new(
+            'model',
+            imported.to_dict().get('id'),
+            project_id=request.form.get('project_id'),
+            display_name=request.form.get('name', ''),
         )
         return success(imported.to_dict(), "模型权重导入成功，请确认后发布")
     except ModelImportError as exc:
@@ -298,6 +253,14 @@ def list_models():
         # 构建查询条件
         conditions = []
         params = []
+
+        # 普通用户只看本人（及系统默认只读）模型；管理员不过滤
+        allowed = visible_ids('model')
+        if allowed is not None:
+            if not allowed:
+                return success({'models': [], 'total': 0, 'page': page, 'page_size': page_size})
+            conditions.append('m.id IN (%s)' % ','.join('?' for _ in allowed))
+            params.extend(sorted(allowed))
         
         if search:
             conditions.append("(m.name LIKE ? OR m.description LIKE ?)")
@@ -340,7 +303,7 @@ def list_models():
         return error(f"获取模型列表失败: {str(e)}")
 
 @model_bp.route('/<model_id>', methods=['GET'])
-@admin_required
+@resource_required('model', 'model_id', 'read')
 def get_model(model_id):
     """获取模型详情"""
     try:
@@ -363,7 +326,7 @@ def get_model(model_id):
         return error(f"获取模型详情失败: {str(e)}")
 
 @model_bp.route('/<model_id>', methods=['PUT'])
-@admin_required
+@resource_required('model', 'model_id', 'write')
 def update_model(model_id):
     """更新模型信息"""
     try:
@@ -399,7 +362,7 @@ def update_model(model_id):
         return error(f"更新模型信息失败: {str(e)}")
 
 @model_bp.route('/<model_id>', methods=['DELETE'])
-@admin_required
+@resource_required('model', 'model_id', 'write')
 def delete_model(model_id):
     """删除模型"""
     try:
@@ -433,11 +396,16 @@ def delete_model(model_id):
         return error(f"删除模型失败: {str(e)}")
 
 @model_bp.route('/<model_id>/publish', methods=['POST'])
-@admin_required
+@resource_required('model', 'model_id', 'publish')
 def publish_model(model_id):
-    """原子发布模型并归档同一模态业务域中的旧版本。"""
+    """原子发布模型，只归档本人同一项目内的同模态旧版本。"""
     try:
-        result = publish_registered_model(model_id, g.user_id, db)
+        from agent.resources import model_scope_ids
+
+        result = publish_registered_model(
+            model_id, g.user_id, db, scope_model_ids=model_scope_ids(model_id),
+        )
+        _bump_agent_revision(model_id)
         return success(result.to_dict(), "模型发布成功")
     except ModelRegistryError as exc:
         return error(str(exc), 400), 400
@@ -446,7 +414,7 @@ def publish_model(model_id):
 
 
 @model_bp.route('/<parent_model_id>/incremental', methods=['POST'])
-@admin_required
+@resource_required('model', 'parent_model_id', 'read')
 def create_incremental_model(parent_model_id):
     """创建独立子模型记录，并从父权重启动反馈数据集训练。"""
     try:
@@ -460,8 +428,18 @@ def create_incremental_model(parent_model_id):
             payload,
             db,
         )
+        lock_path = _lock_db_path()
+        try:
+            acquire_training_lock(lock_path, child.model_id, os.getpid())
+        except TrainingBusy as exc:
+            try:
+                db.execute('DELETE FROM models WHERE id = ?', (child.model_id,))
+            except Exception:
+                pass
+            return error(str(exc), 409), 409
         process = multiprocessing.Process(
             target=run_training_process,
+            kwargs=_worker_paths(),
             args=(
                 child.model_id,
                 child.dataset_id,
@@ -473,7 +451,13 @@ def create_incremental_model(parent_model_id):
         )
         process.daemon = True
         training_processes[child.model_id] = process
-        process.start()
+        try:
+            process.start()
+        except Exception:
+            release_training_lock(lock_path, child.model_id)
+            db.execute('DELETE FROM models WHERE id = ?', (child.model_id,))
+            raise
+        _mark_training_taken_slot(lock_path, child.model_id, process)
         return success(child.to_dict(), "增量训练已启动")
     except ModelRegistryError as exc:
         return error(str(exc), 400), 400
@@ -482,7 +466,7 @@ def create_incremental_model(parent_model_id):
 
 
 @model_bp.route('/<parent_model_id>/compare/<child_model_id>', methods=['GET'])
-@admin_required
+@resources_required([('model','parent_model_id','read'), ('model','child_model_id','read')])
 def compare_model_versions(parent_model_id, child_model_id):
     """比较父子模型指标；缺失值保持 unknown。"""
     try:
@@ -494,7 +478,7 @@ def compare_model_versions(parent_model_id, child_model_id):
         return error(f"模型指标比较失败: {str(exc)}")
 
 @model_bp.route('/<model_id>/unpublish', methods=['POST'])
-@admin_required
+@resource_required('model', 'model_id', 'publish')
 def unpublish_model(model_id):
     """取消发布模型"""
     try:
@@ -515,6 +499,7 @@ def unpublish_model(model_id):
         ''', (MODEL_STATUS['COMPLETED'], model_id))
         
         if affected_rows > 0:
+            _bump_agent_revision(model_id)
             return success(None, "取消发布成功")
         else:
             return error("取消发布失败")
@@ -523,7 +508,7 @@ def unpublish_model(model_id):
         return error(f"取消发布模型失败: {str(e)}")
 
 @model_bp.route('/base-models', methods=['GET'])
-@admin_required
+@token_required
 def list_base_models():
     """获取可用的基础模型列表"""
     try:

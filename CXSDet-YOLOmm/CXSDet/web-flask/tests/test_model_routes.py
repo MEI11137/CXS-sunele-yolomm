@@ -5,8 +5,12 @@ from flask import Flask
 
 from utils.jwt_util import generate_token
 
+from tests import guard_support
 
-def test_import_model_route_accepts_authenticated_multipart_weight(monkeypatch):
+from tests import guard_support
+
+
+def test_import_model_route_accepts_authenticated_multipart_weight(monkeypatch, tmp_path):
     import routes.model as model_route
     import utils.security_utils as security_utils
 
@@ -40,6 +44,7 @@ def test_import_model_route_accepts_authenticated_multipart_weight(monkeypatch):
     monkeypatch.setattr(security_utils, "is_admin", lambda: True)
 
     app = Flask(__name__)
+    app.config["DATABASE"] = str(tmp_path / "guard.sqlite3")
     app.register_blueprint(model_route.model_bp)
     response = app.test_client().post(
         "/api/model/import",
@@ -63,7 +68,7 @@ def test_import_model_route_accepts_authenticated_multipart_weight(monkeypatch):
     assert captured["filename"] == "best.pt"
 
 
-def test_create_model_persists_dataset_modality_and_version(monkeypatch):
+def test_create_model_persists_dataset_modality_and_version(monkeypatch, tmp_path):
     import routes.model as model_route
     import utils.security_utils as security_utils
 
@@ -88,9 +93,10 @@ def test_create_model_persists_dataset_modality_and_version(monkeypatch):
             return 1
 
     class FakeProcess:
-        def __init__(self, target, args):
+        def __init__(self, target, args, **options):
             captured["target"] = target
             captured["args"] = args
+            captured['worker_paths'] = options.get('kwargs')
             self.daemon = False
 
         def start(self):
@@ -101,6 +107,12 @@ def test_create_model_persists_dataset_modality_and_version(monkeypatch):
     monkeypatch.setattr(security_utils, "is_admin", lambda: True)
 
     app = Flask(__name__)
+    # 训练要用本人数据集：授权按归属判断，先把 dataset-mm 登记给用户 1
+    guard_support.install(
+        app,
+        tmp_path / "guard.sqlite3",
+        resources=[guard_support.resource("datasets", "dataset-mm", 1)],
+    )
     app.register_blueprint(model_route.model_bp)
     response = app.test_client().post(
         "/api/model/create",
@@ -119,6 +131,8 @@ def test_create_model_persists_dataset_modality_and_version(monkeypatch):
     assert body["data"]["model_mode"] == "multimodal"
     assert body["data"]["secondary_modality"] == "edge"
     assert body["data"]["version"] == 1
+    assert captured['worker_paths']['database_path']
+    assert captured['worker_paths']['temp_root']
     assert "model_mode" in captured["sql"]
     assert "model_yaml" in captured["sql"]
     assert "publish_status" in captured["sql"]

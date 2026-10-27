@@ -1,5 +1,6 @@
 import io
 import json
+import sqlite3
 import zipfile
 from types import SimpleNamespace
 
@@ -7,6 +8,44 @@ import yaml
 from flask import Flask
 
 from utils.jwt_util import generate_token
+
+from tests import guard_support
+
+
+def _dataset_db(tmp_path):
+    """Minimal datasets table so the shared import service can register."""
+
+    class TempDatabase:
+        def __init__(self, path):
+            self.path = str(path)
+            with sqlite3.connect(self.path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE datasets (
+                        id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT,
+                        zip_bucket TEXT NOT NULL, zip_object_key TEXT NOT NULL,
+                        structure_info TEXT, upload_time TEXT NOT NULL,
+                        file_size INTEGER, status INTEGER DEFAULT 0,
+                        dataset_mode TEXT NOT NULL DEFAULT 'single',
+                        primary_modality TEXT NOT NULL DEFAULT 'rgb',
+                        secondary_modality TEXT, runtime_mapping TEXT
+                    )
+                    """
+                )
+
+        def get_connection(self):
+            return sqlite3.connect(self.path)
+
+        def query(self, sql, params=(), fetchone=False):
+            with sqlite3.connect(self.path) as conn:
+                cursor = conn.execute(sql, params)
+                return cursor.fetchone() if fetchone else cursor.fetchall()
+
+        def execute(self, sql, params=()):
+            with sqlite3.connect(self.path) as conn:
+                return conn.execute(sql, params).rowcount
+
+    return TempDatabase(tmp_path / "routes.sqlite3")
 
 
 def _valid_single_zip() -> io.BytesIO:
@@ -43,26 +82,19 @@ def _valid_multi_zip_without_yaml() -> io.BytesIO:
     return buffer
 
 
-def test_upload_persists_selected_dataset_mode_and_runtime_mapping(monkeypatch):
+def test_upload_persists_selected_dataset_mode_and_runtime_mapping(monkeypatch, tmp_path):
     import routes.dataset as dataset_route
     import utils.security_utils as security_utils
 
+    database = _dataset_db(tmp_path)
     captured = {}
-
-    class FakeDb:
-        def query(self, sql, params=(), fetchone=False):
-            return None
-
-        def execute(self, sql, params=()):
-            captured["sql"] = sql
-            captured["params"] = params
-            return 1
 
     class FakeFileClient:
         def upload(self, bucket, file_path):
+            captured["bucket"] = bucket
             return {"bucket": bucket, "objectKey": "uploaded.zip"}
 
-    monkeypatch.setattr(dataset_route, "db", FakeDb())
+    monkeypatch.setattr(dataset_route, "db", database)
     monkeypatch.setattr(dataset_route, "file_client", FakeFileClient())
     monkeypatch.setattr(security_utils, "is_admin", lambda: True)
 
@@ -85,10 +117,20 @@ def test_upload_persists_selected_dataset_mode_and_runtime_mapping(monkeypatch):
     assert body["code"] == 200
     assert body["data"]["dataset_mode"] == "single"
     assert body["data"]["primary_modality"] == "rgb"
-    assert "dataset_mode" in captured["sql"]
-    assert "runtime_mapping" in captured["sql"]
-    assert "single" in captured["params"]
-    assert "rgb" in captured["params"]
+    assert body["data"]["class_names"] == ["crack"]
+    assert body["data"]["samples"] == 2
+    assert captured["bucket"] == "datasets"
+    with sqlite3.connect(database.path) as conn:
+        row = conn.execute(
+            "SELECT dataset_mode, primary_modality, runtime_mapping, structure_info, "
+            "zip_object_key, status FROM datasets WHERE name='single-v2'"
+        ).fetchone()
+    assert row[0] == "single"
+    assert row[1] == "rgb"
+    assert json.loads(row[2])["rgb_directory"] == "images"
+    assert json.loads(row[3])["names"] == ["crack"]
+    assert row[4] == "uploaded.zip"
+    assert row[5] == 1
 
 
 def test_upload_rejects_missing_mode_before_file_storage(monkeypatch):
@@ -116,18 +158,11 @@ def test_upload_rejects_missing_mode_before_file_storage(monkeypatch):
     assert "数据集类型" in body["msg"]
 
 
-def test_upload_generates_yaml_for_multimodal_archive_when_fields_are_supplied(monkeypatch):
+def test_upload_generates_yaml_for_multimodal_archive_when_fields_are_supplied(monkeypatch, tmp_path):
     import routes.dataset as dataset_route
     import utils.security_utils as security_utils
 
     captured = {}
-
-    class FakeDb:
-        def query(self, sql, params=(), fetchone=False):
-            return None
-
-        def execute(self, sql, params=()):
-            return 1
 
     class FakeFileClient:
         def upload(self, bucket, file_path):
@@ -135,7 +170,7 @@ def test_upload_generates_yaml_for_multimodal_archive_when_fields_are_supplied(m
                 captured["yaml"] = yaml.safe_load(archive.read("nested/data.yaml"))
             return {"bucket": bucket, "objectKey": "generated.zip"}
 
-    monkeypatch.setattr(dataset_route, "db", FakeDb())
+    monkeypatch.setattr(dataset_route, "db", _dataset_db(tmp_path))
     monkeypatch.setattr(dataset_route, "file_client", FakeFileClient())
     monkeypatch.setattr(security_utils, "is_admin", lambda: True)
 
@@ -192,6 +227,12 @@ def test_feedback_version_endpoint_returns_a_draft_for_manual_splitting(monkeypa
     monkeypatch.setattr(security_utils, "is_admin", lambda: True)
 
     app = Flask(__name__)
+    # 拿本人数据集做反馈版本：授权按归属判断，先把 d1 登记给用户 7
+    guard_support.install(
+        app,
+        tmp_path / "guard.sqlite3",
+        resources=[guard_support.resource("datasets", "d1", 7)],
+    )
     app.register_blueprint(dataset_route.dataset_bp)
     response = app.test_client().post(
         "/api/dataset/d1/feedback-version",
@@ -206,19 +247,38 @@ def test_feedback_version_endpoint_returns_a_draft_for_manual_splitting(monkeypa
     assert captured["creator_id"] == 7
 
 
-def _draft_client(monkeypatch, *, admin=True):
+def _draft_client(monkeypatch, db_path, *, admin=True, accounts=None, resources=None,
+                  owner_id=8):
+    """建一个带临时库的客户端：授权现在按真实归属判断，角色开关不够用。"""
     import utils.security_utils as security_utils
     from flask import Flask
     import routes.dataset as dataset_route
 
     monkeypatch.setattr(security_utils, "is_admin", lambda: admin)
     app = Flask(__name__)
+    guard_support.install(
+        app,
+        db_path,
+        accounts=accounts,
+        resources=(
+            resources
+            if resources is not None
+            else [guard_support.resource("dataset_drafts", "draft-1", owner_id)]
+        ),
+    )
     app.register_blueprint(dataset_route.dataset_bp)
     return app.test_client()
 
 
-def test_draft_samples_route_is_admin_only(monkeypatch):
-    client = _draft_client(monkeypatch, admin=False)
+def test_draft_samples_route_is_owner_only(monkeypatch, tmp_path):
+    # 不是本人创建的草稿：普通用户拿不到样本清单（原来是"只有管理员能看"）
+    client = _draft_client(
+        monkeypatch,
+        tmp_path / "guard.sqlite3",
+        admin=False,
+        accounts={8: 0},
+        resources=[guard_support.resource("dataset_drafts", "draft-1", 99)],
+    )
     response = client.get(
         "/api/dataset/drafts/draft-1/samples",
         headers={"Authorization": f"Bearer {generate_token(8)}"},
@@ -226,7 +286,7 @@ def test_draft_samples_route_is_admin_only(monkeypatch):
     assert json.loads(response.data)["code"] == 403
 
 
-def test_dataset_list_unifies_records_and_excludes_finalized_drafts(monkeypatch):
+def test_dataset_list_unifies_records_and_excludes_finalized_drafts(monkeypatch, tmp_path):
     import routes.dataset as dataset_route
 
     captured = []
@@ -253,7 +313,8 @@ def test_dataset_list_unifies_records_and_excludes_finalized_drafts(monkeypatch)
             raise AssertionError(sql)
 
     monkeypatch.setattr(dataset_route, "db", FakeDb())
-    client = _draft_client(monkeypatch)
+    # 列表按归属过滤；管理员不过滤，这里只校验两种记录怎么合并、草稿状态怎么筛
+    client = _draft_client(monkeypatch, tmp_path / "guard.sqlite3", accounts={8: 1})
     response = client.get(
         "/api/dataset/list?record_kind=all&page=1&page_size=10",
         headers={"Authorization": f"Bearer {generate_token(8)}"},
@@ -275,13 +336,13 @@ def test_dataset_list_unifies_records_and_excludes_finalized_drafts(monkeypatch)
     assert "workflow_status = ?" in captured[-1]
 
 
-def test_draft_assignment_route_passes_atomic_sample_selection(monkeypatch):
+def test_draft_assignment_route_passes_atomic_sample_selection(monkeypatch, tmp_path):
     import routes.dataset as dataset_route
 
     captured = {}
     monkeypatch.setattr(dataset_route, "assign_draft_samples", lambda *args: captured.update({"args": args}) or {"updated": 2})
     monkeypatch.setattr(dataset_route, "db", object())
-    client = _draft_client(monkeypatch)
+    client = _draft_client(monkeypatch, tmp_path / "guard.sqlite3")
     response = client.post(
         "/api/dataset/drafts/draft-1/assign",
         headers={"Authorization": f"Bearer {generate_token(8)}"},
@@ -292,7 +353,7 @@ def test_draft_assignment_route_passes_atomic_sample_selection(monkeypatch):
     assert captured["args"][:3] == ("draft-1", ["s1", "s2"], "train")
 
 
-def test_sample_preview_streams_stored_image_with_derived_mime(monkeypatch):
+def test_sample_preview_streams_stored_image_with_derived_mime(monkeypatch, tmp_path):
     import routes.dataset as dataset_route
     from services.dataset_draft_service import DraftSampleResult
 
@@ -304,7 +365,7 @@ def test_sample_preview_streams_stored_image_with_derived_mime(monkeypatch):
     monkeypatch.setattr(dataset_route, "get_draft_sample", lambda *_args: sample)
     monkeypatch.setattr(dataset_route.file_client, "get", lambda bucket, key: b"png bytes")
     monkeypatch.setattr(dataset_route, "db", object())
-    client = _draft_client(monkeypatch)
+    client = _draft_client(monkeypatch, tmp_path / "guard.sqlite3")
     response = client.get(
         "/api/dataset/drafts/draft-1/samples/sample-1/preview/rgb",
         headers={"Authorization": f"Bearer {generate_token(8)}"},
@@ -344,7 +405,7 @@ def test_secondary_repair_reports_sample_ownership_validation(monkeypatch, tmp_p
         lambda *_args, **_kwargs: (_ for _ in ()).throw(DraftValidationError("样本不存在或不属于该数据集")),
     )
     monkeypatch.setattr(dataset_route, "db", object())
-    client = _draft_client(monkeypatch)
+    client = _draft_client(monkeypatch, tmp_path / "guard.sqlite3")
     response = client.post(
         "/api/dataset/drafts/draft-1/samples/foreign-sample/secondary",
         headers={"Authorization": f"Bearer {generate_token(8)}"},
@@ -365,7 +426,7 @@ def test_finalize_draft_route_returns_formal_dataset(monkeypatch, tmp_path):
     monkeypatch.setattr(dataset_route, "finalize_draft", lambda *_args: SimpleNamespace(to_dict=lambda: result))
     monkeypatch.setattr(dataset_route, "db", object())
     monkeypatch.setattr(dataset_route, "file_client", object())
-    client = _draft_client(monkeypatch)
+    client = _draft_client(monkeypatch, tmp_path / "guard.sqlite3")
     response = client.post(
         "/api/dataset/drafts/draft-1/finalize",
         headers={"Authorization": f"Bearer {generate_token(8)}"},
@@ -375,11 +436,11 @@ def test_finalize_draft_route_returns_formal_dataset(monkeypatch, tmp_path):
     assert body["data"]["dataset_id"] == "draft-1"
 
 
-def test_retry_rejects_non_failed_draft(monkeypatch):
+def test_retry_rejects_non_failed_draft(monkeypatch, tmp_path):
     import routes.dataset as dataset_route
     monkeypatch.setattr(dataset_route, "get_draft", lambda *_args: {"id": "draft-1", "workflow_status": "draft"})
     monkeypatch.setattr(dataset_route, "db", object())
-    client = _draft_client(monkeypatch)
+    client = _draft_client(monkeypatch, tmp_path / "guard.sqlite3")
     response = client.post(
         "/api/dataset/drafts/draft-1/retry",
         headers={"Authorization": f"Bearer {generate_token(8)}"},

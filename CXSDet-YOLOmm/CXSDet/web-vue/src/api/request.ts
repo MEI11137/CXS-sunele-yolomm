@@ -18,6 +18,7 @@ import { useUserStore } from '@/stores/user'
 const instance: AxiosInstance = axios.create({
   baseURL: import.meta.env.VITE_API_URL,
   timeout: 60000,
+  withCredentials: true,
 })
 
 // 请求拦截器

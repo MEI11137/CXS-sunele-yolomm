@@ -18,6 +18,7 @@ __pycache__/
 *$py.class
 .pytest_cache/
 .pytest-tmp*/
+.c01-cont-test/
 .mypy_cache/
 .ruff_cache/
 .ultralytics/
@@ -33,6 +34,7 @@ env/
 
 # Node.js dependencies and generated frontend output
 node_modules/
+.npm-cache/
 dist/
 .vite/
 coverage/
@@ -48,6 +50,7 @@ pnpm-debug.log*
 !.env.example
 !.env.sample
 **/config.local.json
+**/.jwt-secret
 
 # Runtime databases, logs, temporary files, and backups
 *.db
@@ -97,3 +100,5 @@ CXSDet-YOLOmm/4测试包/
 *.bin
 *.dump
 
+.integration-deps/
+.integration-checks/

@@ -9,6 +9,8 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from utils.dataset_classes import dataset_class_names
+
 
 LOGGER = logging.getLogger(__name__)
 PARSE_FAILURE_SUMMARY = "AI返回格式异常，需要人工复核"
@@ -32,9 +34,17 @@ class AIReviewUpstreamError(AIReviewError):
 
     public_message = UPSTREAM_FAILURE_SUMMARY
 
-    def __init__(self, message=UPSTREAM_FAILURE_SUMMARY):
-        super().__init__(message)
-        self.public_message = message
+    def __init__(self, message="", *, public_message=None):
+        # 位置参数只是内部原因，**不会**自动变成对外文案；对外一律用
+        # ``public_message``（缺省为通用失败提示）。401 之类的具体指引要显式传入。
+        super().__init__(message or UPSTREAM_FAILURE_SUMMARY)
+        self.public_message = public_message or UPSTREAM_FAILURE_SUMMARY
+
+
+class AIReviewInputError(AIReviewError):
+    """记录本身不满足复核条件（缺配图等），在花钱之前就拒绝。"""
+
+    public_message = "该记录缺少复核所需的图片"
 
 
 ALLOWED_STATUSES = {
@@ -155,10 +165,22 @@ def _upstream_failure_message(exc: Exception) -> str:
 
 
 def review_detection(record_id: str, client, database, storage_client) -> AIReviewResult:
+    """对一条真实检测记录做一次结构化复核。
+
+    * 按记录**真实存在**的图片取图：RGB 必有；有多模态配图就一起发，
+      不拿 RGB 或增强图冒充第二模态。
+    * 只调用一次远端模型：解析失败不自动重试，避免重复计费。
+    """
     record = database.query(
         """
-        SELECT id, original_image_bucket, original_image_object_key, detection_result
-        FROM detection_records WHERE id = ?
+        SELECT r.id, r.original_image_bucket, r.original_image_object_key,
+               r.secondary_image_bucket, r.secondary_image_object_key,
+               r.detection_result, m.model_mode, m.secondary_modality,
+               d.structure_info
+        FROM detection_records r
+        LEFT JOIN models m ON m.id = r.model_id
+        LEFT JOIN datasets d ON d.id = m.dataset_id
+        WHERE r.id = ?
         """,
         (record_id,),
         fetchone=True,
@@ -173,49 +195,67 @@ def review_detection(record_id: str, client, database, storage_client) -> AIRevi
     except json.JSONDecodeError:
         detections = []
 
+    secondary_bytes = None
+    secondary_bucket = record.get("secondary_image_bucket")
+    secondary_key = record.get("secondary_image_object_key")
+    if secondary_bucket and secondary_key:
+        secondary_bytes = storage_client.get(secondary_bucket, secondary_key)
+    elif (record.get("model_mode") or "single") == "multimodal":
+        # 多模态模型却没有配套的第二模态图：拒绝，不猜也不复用 RGB
+        raise AIReviewInputError(
+            f"该记录缺少{record.get('secondary_modality') or '第二模态'}配图，不能做多模态复核"
+        )
+
+    try:
+        class_names = dataset_class_names(record.get("structure_info"))
+    except Exception:  # noqa: BLE001 - 类别表只影响提示词，不阻断复核
+        class_names = []
+
     model = _configured_model(client)
-    for attempt in (1, 2):
-        try:
-            raw = client.review_detection_structured(image_bytes, detections)
-        except Exception as exc:
-            LOGGER.warning(
-                "ai_review_upstream_failure record_id=%s model=%s exception_type=%s "
-                "status_code=%s error_code=%s",
-                record_id,
-                model,
-                type(exc).__name__,
-                _public_exception_field(exc, "status_code"),
-                _public_exception_field(exc, "code"),
-            )
-            message = _upstream_failure_message(exc)
-            fallback = AIReviewResult("needs_human_review", message)
-            _persist_review(database, record_id, fallback)
-            raise AIReviewUpstreamError(message) from exc
+    try:
+        raw = client.review_detection_structured(
+            image_bytes,
+            detections,
+            class_names=class_names,
+            secondary_image_bytes=secondary_bytes,
+            secondary_modality=record.get("secondary_modality"),
+        )
+    except AIReviewError:
+        raise
+    except Exception as exc:
+        LOGGER.warning(
+            "ai_review_upstream_failure record_id=%s model=%s exception_type=%s "
+            "status_code=%s error_code=%s",
+            record_id,
+            model,
+            type(exc).__name__,
+            _public_exception_field(exc, "status_code"),
+            _public_exception_field(exc, "code"),
+        )
+        message = _upstream_failure_message(exc)
+        fallback = AIReviewResult("needs_human_review", UPSTREAM_FAILURE_SUMMARY)
+        _persist_review(database, record_id, fallback)
+        raise AIReviewUpstreamError(message, public_message=message) from exc
 
-        try:
-            result = _parse_review_payload(raw)
-        except AIReviewParseError as exc:
-            raw_type, raw_length, response_hash = _response_metadata(raw)
-            LOGGER.warning(
-                "ai_review_parse_failure record_id=%s model=%s attempt=%s "
-                "raw_type=%s raw_length=%s response_hash=%s",
-                record_id,
-                model,
-                attempt,
-                raw_type,
-                raw_length,
-                response_hash,
-            )
-            if attempt == 1:
-                continue
-            fallback = AIReviewResult("needs_human_review", PARSE_FAILURE_SUMMARY)
-            _persist_review(database, record_id, fallback)
-            raise AIReviewParseError(PARSE_FAILURE_SUMMARY) from exc
+    try:
+        result = _parse_review_payload(raw)
+    except AIReviewParseError as exc:
+        raw_type, raw_length, response_hash = _response_metadata(raw)
+        LOGGER.warning(
+            "ai_review_parse_failure record_id=%s model=%s raw_type=%s "
+            "raw_length=%s response_hash=%s",
+            record_id,
+            model,
+            raw_type,
+            raw_length,
+            response_hash,
+        )
+        fallback = AIReviewResult("needs_human_review", PARSE_FAILURE_SUMMARY)
+        _persist_review(database, record_id, fallback)
+        raise AIReviewParseError(PARSE_FAILURE_SUMMARY) from exc
 
-        _persist_review(database, record_id, result)
-        return result
-
-    raise AssertionError("AI review retry loop exhausted unexpectedly")
+    _persist_review(database, record_id, result)
+    return result
 
 
 def check_vl_health(client) -> dict[str, Any]:

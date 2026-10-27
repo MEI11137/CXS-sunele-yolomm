@@ -5,13 +5,17 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 
 class ModelRegistryError(ValueError):
     pass
+
+
+class ModelPublishConflict(ModelRegistryError):
+    """The published model set changed after a caller's preview."""
 
 
 @dataclass(frozen=True)
@@ -44,6 +48,8 @@ class PublishResult:
     model_id: str
     previous_model_id: str | None
     publish_status: str
+    # 本次真正被归档的模型（精确清单，便于页面与 Agent 核对）
+    archived_model_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -204,9 +210,22 @@ def publish_model(
     operator_id: int,
     database,
     storage_exists: Callable[[str, str], bool] | None = None,
+    *,
+    expected_archived_model_ids: list[str] | None = None,
+    scope_model_ids: list[str] | None = None,
 ) -> PublishResult:
+    """发布一个模型，并只归档 ``scope_model_ids`` 范围内的同模态旧模型。
+
+    ``scope_model_ids`` 是**调用方按真实归属（owner + project）算出的合法范围**，
+    默认只包含该模型自己——即"不确认归属就不归档任何别人的模型"。历史实现按整张
+    ``models`` 表同模态筛选，会把其他用户/项目的已发布模型一起归档。
+    """
     conn = database.get_connection()
     conn.row_factory = sqlite3.Row
+    scope = {str(item) for item in (scope_model_ids or [model_id])}
+    scope.add(model_id)
+    scope_placeholders = ", ".join("?" for _ in scope)
+    scope_params = tuple(sorted(scope))
     try:
         conn.execute("BEGIN IMMEDIATE")
         candidate = _row(conn, "SELECT * FROM models WHERE id = ?", (model_id,))
@@ -226,34 +245,37 @@ def publish_model(
             raise ModelRegistryError("模型模式与数据集不匹配")
         if (dataset["secondary_modality"] or None) != (candidate["secondary_modality"] or None):
             raise ModelRegistryError("模型第二模态与数据集不匹配")
-        previous = _row(
-            conn,
-            """
+        published = conn.execute(
+            f"""
             SELECT id FROM models
             WHERE status = 3 AND id != ? AND model_mode = ?
               AND primary_modality = ? AND secondary_modality IS ?
-            ORDER BY create_time DESC LIMIT 1
+              AND id IN ({scope_placeholders})
+            ORDER BY create_time DESC
             """,
             (
                 model_id,
                 candidate["model_mode"],
                 candidate["primary_modality"],
                 candidate["secondary_modality"],
-            ),
-        )
-        conn.execute(
-            """
-            UPDATE models SET status = 1, publish_status = 'archived'
-            WHERE status = 3 AND id != ? AND model_mode = ?
-              AND primary_modality = ? AND secondary_modality IS ?
-            """,
-            (
-                model_id,
-                candidate["model_mode"],
-                candidate["primary_modality"],
-                candidate["secondary_modality"],
-            ),
-        )
+            )
+            + scope_params,
+        ).fetchall()
+        if (expected_archived_model_ids is not None and
+                sorted(row["id"] for row in published) != sorted(expected_archived_model_ids)):
+            raise ModelPublishConflict("待归档模型已变化，请重新预检")
+        previous = published[0] if published else None
+        archived_ids = [row["id"] for row in published]
+        if archived_ids:
+            # 精确归档清单：只更新事务内重新核对过的那几条，绝不再按模态整表更新
+            exact_placeholders = ", ".join("?" for _ in archived_ids)
+            conn.execute(
+                f"""
+                UPDATE models SET status = 1, publish_status = 'archived'
+                WHERE status = 3 AND id IN ({exact_placeholders})
+                """,
+                tuple(archived_ids),
+            )
         conn.execute(
             "UPDATE models SET status = 3, publish_status = 'published' WHERE id = ?",
             (model_id,),
@@ -277,6 +299,7 @@ def publish_model(
             model_id,
             previous["id"] if previous else None,
             "published",
+            sorted(archived_ids),
         )
     except Exception:
         conn.rollback()

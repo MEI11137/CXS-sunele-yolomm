@@ -1,7 +1,7 @@
 
 from flask import Blueprint, request, g, jsonify
 from utils.response import success, error
-from utils.jwt_util import token_required, admin_required, get_user_id
+from utils.jwt_util import token_required, admin_required, get_user_id, JWT_EXPIRATION
 from services.user_service import user_service
 from utils.models import User, UserLoginVO
 from utils.security_utils import get_current_user, is_admin
@@ -21,7 +21,13 @@ def login():
         if not login_vo:
             return error('用户名或密码错误', 400)
         
-        return success(login_vo.to_dict(), '登录成功')
+        result = login_vo.to_dict()
+        response = success(result, '登录成功')
+        response.set_cookie(
+            'cxs_file_session', result['token'], max_age=JWT_EXPIRATION,
+            path='/api/file', httponly=True, samesite='Lax', secure=request.is_secure,
+        )
+        return response
     except Exception as e:
         return error(f'登录失败: {str(e)}')
 
@@ -80,11 +86,15 @@ def update_user():
         # 管理员可以更新所有用户，普通用户只能更新自己的信息
         if not is_admin() and user_id != g.user_id:
             return error('没有权限更新该用户信息', 403)
+        if not is_admin() and 'role' in data:
+            return error('没有权限修改角色', 403)
         
         if user_service.update_user(user_id, data):
             return success(None, '更新成功')
         else:
             return error('更新失败', 400)
+    except PermissionError as e:
+        return error(str(e), 403)
     except Exception as e:
         return error(f'更新失败: {str(e)}')
 
@@ -137,7 +147,9 @@ def logout():
     """退出登录"""
     # 实际上JWT是无状态的，客户端只需要丢弃token即可
     # 这里只是为了兼容前端接口
-    return success(None, '退出成功')
+    response = success(None, '退出成功')
+    response.delete_cookie('cxs_file_session', path='/api/file', samesite='Lax')
+    return response
 
 @user_bp.route('/<int:id>', methods=['GET'])
 @admin_required

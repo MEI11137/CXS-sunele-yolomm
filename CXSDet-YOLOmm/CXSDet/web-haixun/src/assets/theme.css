@@ -1,0 +1,56 @@
+/* 主题变量 —— 浅色为默认，深色为中性黑灰（非科技蓝大屏） */
+:root,
+:root[data-theme='light'] {
+  --bg: #f3f5f7;
+  --panel: #ffffff;
+  --panel-secondary: #f6f7f8;
+  --bg-selected: #e8ebef;
+  --border: #e4e8ec;
+  --border-control: #cbd1d8;
+  --text: #17212a;
+  --text-secondary: #606b77;
+  --btn-primary: #202a33;
+  --btn-primary-text: #ffffff;
+  --accent: #1d5fbf;
+  --warn-text: #8a4b0e;
+  --warn-bg: #fff5e7;
+  --shadow-sm: 0 1px 2px rgba(17, 24, 33, 0.06);
+  --shadow-md: 0 4px 16px rgba(17, 24, 33, 0.1);
+  --focus-ring: 0 0 0 2px rgba(29, 95, 191, 0.35);
+  --scrim: rgba(17, 24, 33, 0.4);
+  --success: #1e7d46;
+  --danger: #b42318;
+  --danger-bg: #fef3f2;
+  --table-stripe: #fafbfc;
+  --track-bg: #eceff2;
+}
+
+:root[data-theme='dark'] {
+  --bg: #111111;
+  --panel: #1b1b1b;
+  --panel-secondary: #242424;
+  --bg-selected: #303030;
+  --border: #343434;
+  --border-control: #4a4a4a;
+  --text: #f1f1f1;
+  --text-secondary: #b4b4b4;
+  --btn-primary: #ffffff;
+  --btn-primary-text: #111111;
+  --accent: #6da4f5;
+  --warn-text: #e0a95f;
+  --warn-bg: #332715;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.6);
+  --focus-ring: 0 0 0 2px rgba(109, 164, 245, 0.4);
+  --scrim: rgba(0, 0, 0, 0.6);
+  --success: #4db87a;
+  --danger: #f0817a;
+  --danger-bg: #2b1a19;
+  --table-stripe: #202020;
+  --track-bg: #2a2a2a;
+}
+
+/* 照片始终保持原色，不反相 */
+img.photo {
+  filter: none !important;
+}

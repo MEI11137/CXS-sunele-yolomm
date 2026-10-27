@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 from datetime import datetime
 from PIL import Image
-from flask import Blueprint, request, g
+from flask import Blueprint, request, g, current_app
 from clients.file_client import file_client
 from utils.response import success, error
 from utils.db import db
@@ -16,7 +16,14 @@ from utils.security_utils import is_admin
 from config import TEMP_DIR, YOLO_CLASSES_CONFIG
 from services.detection_service import execute_detection
 from services.yolo_runtime import MissingModalityError
-from services.ai_review_service import AIReviewError, check_vl_health, review_detection
+from agent.identity import load_actor
+from services.personal_review_client import create_personal_review_client
+from services.ai_review_service import (
+    AIReviewError,
+    AIReviewInputError,
+    check_vl_health,
+    review_detection,
+)
 from services.review_service import (
     ReviewConflictError,
     ReviewValidationError,
@@ -26,6 +33,7 @@ from services.feedback_dataset_service import (
     FeedbackValidationError,
     add_confirmed_record,
 )
+from services.file_access import FileAccess
 from services.batch_review_service import (
     BatchValidationError,
     add_batch_confirmed_records,
@@ -377,6 +385,19 @@ def save_detection():
         if not save_data:
             return error("保存数据不能为空")
 
+        # Client-supplied file references must already be owned by this user.
+        access = None
+        for prefix in ('original_image', 'result_image', 'enhanced_image'):
+            bucket = save_data.get(f'{prefix}_bucket')
+            object_key = save_data.get(f'{prefix}_object_key')
+            if bool(bucket) != bool(object_key):
+                raise PermissionError("图像文件引用不完整")
+            if bucket:
+                if access is None:
+                    access = FileAccess(current_app.config['DATABASE'])
+                    access.require_account(g.user_id)
+                access.require_read(g.user_id, bucket, object_key)
+
         existing_record_id = save_data.get('record_id')
         if existing_record_id:
             existing = db.query(
@@ -434,6 +455,8 @@ def save_detection():
         else:
             return error("保存失败")
         
+    except PermissionError:
+        return error("图像文件无权访问", 403)
     except Exception as e:
         return error(f"保存识别结果失败: {str(e)}")
 
@@ -515,8 +538,12 @@ def review_detection_record(record_id):
         )
         if not record or (record.get('user_id') != g.user_id and not is_admin()):
             return error("识别记录不存在或无权访问", 404)
-        review = review_detection(record_id, LLMVLClient(), db, file_client)
+        review = review_detection(
+            record_id, _personal_review_client(), db, file_client
+        )
         return success(review.to_dict(), "AI辅助复核完成，请人工确认")
+    except AIReviewInputError as exc:
+        return error(exc.public_message, 400), 400
     except AIReviewError as exc:
         return error(exc.public_message, 502), 502
     except Exception as exc:
@@ -536,11 +563,13 @@ def batch_review_detection_records():
             database=db,
             storage_client=file_client,
             review_runner=review_detection,
-            client_factory=LLMVLClient,
+            client_factory=_personal_review_client,
         )
         return success(result, "批量AI辅助复核已完成，请逐条人工确认")
     except BatchValidationError as exc:
         return error(str(exc), 400), 400
+    except AgentError as exc:
+        return error(exc.message, exc.http_status), exc.http_status
     except Exception as exc:
         return error(f"批量AI辅助复核失败: {type(exc).__name__}")
 
@@ -550,9 +579,13 @@ def batch_review_detection_records():
 def llm_health():
     """验证当前用户配置的大模型和模型可见性，不返回凭据。"""
     try:
-        return success(check_vl_health(LLMVLClient()))
+        return success(check_vl_health(_personal_review_client()))
+    except AIReviewInputError as exc:
+        return error(exc.public_message, 400), 400
     except AIReviewError as exc:
         return error(exc.public_message, 502), 502
+    except AgentError as exc:
+        return error(exc.message, exc.http_status), exc.http_status
     except Exception as exc:
         return error(f"大模型连接检查失败: {type(exc).__name__}")
 
@@ -566,6 +599,44 @@ def _record_is_accessible(record_id):
         fetchone=True,
     )
     return bool(record)
+
+
+def _personal_review_client():
+    """每次调用都按**当前用户**构造：不持有共享 Key，也没有全局回退。"""
+    return create_personal_review_client(load_actor(g.user_id))
+
+
+def _publish_review_change(user_id, record_id, result):
+    """人工复核成功后：递增索引版本并发出业务变更通知。
+
+    只有真的写了新版本才发布；通知发不出去也不影响已经落库的人工决定。
+    """
+    try:
+        from agent import resources
+
+        resources.ensure("detection_records", record_id)
+        revision = resources.bump("detection_records", record_id)
+        notifier = (current_app.extensions.get("haixun_agent") or {}).get("notifier")
+        if notifier is None:
+            return
+        notifier(
+            int(user_id),
+            {
+                "tool": "review.submit_human",
+                "principal_id": int(user_id),
+                "business_refs": [
+                    {
+                        "type": "record",
+                        "id": record_id,
+                        "version": str(revision or result.new_version),
+                    }
+                ],
+                "summary": {"human_review_status": result.status},
+            },
+        )
+    except Exception:
+        # 通知/索引属于附加链路，不能把已经保存成功的人工决定报成失败
+        pass
 
 
 @detection_bp.route('/records/<record_id>/human-review', methods=['POST'])
@@ -584,6 +655,8 @@ def human_review_detection_record(record_id):
             payload.get('decision'),
             db,
         )
+        # 人工决定落库成功：递增 Agent 索引版本，再通知业务变更（B 核实版本后才接力）
+        _publish_review_change(g.user_id, record_id, result)
         return success(result.to_dict(), "人工复核已保存")
     except ReviewConflictError as exc:
         return error(str(exc), 409), 409
@@ -736,22 +809,20 @@ def delete_detection_record(record_id):
         if not record_data:
             return error("识别记录不存在或无权访问", 404)
         
-        # 删除文件服务中的图片文件
-        try:
-            # 删除原始图片
-            if record_data['original_image_bucket'] and record_data['original_image_object_key']:
-                file_client.delete(record_data['original_image_bucket'], record_data['original_image_object_key'])
-            
-            # 删除结果图片
-            if record_data['result_image_bucket'] and record_data['result_image_object_key']:
-                file_client.delete(record_data['result_image_bucket'], record_data['result_image_object_key'])
-            
-            # 删除增强图片
-            if record_data['enhanced_image_bucket'] and record_data['enhanced_image_object_key']:
-                file_client.delete(record_data['enhanced_image_bucket'], record_data['enhanced_image_object_key'])
-                
-        except Exception as e:
-            print(f"删除图片文件失败: {e}")
+        # Legacy rows may contain client-supplied keys. Removing a record must
+        # never turn such a key into authority to delete a physical object.
+        access = FileAccess(current_app.config['DATABASE'])
+        for prefix in ('original_image', 'result_image', 'enhanced_image'):
+            bucket = record_data.get(f'{prefix}_bucket')
+            object_key = record_data.get(f'{prefix}_object_key')
+            if not bucket or not object_key:
+                continue
+            try:
+                access.require_delete(g.user_id, bucket, object_key)
+            except PermissionError:
+                continue
+            file_client.delete(bucket, object_key)
+            access.mark_deleted(bucket, object_key)
         
         # 删除记录
         affected_rows = db.execute('''
@@ -777,6 +848,12 @@ def enhance_image():
         
         if not bucket or not object_key:
             return error("缺少图像文件信息")
+        try:
+            access = FileAccess(current_app.config['DATABASE'])
+            access.require_account(g.user_id)
+            access.require_read(g.user_id, bucket, object_key)
+        except PermissionError:
+            return error("图像文件无权访问", 403)
         
         # 获取原始图像
         image_data = file_client.get(bucket, object_key)
@@ -811,6 +888,10 @@ def enhance_image():
         try:
             # 上传增强后的图像
             enhanced_upload_result = file_client.upload('detection_enhanced', temp_enhanced_path)
+            access.register_upload(
+                g.user_id, enhanced_upload_result['bucket'], enhanced_upload_result['objectKey'],
+                'enhanced_image', 'image/jpeg', os.path.getsize(temp_enhanced_path),
+            )
             
             return success({
                 'enhanced_image_url': file_client.get_file_url(
@@ -843,6 +924,12 @@ def analyze_defects():
         
         if not bucket or not object_key:
             return error("缺少图像文件信息")
+        try:
+            access = FileAccess(current_app.config['DATABASE'])
+            access.require_account(g.user_id)
+            access.require_read(g.user_id, bucket, object_key)
+        except PermissionError:
+            return error("图像文件无权访问", 403)
         
         # 获取图像数据
         image_data = file_client.get(bucket, object_key)

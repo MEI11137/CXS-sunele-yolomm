@@ -66,7 +66,7 @@ def test_publish_atomically_archives_previous_active_model(tmp_path):
     from services.model_registry_service import publish_model
 
     db, path = _db(tmp_path)
-    result = publish_model("child", 7, db)
+    result = publish_model("child", 7, db, scope_model_ids=["parent", "child"])
     assert result.previous_model_id == "parent"
     conn = sqlite3.connect(path)
     states = dict(conn.execute("SELECT id, status FROM models").fetchall())
@@ -87,4 +87,19 @@ def test_failed_or_weightless_model_cannot_be_published(tmp_path):
     conn.commit()
     conn.close()
     with pytest.raises(ModelRegistryError):
-        publish_model("child", 7, db)
+        publish_model("child", 7, db, scope_model_ids=["parent", "child"])
+
+
+def test_publish_does_not_archive_models_outside_the_authorised_scope(tmp_path):
+    """发布只归档真实验权范围（本人同一项目）内的模型，别的模型必须保持发布。"""
+    from services.model_registry_service import publish_model
+
+    db, path = _db(tmp_path)
+    # 父模型不在本次核准范围内（例如属于另一项目/另一用户）
+    result = publish_model("child", 7, db, scope_model_ids=["child"])
+    assert result.previous_model_id is None
+    assert result.archived_model_ids == []
+    conn = sqlite3.connect(path)
+    states = dict(conn.execute("SELECT id, status FROM models").fetchall())
+    conn.close()
+    assert states == {"parent": 3, "child": 3}

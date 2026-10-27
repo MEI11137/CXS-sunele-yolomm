@@ -22,8 +22,9 @@ const service: AxiosInstance = axios.create({
 // 请求拦截器
 service.interceptors.request.use(
   (config) => {
-    // 从localStorage获取token
-    const token = localStorage.getItem('token')
+    // 登录态保存在 userInfo 中，与普通业务请求保持一致。
+    const storedUser = localStorage.getItem('userInfo')
+    const token = storedUser ? JSON.parse(storedUser).token : null
     if (token) {
       config.headers.Authorization = `Bearer ${token}`
     }

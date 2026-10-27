@@ -1,6 +1,5 @@
 
 import os
-import uuid
 import tempfile
 import json
 import re
@@ -10,20 +9,16 @@ import mimetypes
 import math
 from io import BytesIO
 from pathlib import Path
-from datetime import datetime
 from flask import Blueprint, g, request, send_file
 from werkzeug.utils import secure_filename
 from clients.file_client import file_client
 from utils.response import success, error
 from utils.db import db
-from utils.jwt_util import admin_required
-from utils.models import Dataset, DATASET_STATUS
+from utils.jwt_util import token_required
+from utils.resource_guard import register_new, resource_required, visible_ids, project_target_required
+from utils.models import Dataset
 from config import TEMP_DIR
-from services.dataset_contract import (
-    DatasetValidationError,
-    inject_generated_data_yaml,
-    validate_dataset_archive,
-)
+from services.dataset_import_service import DatasetImportError, import_dataset_archive
 from services.feedback_dataset_service import (
     FeedbackValidationError,
     create_feedback_dataset_draft,
@@ -45,7 +40,8 @@ from services.video_dataset_service import VideoDatasetConfig, generate_video_da
 dataset_bp = Blueprint('dataset', __name__, url_prefix='/api/dataset')
 
 @dataset_bp.route('/upload', methods=['POST'])
-@admin_required
+@token_required
+@project_target_required
 def upload_dataset():
     """上传数据集"""
     try:
@@ -88,62 +84,53 @@ def upload_dataset():
             temp_file_path = temp_file.name
             
         try:
-            try:
-                validation = validate_dataset_archive(
-                    temp_file_path,
-                    dataset_mode,
-                    secondary_modality=secondary_modality or None,
-                    class_names=class_names or None,
-                )
-                inject_generated_data_yaml(temp_file_path, validation)
-            except DatasetValidationError as exc:
-                return error(f"数据集格式验证失败: {exc}", 400)
-            structure_result = validation.to_dict()
-            
-            # 上传到文件服务
-            upload_result = file_client.upload('datasets', temp_file_path)
-            
-            # 保存到数据库
-            dataset_id = str(uuid.uuid4())
-            file_size = os.path.getsize(temp_file_path)
-            
-            affected_rows = db.execute('''
-                INSERT INTO datasets (id, name, description, zip_bucket, zip_object_key,
-                                    structure_info, upload_time, file_size, status,
-                                    dataset_mode, primary_modality, secondary_modality,
-                                    runtime_mapping)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                dataset_id, name, description, upload_result['bucket'], upload_result['objectKey'],
-                json.dumps(structure_result), datetime.now().isoformat(), file_size, 
-                DATASET_STATUS['APPROVED'], dataset_mode, validation.primary_modality,
-                validation.secondary_modality, json.dumps(validation.runtime_mapping, ensure_ascii=False)
-            ))
-            
-            if affected_rows > 0:
-                return success({
-                    'id': dataset_id,
-                    'name': name,
-                    'description': description,
-                    'structure_info': structure_result,
-                    'dataset_mode': dataset_mode,
-                    'primary_modality': validation.primary_modality,
-                    'secondary_modality': validation.secondary_modality,
-                    'file_size': file_size,
-                    'upload_time': datetime.now().isoformat()
-                }, "数据集上传成功")
-            else:
-                return error("保存数据集信息失败")
-            
+            # Shared import service: the same validation and registration used
+            # by the business tool layer, so the page and the agent cannot
+            # diverge on what an importable archive is.
+            imported = import_dataset_archive(
+                zip_path=temp_file_path,
+                name=name,
+                description=description,
+                dataset_mode=dataset_mode,
+                secondary_modality=secondary_modality or None,
+                class_names=class_names or None,
+                database=db,
+                storage_client=file_client,
+            )
+        except DatasetImportError as exc:
+            return error(str(exc), 400), 400
         finally:
             # 清理临时文件
             os.unlink(temp_file_path)
+
+        register_new(
+            'dataset',
+            imported['dataset_id'],
+            project_id=request.form.get('project_id'),
+            display_name=imported['name'],
+        )
+
+        return success({
+            'id': imported['dataset_id'],
+            'name': imported['name'],
+            'description': imported['description'],
+            'structure_info': imported['structure_info'],
+            'dataset_mode': imported['dataset_mode'],
+            'primary_modality': imported['primary_modality'],
+            'secondary_modality': imported['secondary_modality'],
+            'file_size': imported['file_size'],
+            'upload_time': imported['upload_time'],
+            'class_names': imported['class_names'],
+            'split_counts': imported['split_counts'],
+            'samples': imported['total_samples'],
+            'warnings': imported['warnings'],
+        }, "数据集上传成功")
             
     except Exception as e:
         return error(f"上传数据集失败: {str(e)}")
 
 @dataset_bp.route('/list', methods=['GET'])
-@admin_required
+@token_required
 def list_datasets():
     """获取数据集列表"""
     try:
@@ -247,6 +234,18 @@ def list_datasets():
                     },
                 })
 
+        # 列表按同一套归属规则过滤：普通用户只看本人（及系统默认只读）资源，
+        # 不能因为去掉 admin_required 就把别人的数据集列出来。
+        allowed_datasets = visible_ids('dataset')
+        allowed_drafts = visible_ids('draft')
+        if allowed_datasets is not None or allowed_drafts is not None:
+            def _visible(item):
+                if item.get('record_kind') == 'draft':
+                    return allowed_drafts is None or item['id'] in allowed_drafts
+                return allowed_datasets is None or item['id'] in allowed_datasets
+
+            records = [item for item in records if _visible(item)]
+
         records.sort(key=lambda item: str(item.get('upload_time') or ''), reverse=True)
         total = len(records)
         offset = (page - 1) * page_size
@@ -264,7 +263,7 @@ def list_datasets():
         return error(f"获取数据集列表失败: {str(e)}")
 
 @dataset_bp.route('/<dataset_id>', methods=['GET'])
-@admin_required
+@resource_required('dataset', 'dataset_id', 'read')
 def get_dataset(dataset_id):
     """获取数据集详情"""
     try:
@@ -298,7 +297,7 @@ def get_dataset(dataset_id):
         return error(f"获取数据集详情失败: {str(e)}")
 
 @dataset_bp.route('/<dataset_id>', methods=['PUT'])
-@admin_required
+@resource_required('dataset', 'dataset_id', 'write')
 def update_dataset(dataset_id):
     """更新数据集信息"""
     try:
@@ -334,7 +333,7 @@ def update_dataset(dataset_id):
         return error(f"更新数据集信息失败: {str(e)}")
 
 @dataset_bp.route('/<dataset_id>', methods=['DELETE'])
-@admin_required
+@resource_required('dataset', 'dataset_id', 'write')
 def delete_dataset(dataset_id):
     """删除数据集"""
     try:
@@ -370,7 +369,7 @@ def delete_dataset(dataset_id):
         return error(f"删除数据集失败: {str(e)}")
 
 @dataset_bp.route('/<dataset_id>/download', methods=['GET'])
-@admin_required
+@resource_required('dataset', 'dataset_id', 'read')
 def download_dataset(dataset_id):
     """下载数据集"""
     try:
@@ -407,7 +406,7 @@ def download_dataset(dataset_id):
 
 
 @dataset_bp.route('/drafts/<draft_id>/samples', methods=['GET'])
-@admin_required
+@resource_required('draft', 'draft_id', 'read')
 def get_dataset_draft_samples(draft_id):
     try:
         draft = get_draft(draft_id, db)
@@ -448,7 +447,7 @@ def get_dataset_draft_samples(draft_id):
 
 
 @dataset_bp.route('/drafts/<draft_id>/samples/<sample_id>/assign', methods=['POST'])
-@admin_required
+@resource_required('draft', 'draft_id', 'write')
 def assign_dataset_draft_sample(draft_id, sample_id):
     data = request.get_json(silent=True) or {}
     split = data.get('split')
@@ -462,7 +461,7 @@ def assign_dataset_draft_sample(draft_id, sample_id):
 
 
 @dataset_bp.route('/drafts/<draft_id>/assign', methods=['POST'])
-@admin_required
+@resource_required('draft', 'draft_id', 'write')
 def assign_dataset_draft_samples(draft_id):
     data = request.get_json(silent=True) or {}
     try:
@@ -475,7 +474,7 @@ def assign_dataset_draft_samples(draft_id):
 
 
 @dataset_bp.route('/drafts/<draft_id>/samples/<sample_id>/preview/<kind>', methods=['GET'])
-@admin_required
+@resource_required('draft', 'draft_id', 'read')
 def preview_dataset_draft_sample(draft_id, sample_id, kind):
     if kind not in {'rgb', 'secondary', 'label'}:
         return error("预览类型无效", 400)
@@ -509,7 +508,7 @@ def preview_dataset_draft_sample(draft_id, sample_id, kind):
 
 
 @dataset_bp.route('/drafts/<draft_id>/samples/<sample_id>/secondary', methods=['POST'])
-@admin_required
+@resource_required('draft', 'draft_id', 'write')
 def upload_dataset_draft_secondary(draft_id, sample_id):
     image_file = request.files.get('file')
     if not image_file or not image_file.filename:
@@ -568,7 +567,7 @@ def upload_dataset_draft_secondary(draft_id, sample_id):
 
 
 @dataset_bp.route('/drafts/<draft_id>/finalize', methods=['POST'])
-@admin_required
+@resource_required('draft', 'draft_id', 'write')
 def finalize_dataset_draft(draft_id):
     os.makedirs(TEMP_DIR, exist_ok=True)
     try:
@@ -651,7 +650,7 @@ def _retry_video_draft_worker(draft_id):
 
 
 @dataset_bp.route('/drafts/<draft_id>/retry', methods=['POST'])
-@admin_required
+@resource_required('draft', 'draft_id', 'write')
 def retry_dataset_draft(draft_id):
     draft = get_draft(draft_id, db)
     if not draft:
@@ -705,7 +704,7 @@ def retry_dataset_draft(draft_id):
 
 
 @dataset_bp.route('/<dataset_id>/feedback-version', methods=['POST'])
-@admin_required
+@resource_required('dataset', 'dataset_id', 'write')
 def build_feedback_dataset_version(dataset_id):
     """把人工确认样本保存为等待人工划分的数据集草稿。"""
     os.makedirs(TEMP_DIR, exist_ok=True)

@@ -22,3 +22,11 @@ def test_create_app_accepts_isolated_runtime_paths(isolated_app_paths):
     assert flask_app.config["FILE_STORE_PATH"] == str(isolated_app_paths["file_store"])
     rules = {rule.rule for rule in flask_app.url_map.iter_rules()}
     assert "/api/health/health_check" in rules
+    preflight = flask_app.test_client().options(
+        "/api/user/login",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert preflight.headers.get("Access-Control-Allow-Credentials") == "true"

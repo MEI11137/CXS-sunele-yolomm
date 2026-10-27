@@ -17,6 +17,7 @@ from routes.model import model_bp
 from routes.detection import detection_bp
 from routes.video_detection import video_detection_bp
 from routes.realtime_detection import realtime_detection_bp
+from agent.registry import register_agent
 
 def create_app(config_overrides=None):
     """创建 Flask 应用，并允许测试安全地覆盖运行目录。"""
@@ -29,7 +30,14 @@ def create_app(config_overrides=None):
     if config_overrides:
         flask_app.config.update(config_overrides)
 
-    CORS(flask_app)
+    frontend_origins = [
+        origin.strip()
+        for origin in os.environ.get(
+            'FRONTEND_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000'
+        ).split(',')
+        if origin.strip()
+    ]
+    CORS(flask_app, origins=frontend_origins, supports_credentials=True)
 
     # 注册路由(注意：url前缀已经在路由文件中设置，无需重复设置)
     flask_app.register_blueprint(health_bp)
@@ -40,6 +48,8 @@ def create_app(config_overrides=None):
     flask_app.register_blueprint(detection_bp)
     flask_app.register_blueprint(video_detection_bp)
     flask_app.register_blueprint(realtime_detection_bp)
+    # Agent 后端：公共迁移、内置手册、启动核对与 /api/agent 路由
+    register_agent(flask_app)
     return flask_app
 
 

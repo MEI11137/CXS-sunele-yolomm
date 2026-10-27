@@ -14,6 +14,7 @@ from utils.db import db
 from utils.models import User, UserInfo, UserLoginVO, PageVO, encrypt_password
 from utils.jwt_util import generate_token
 from clients.file_client import file_client
+from services.file_access import FileAccess
 import logging
 
 # 配置日志
@@ -110,13 +111,21 @@ class UserService:
         old_object_key = user.avatar_object_key
         new_bucket = user_data.get('avatarBucket')
         new_object_key = user_data.get('avatarObjectKey')
+        if 'avatarBucket' in user_data or 'avatarObjectKey' in user_data:
+            effective_bucket = new_bucket if 'avatarBucket' in user_data else old_bucket
+            effective_key = new_object_key if 'avatarObjectKey' in user_data else old_object_key
+            if bool(effective_bucket) != bool(effective_key):
+                raise PermissionError("头像文件信息不完整")
+            if effective_bucket:
+                FileAccess(db.db_path).require_avatar_assignment(user_id, effective_bucket, effective_key)
         
         if ((new_bucket is not None and new_bucket != old_bucket) or 
             (new_object_key is not None and new_object_key != old_object_key)):
             # 如果旧头像存在，尝试删除
             if old_bucket and old_object_key:
                 try:
-                    # 使用文件客户端删除旧头像
+                    FileAccess(db.db_path).require_avatar_assignment(user_id, old_bucket, old_object_key)
+                    FileAccess(db.db_path).mark_deleted(old_bucket, old_object_key)
                     file_client.delete(old_bucket, old_object_key)
                 except Exception as e:
                     # 删除失败不影响更新
@@ -286,7 +295,10 @@ class UserService:
         # 删除用户头像
         if user.avatar_bucket and user.avatar_object_key:
             try:
-                # 使用文件客户端删除头像
+                FileAccess(db.db_path).require_avatar_assignment(
+                    user_id, user.avatar_bucket, user.avatar_object_key
+                )
+                FileAccess(db.db_path).mark_deleted(user.avatar_bucket, user.avatar_object_key)
                 file_client.delete(user.avatar_bucket, user.avatar_object_key)
             except Exception as e:
                 logger.error(f"删除用户头像失败: {str(e)}")
