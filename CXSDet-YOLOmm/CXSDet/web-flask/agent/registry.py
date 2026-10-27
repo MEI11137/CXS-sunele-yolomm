@@ -63,6 +63,9 @@ def register_agent(app) -> Dict[str, Any]:
 
     if "agent_bp" not in app.blueprints:
         app.register_blueprint(agent_bp)
+    from agent.opencode_runtime import opencode_bp
+    if "opencode_bridge" not in app.blueprints:
+        app.register_blueprint(opencode_bp)
     return report
 
 

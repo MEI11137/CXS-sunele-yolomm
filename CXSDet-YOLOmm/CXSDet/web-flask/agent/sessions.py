@@ -146,13 +146,13 @@ def append_message(
 def list_messages(
     session_id: str, limit: Optional[int] = None, newest_first: bool = False
 ) -> List[Dict[str, Any]]:
-    sql = "SELECT * FROM agent_message WHERE session_id = ? ORDER BY created_at"
+    sql = "SELECT * FROM agent_message WHERE session_id = ? ORDER BY created_at, rowid"
     params: List[Any] = [session_id]
     if limit:
         # 取最近 N 条：先按时间倒序截断，再翻回正序
         sql = (
-            "SELECT * FROM (SELECT * FROM agent_message WHERE session_id = ? "
-            "ORDER BY created_at DESC LIMIT ?) ORDER BY created_at"
+            "SELECT * FROM (SELECT rowid AS message_order, * FROM agent_message WHERE session_id = ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT ?) ORDER BY created_at, message_order"
         )
         params.append(int(limit))
     conn = connect()

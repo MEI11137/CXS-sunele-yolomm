@@ -201,6 +201,11 @@ def model_client(actor: ActorContext) -> OpenAIGateway:
     return OpenAIGateway(_credentials(actor), client_factory=_gateway_factory)
 
 
+def provider_credentials(actor: ActorContext) -> ProviderCredentials:
+    """服务端引擎适配器使用；不得序列化到 API、日志或前端。"""
+    return _credentials(actor)
+
+
 def capabilities(actor: ActorContext) -> Dict[str, Any]:
     view = get_connection_view(actor)
     return (view or {}).get("capabilities", {})

@@ -543,6 +543,8 @@ class AgentBackendTest(unittest.TestCase):
 
         register_agent(self.app)
         if gateway is not None:
+            # 本组验证旧执行器契约；新默认 OpenCode 有独立真实协议验收。
+            self.app.config["AGENT_ENGINE"] = "legacy"
             original = connections.model_client
             connections.configure_gateway_factory(None)
             connections.model_client = lambda actor: gateway

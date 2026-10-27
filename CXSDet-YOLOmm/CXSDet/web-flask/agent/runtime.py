@@ -1284,8 +1284,14 @@ class AgentRuntime:
 
 
 def get_runtime() -> AgentRuntime:
-    """默认运行时（真实模型客户端 + 已注册工具）。"""
-    return AgentRuntime()
+    """站点默认使用 OpenCode；旧执行器仅供回归测试/显式回滚。"""
+    import os
+    from flask import current_app
+    engine = current_app.config.get("AGENT_ENGINE") or os.environ.get("AGENT_ENGINE", "opencode")
+    if str(engine).lower() == "legacy":
+        return AgentRuntime()
+    from agent.opencode_runtime import app_runtime
+    return app_runtime()
 
 
 def set_business_backend(backend: Any) -> None:

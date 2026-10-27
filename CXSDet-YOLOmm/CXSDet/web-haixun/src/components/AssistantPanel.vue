@@ -85,12 +85,13 @@ async function send() {
   scrollToBottom()
 
   abortCtrl.value = new AbortController()
+  const sendingSessionId = session.currentId
   await session.send(
     content,
     {
       resourceRefs: refs,
       onDelta: (delta) => {
-        const cur = session.current()
+        const cur = session.sessions.find(s => s.id === sendingSessionId)
         if (cur && cur.messages.length) {
           const last = cur.messages[cur.messages.length - 1]
           if (last.streaming) last.content += delta

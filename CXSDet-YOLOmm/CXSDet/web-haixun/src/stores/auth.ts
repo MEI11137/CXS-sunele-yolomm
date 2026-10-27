@@ -124,10 +124,7 @@ export const useAuthStore = defineStore('auth', () => {
     workspace.loaded = false
 
     const session = useSessionStore()
-    session.sessions = []
-    session.currentId = ''
-    session.loaded = false
-    session.lastTurn = null
+    session.reset()
 
     const inspection = useInspectionStore()
     inspection.defects = []
