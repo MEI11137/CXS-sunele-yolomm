@@ -610,14 +610,14 @@ def scope_ids(source_table: str, source_id: str) -> List[str]:
             rows = query_all(
                 conn,
                 "SELECT source_id FROM agent_resource WHERE source_table = ? "
-                "AND owner_id = ? AND project_id = ? AND source_id IS NOT NULL",
+                "AND owner_id = ? AND project_id = ? AND source_id IS NOT NULL AND deleted_at IS NULL",
                 (source_table, owner_id, project_id),
             )
         else:
             rows = query_all(
                 conn,
                 "SELECT source_id FROM agent_resource WHERE source_table = ? "
-                "AND owner_id = ? AND source_id IS NOT NULL",
+                "AND owner_id = ? AND source_id IS NOT NULL AND deleted_at IS NULL",
                 (source_table, owner_id),
             )
     finally:
@@ -682,6 +682,8 @@ def access_check(
     finally:
         conn.close()
     view = permissions._resource_view(row) if row else None
+    if view and view.get('deleted_at'):
+        raise LookupError('资源已移入回收站，请先恢复')
     if view is None:
         # 历史/新写入但尚未登记：能推导出归属就顺手补登记（幂等、不猜）
         view = ensure(table, business_id, kind=kind)

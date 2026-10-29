@@ -1,15 +1,27 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, computed, onMounted, watch } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
 import { getAdapter } from '@/services'
 import type { DetectionRecordSummary } from '@/types'
+import { reviewStatus } from '@/utils/reviewStatus'
+import { useResourceRefresh } from '@/utils/resourceLifecycle'
+import { request } from '@/services/http'
+import { feedbackEligibleRecords } from '@/utils/feedbackSelection'
 
 const router = useRouter()
+const route = useRoute()
 const records = ref<DetectionRecordSummary[]>([])
 const page = ref(1)
 const total = ref(0)
 const busy = ref(false)
 const error = ref('')
+const selected = ref<string[]>([])
+const reviewingIds = ref<string[]>([])
+const reviewResults = ref<Array<{ record_id: string; status: string; error?: string }>>([])
+const reviewNotice = ref('')
+const feedbackNotice = ref('')
+const feedbackResults = ref<Array<{ record_id: string; status: string; error?: string }>>([])
+const eligibleFeedback = computed(() => feedbackEligibleRecords(records.value, selected.value))
 async function load() {
   busy.value = true
   try { const result = await getAdapter().listRecords({ page: page.value, pageSize: 50 }); records.value = result.items; total.value = result.total; error.value = '' }
@@ -17,28 +29,39 @@ async function load() {
   finally { busy.value = false }
 }
 onMounted(load)
+useResourceRefresh(load)
 const defects = computed(() => records.value.map(r => ({
   id: r.id, turbineId: r.model_name || r.model_id, bladeFile: r.title || r.id,
   suspectedType: [...new Set(r.detections.map(x => x.class_name))].join('、') || '未检出目标',
   confidence: Math.max(0, ...r.detections.map(x => x.confidence)),
-  reviewStatus: ['confirmed', 'no_defect'].includes(r.human_review_status) ? 'done' : 'pending', raw: r,
+  reviewStatus: reviewStatus(r.human_review_status), raw: r,
 })))
-async function process(r: DetectionRecordSummary, feedback = false) {
-  if (busy.value) return
-  if (feedback && !window.confirm(`确认把记录 ${r.id} 加入原训练数据集反馈池？仅接收当前人工确认版本。`)) return
-  busy.value = true; error.value = ''
+async function addFeedback(ids: string[]) {
+  if (busy.value || reviewingIds.value.length) return
+  const unique = [...new Set(ids)]
+  const targets = feedbackEligibleRecords(records.value, unique)
+  if (!targets.length) { feedbackNotice.value = '所选记录均已加入反馈池，或尚未人工确认，没有新增样本。'; return }
+  const skipped = unique.length - targets.length
+  if (!window.confirm(`确认将所选 ${targets.length} 条人工确认记录加入反馈池？${skipped ? `\n跳过 ${skipped} 条未确认或已入池的记录。` : ''}\n${targets.map(row => `${row.title || row.id} [${row.id}]`).join('\n')}\n按每条记录检测模型关联的原数据集分别入池。不修改原数据集文件，不自动生成新版本或训练。`)) return
+  busy.value = true; error.value = ''; feedbackNotice.value = ''; feedbackResults.value = []
   try {
-    if (feedback) {
-      const result = await getAdapter().addFeedbackBatch([r.id])
-      if (Number(result.failed || 0)) throw new Error(JSON.stringify(result))
-    } else await getAdapter().requestAiReview(r.id)
+    const result = await getAdapter().addFeedbackBatch(targets.map(row => row.id))
+    feedbackResults.value = (result.items || []) as typeof feedbackResults.value
+    const groups = (result.dataset_groups || []) as Array<{ dataset_name: string; record_ids: string[] }>
+    const destinations = groups.map(group => `${group.dataset_name}：${group.record_ids.length} 条`).join('；')
+    feedbackNotice.value = `本次加入反馈池：成功 ${Number(result.succeeded || 0)} 条，失败 ${Number(result.failed || 0)} 条${skipped ? `，跳过 ${skipped} 条` : ''}。${destinations ? destinations + '。' : ''}尚未生成数据集版本。`
+    const completed = new Set(feedbackResults.value.filter(item => item.status === 'success').map(item => item.record_id))
+    selected.value = selected.value.filter(id => !completed.has(id))
     await load()
-  } catch (e) { error.value = (e as Error).message }
+  } catch (e) { error.value = (e as Error).message; feedbackNotice.value = '加入反馈池未全部完成，请核对列表状态；不会自动重复提交。' }
   finally { busy.value = false }
 }
 
 const search = ref('')
-const statusFilter = ref<'all' | 'pending' | 'reviewing' | 'done'>('all')
+const statusFilter = ref<'all' | 'pending' | 'reviewing' | 'done' | 'rejected'>('all')
+watch(() => route.query.status, value => {
+  if (['all', 'pending', 'done', 'rejected'].includes(String(value))) statusFilter.value = String(value) as typeof statusFilter.value
+}, { immediate: true })
 
 const filtered = computed(() => {
   return defects.value.filter((d) => {
@@ -51,13 +74,56 @@ const filtered = computed(() => {
     return matchSearch && matchStatus
   })
 })
+watch(() => filtered.value.map(row => row.id), ids => { selected.value = selected.value.filter(id => ids.includes(id)) })
+const allSelected = computed(() => !!filtered.value.length && filtered.value.every(row => selected.value.includes(row.id)))
+function selectAll(event: Event) { selected.value = (event.target as HTMLInputElement).checked ? filtered.value.map(row => row.id) : [] }
+async function review(ids: string[], batch = false) {
+  if (reviewingIds.value.length) return
+  const targets = [...new Set(ids)]
+  if (!targets.length || targets.length > 50) return
+  if (batch && !window.confirm(`仅核查已勾选的 ${targets.length} 条记录，将调用本人模型 API。不会核查未选记录，也不会自动提交人工结论。确认继续？`)) return
+  reviewingIds.value = targets; reviewResults.value = []; error.value = ''
+  reviewNotice.value = `正在核查 ${targets.length} 条${batch ? '已选记录' : '指定记录'}，未选记录不会处理。`
+  try {
+    if (batch) {
+      const result = await getAdapter().requestAiReviews(targets)
+      reviewResults.value = (result.items || []) as typeof reviewResults.value
+      reviewNotice.value = `本次仅处理已选 ${targets.length} 条：成功 ${Number(result.succeeded || 0)}，失败 ${Number(result.failed || 0)}。失败项不会自动重试。`
+    } else {
+      await getAdapter().requestAiReview(targets[0])
+      reviewResults.value = [{ record_id: targets[0], status: 'success' }]
+      reviewNotice.value = `单条核查完成，仅更新记录 ${targets[0]}，其他记录未核查。`
+    }
+    await load()
+  } catch (e) {
+    error.value = (e as Error).message
+    reviewNotice.value = '核查未全部完成，不会自动重发请求。'
+  } finally { reviewingIds.value = [] }
+}
+function aiLabel(value: string) {
+  return ({ not_requested: '未核查', consistent: '结果一致', possible_false_positive: '疑似误报', possible_missed_detection: '疑似漏报', needs_human_review: '需人工复核', failed: '核查失败', running: '核查中' } as Record<string, string>)[value] || value
+}
+async function deleteRecords(ids: string[]) {
+  if (busy.value || reviewingIds.value.length) return
+  const targets = [...new Set(ids)].map(id => records.value.find(row => row.id === id)).filter((row): row is DetectionRecordSummary => !!row)
+  if (!targets.length || targets.length > 50) return
+  if (!window.confirm(`确认删除所选 ${targets.length} 条记录？\n${targets.map(row => (row.title || row.id) + ' [' + row.id + ']').join('\n')}\n只隐藏这些记录，保留图片、数据集、模型和回流来源，可由助手恢复。`)) return
+  busy.value = true; error.value = ''
+  try {
+    const result = await request<{ count: number }>('/api/detection/records/delete/batch', { method: 'POST', body: {
+      records: targets.map(row => ({ record_id: row.id, expected_version: row.review_version ?? 0 })) } })
+    reviewNotice.value = `已删除所选 ${result.count} 条记录，文件和历史来源保留。`
+    await load()
+  } catch (e) { error.value = (e as Error).message }
+  finally { busy.value = false }
+}
 
 function statusLabel(s: string) {
-  return s === 'pending' ? '待复核' : s === 'reviewing' ? '复核中' : '已完成'
+  return s === 'rejected' ? '已驳回' : s === 'pending' ? '待复核' : s === 'reviewing' ? '复核中' : '已完成'
 }
 
 function statusClass(s: string) {
-  return s === 'pending' ? 'tag-warn' : s === 'reviewing' ? 'tag-accent' : 'tag-success'
+  return s === 'pending' || s === 'rejected' ? 'tag-warn' : s === 'reviewing' ? 'tag-accent' : 'tag-success'
 }
 
 // CSV 导出：转义特殊字符 + 防止公式注入
@@ -108,7 +174,7 @@ function goReview(id: string) {
       <input v-model="search" class="input search-input" type="search" placeholder="在本页搜索模型 / 记录 / 缺陷类型" />
       <div class="status-tabs" role="tablist">
         <button
-          v-for="s in [['all', '全部'], ['pending', '待复核'], ['reviewing', '复核中'], ['done', '已完成']]"
+          v-for="s in [['all', '全部'], ['pending', '待复核'], ['reviewing', '复核中'], ['done', '已完成'], ['rejected', '已驳回']]"
           :key="s[0]"
           class="status-tab"
           :class="{ active: statusFilter === s[0] }"
@@ -122,10 +188,23 @@ function goReview(id: string) {
     </div>
 
     <div class="panel table-wrap">
+      <div class="batch-toolbar">
+        <span>已选 {{ selected.length }} 条（仅当前页筛选结果）</span>
+        <button class="btn btn-sm" :disabled="!selected.length || !!reviewingIds.length || busy" @click="review(selected, true)">批量 AI 核查所选</button>
+        <button class="btn btn-sm" :disabled="!eligibleFeedback.length || !!reviewingIds.length || busy" title="仅处理已勾选、已人工确认且尚未加入反馈池的记录" @click="addFeedback(selected)">批量加入反馈所选（{{ eligibleFeedback.length }}）</button>
+        <button class="btn btn-sm" :disabled="!selected.length || !!reviewingIds.length || busy" @click="deleteRecords(selected)">批量删除所选</button>
+        <button class="btn btn-sm" :disabled="!selected.length || !!reviewingIds.length" @click="selected = []">清空选择</button>
+      </div>
       <p v-if="error" role="alert">{{ error }}</p>
+      <p v-if="reviewNotice" role="status">{{ reviewNotice }}</p>
+      <p class="feedback-hint">加入反馈池仅收集人工确认样本；在「数据集」生成反馈草稿、划分并定稿后，才得到新数据集，不会直接覆盖原数据集文件。</p>
+      <p v-if="feedbackNotice" role="status">{{ feedbackNotice }}</p>
+      <ul v-if="feedbackResults.some(item => item.status !== 'success')"><li v-for="item in feedbackResults.filter(item => item.status !== 'success')" :key="item.record_id">{{ item.record_id }}：{{ item.error || '加入反馈池失败' }}</li></ul>
+      <ul v-if="reviewResults.some(item => item.status !== 'success')"><li v-for="item in reviewResults.filter(item => item.status !== 'success')" :key="item.record_id">{{ item.record_id }}：{{ item.error || '核查失败' }}</li></ul>
       <table class="data-table">
         <thead>
           <tr>
+            <th><input type="checkbox" aria-label="全选当前页筛选记录" :checked="allSelected" :disabled="!!reviewingIds.length || busy" @change="selectAll" /></th>
             <th>检测模型</th>
             <th>记录</th>
             <th>疑似缺陷</th>
@@ -137,20 +216,22 @@ function goReview(id: string) {
         </thead>
         <tbody>
           <tr v-for="d in filtered" :key="d.id">
+            <td><input v-model="selected" type="checkbox" :value="d.id" :aria-label="'选择记录 ' + d.id" :disabled="busy || !!reviewingIds.length" /></td>
             <td><span class="mono num">{{ d.turbineId }}</span></td>
             <td class="file-cell">{{ d.bladeFile }}</td>
             <td><span class="tag">{{ d.suspectedType }}</span></td>
             <td class="num">{{ (d.confidence * 100).toFixed(0) }}%</td>
             <td><span class="tag" :class="statusClass(d.reviewStatus)">{{ statusLabel(d.reviewStatus) }}</span></td>
-            <td>{{ d.raw.ai_review_status }} · {{ d.raw.feedback_dataset_id ? '已回流' : '未回流' }}</td>
+            <td>{{ reviewingIds.includes(d.id) ? '正在核查此条…' : aiLabel(d.raw.ai_review_status) }} · {{ d.raw.feedback_dataset_id ? '已入反馈池' : '未入反馈池' }}</td>
             <td class="action-col">
               <button class="btn btn-sm" @click="goReview(d.id)">查看 / 复核</button>
-              <button class="btn btn-sm" :disabled="busy" @click="process(d.raw)">AI 核查</button>
-              <button v-if="d.reviewStatus === 'done'" class="btn btn-sm" :disabled="busy || !!d.raw.feedback_dataset_id" @click="process(d.raw, true)">加入反馈</button>
+              <button class="btn btn-sm" :disabled="busy || !!reviewingIds.length" @click="review([d.id])">{{ reviewingIds.includes(d.id) ? '正在核查…' : '仅核查此条' }}</button>
+              <button v-if="d.reviewStatus === 'done'" class="btn btn-sm" :disabled="busy || !!reviewingIds.length || !!d.raw.feedback_dataset_id" @click="addFeedback([d.id])">{{ d.raw.feedback_dataset_id ? '已入反馈池' : '加入反馈' }}</button>
+              <button class="btn btn-sm" :disabled="busy || !!reviewingIds.length" @click="deleteRecords([d.id])">删除此条</button>
             </td>
           </tr>
           <tr v-if="!filtered.length">
-            <td colspan="7">
+            <td colspan="8">
               <div class="empty">
                 <div class="empty-title">没有匹配的记录</div>
                 <div class="empty-desc">调整搜索条件或筛选状态后重试</div>
@@ -167,6 +248,8 @@ function goReview(id: string) {
 </template>
 
 <style scoped>
+.feedback-hint { padding: 0 14px; color: var(--text-secondary); font-size: 12px; line-height: 1.7; }
+.batch-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); font-size: 13px; }
 .page {
   padding: var(--content-pad);
   max-width: 1100px;

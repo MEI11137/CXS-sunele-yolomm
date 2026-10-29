@@ -109,7 +109,26 @@ def token_required(f):
         
         # 将用户ID保存到全局对象中，供视图函数使用
         g.user_id = user_id
-        
+        if request.headers.get('X-Project-Id') and request.path.startswith(('/api/dataset', '/api/model', '/api/detection')):
+            from utils.resource_guard import validate_project_request
+            blocked = validate_project_request(user_id)
+            if blocked is not None:
+                return blocked
+        from services.project_storage import project_scope, strict_workspace
+        if request.path.startswith(('/api/dataset', '/api/model', '/api/detection', '/api/video', '/api/realtime')):
+            project_id = request.headers.get('X-Project-Id')
+            if project_id:
+                try:
+                    from agent.identity import load_actor
+                    from agent.permissions import get_project
+                    from flask import current_app
+                    get_project(load_actor(user_id), project_id)
+                    with project_scope(current_app.config['DATABASE'], project_id):
+                        return f(*args, **kwargs)
+                except ValueError as exc:
+                    return error(str(exc), 409), 409
+            if strict_workspace() and request.method in {'POST', 'PUT', 'PATCH', 'DELETE'}:
+                return error('请从已绑定本机文件夹的项目中执行此操作', 409), 409
         return f(*args, **kwargs)
     return decorated
 

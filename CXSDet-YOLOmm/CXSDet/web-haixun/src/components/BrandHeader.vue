@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import WorkspaceSwitcher from './WorkspaceSwitcher.vue'
 
 defineProps<{ workspaceName: string; inline?: boolean }>()
 </script>
@@ -18,7 +17,6 @@ defineProps<{ workspaceName: string; inline?: boolean }>()
       </div>
       <span class="brand-name">海巡智检</span>
     </div>
-    <WorkspaceSwitcher v-if="!inline" :workspace-name="workspaceName" />
   </div>
 </template>
 
@@ -36,7 +34,7 @@ defineProps<{ workspaceName: string; inline?: boolean }>()
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 14px;
+  margin-bottom: 0;
 }
 .brand.inline .brand-row {
   margin-bottom: 0;

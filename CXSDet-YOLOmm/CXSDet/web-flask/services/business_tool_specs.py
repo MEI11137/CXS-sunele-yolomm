@@ -196,6 +196,48 @@ _SPECS: list[ToolSpec] = [
         deps=(("storage_client", "requires the protected storage adapter"),),
     ),
     _tool(
+        "dataset.inspect_samples",
+        "Read actual image identity and sample paths inside a registered dataset, including dimensions, "
+        "file and decoded-pixel hashes, duplicates, cross-split leakage and label conflicts. "
+        "Match current confirmed feedback or one authorized record to original samples, including old JPEG95 conversions. "
+        "Returns existing/new/ambiguous evidence; filenames alone never authorize replacement. Read-only, does not deduplicate or change labels.",
+        _object({'dataset_id': {'type': 'string', 'minLength': 1}, 'record_id': {'type': 'string', 'minLength': 1},
+                 'page': {'type': 'integer', 'minimum': 1}, 'page_size': {'type': 'integer', 'minimum': 1, 'maximum': 100},
+                 'search': {'type': 'string', 'maxLength': 200}}, ['dataset_id']),
+        {'dataset_id': {'type': 'string'}, 'total_samples': {'type': 'integer'}, 'scan_complete': {'type': 'boolean'},
+         'duplicate_groups': {'type': 'integer'}, 'duplicates': {'type': 'array'},
+         'feedback_matches': {'type': 'array'}, 'samples': {'type': 'array'}},
+        effect='read', kind='dataset', id_field='dataset_id', resource_actions=('dataset:read',),
+        deps=(("storage_client", "requires the protected storage adapter"),),
+    ),
+    _tool(
+        "dataset.feedback_revision",
+        "Return current human-confirmed feedback to its source dataset as a new revision. "
+        "Preserve the source archive and existing train/val/test assignments; replace annotations "
+        "of content-matched images, append genuinely new images to the explicitly selected split. "
+        "Preview exact counts and conflicts, then register the revision in the project workspace. "
+        "Does not train. For a separate feedback-only dataset use draft.create_from_feedback then assign_splits/finalize.",
+        _object({'dataset_id': {'type': 'string', 'minLength': 1}, 'name': _TEXT,
+                 'new_sample_split': {'type': 'string', 'enum': ['train', 'val', 'test']}},
+                ['dataset_id', 'name', 'new_sample_split']),
+        {'dataset_id': {'type': 'string'}, 'source_dataset_id': {'type': 'string'},
+         'name': {'type': 'string'}, 'total_samples': {'type': 'integer'},
+         'split_counts': {'type': 'object'}, 'output_dir': {'type': 'string'}, 'candidate_id': {'type': 'string'}},
+        kind='dataset', id_field='dataset_id', resource_actions=('dataset:read', 'dataset:create'),
+        deps=(("storage_client", "requires the protected storage adapter"),),
+    ),
+    _tool(
+        "dataset.split",
+        "Split or re-split a complete registered dataset into train/val/test using explicit ratios. Preview real counts and conflicts, then create and register a new dataset version; never overwrite the source or train a model.",
+        _object({"dataset_id": {"type": "string", "minLength": 1}, "name": _TEXT,
+                 "split_policy": {"type": "object", "values": {"type": "number"}, "minProperties": 2}},
+                ["dataset_id", "name", "split_policy"]),
+        {"dataset_id": {"type": "string"}, "source_dataset_id": {"type": "string"},
+         "name": {"type": "string"}, "split_counts": {"type": "object"}, "total_samples": {"type": "integer"},
+         "candidate_id": {"type": "string"}, "output_dir": {"type": "string"}},
+        kind="dataset", id_field="dataset_id", resource_actions=("dataset:read", "dataset:create"), deps=_FILE_DEPS,
+    ),
+    _tool(
         "dataset.register_candidate",
         "Validate a previously built candidate directory as a YOLO archive and "
         "register it as a new dataset. The source data is left untouched.",
@@ -520,8 +562,8 @@ _SPECS: list[ToolSpec] = [
         kind="draft",
         id_field="draft_id",
         resource_actions=("draft:update",),
-        # 样本划分是人的决定，首版不交给 Agent 代为完成
-        agent_executable=False,
+        # 按用户明确指令划分，沿用真实服务、样本ID校验和业务确认卡。
+        agent_executable=True,
     ),
     _tool(
         "draft.finalize",

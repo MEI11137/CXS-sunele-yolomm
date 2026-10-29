@@ -77,6 +77,8 @@ def install(
                 (int(user_id), f"user{user_id}", "x", int(role)),
             )
         for index, (source_table, payload) in enumerate(_iter(resources)):
+            conn.execute("INSERT OR IGNORE INTO agent_project (id,owner_id,name,requirements_json,origin,status,created_at,updated_at) VALUES (?,?,?,'{}','legacy','active',?,?)",
+                         (payload['project_id'], int(payload['owner_id']), '授权测试项目-' + payload['project_id'], '2026-01-01T00:00:00','2026-01-01T00:00:00'))
             conn.execute(
                 "INSERT OR REPLACE INTO agent_resource "
                 "(id, kind, project_id, owner_id, display_name, revision, "

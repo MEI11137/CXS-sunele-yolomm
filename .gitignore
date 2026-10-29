@@ -53,10 +53,20 @@ pnpm-debug.log*
 **/.jwt-secret
 
 # Runtime databases, logs, temporary files, and backups
+.runtime/
+.run/
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
 *.log
 temp/
 tmp/

@@ -99,6 +99,10 @@ def test_detection_uploads_outputs_and_automatically_inserts_record(tmp_path):
     assert "INSERT INTO detection_records" in database.sql
     assert result.record_id in database.params
     assert "completed" in database.params
+    identity = __import__('json').loads(database.params[-1])
+    assert identity['rgb']['original_name'] == 'rgb.jpg'
+    assert identity['rgb']['size'] == rgb.stat().st_size
+    assert identity['rgb']['width'] == 40
 
 
 def test_edge_detection_generates_and_persists_x_input(tmp_path):
@@ -156,3 +160,22 @@ def test_database_failure_removes_newly_uploaded_objects(tmp_path):
     assert set(storage.deleted) == {
         (item["bucket"], item["objectKey"]) for item in storage.uploads
     }
+
+
+def test_gif_source_stays_unchanged_while_inference_uses_private_png(tmp_path):
+    from services.detection_service import execute_detection
+    from services.yolo_runtime import DetectionOutput
+    rgb=tmp_path/'source.gif'; Image.new('RGB',(40,40),(120,60,30)).save(rgb,'GIF')
+    original=rgb.read_bytes(); storage=MemoryStorage(); database=CapturingDb(); seen={}
+    upload=storage.upload
+    def capture(bucket,path):
+        if bucket=='detection_original': seen['source']=Path(path).read_bytes()
+        return upload(bucket,path)
+    storage.upload=capture
+    def predict(detector,inputs,confidence):
+        assert inputs.rgb_path.endswith('-inference.png')
+        return DetectionOutput([],[])
+    execute_detection(user_id=7,model_meta=_model(),rgb_path=str(rgb),x_path=None,confidence=.5,
+                      work_dir=str(tmp_path/'work'),storage_client=storage,database=database,
+                      detector_loader=lambda *args:object(),predictor=predict)
+    assert seen['source']==original and rgb.read_bytes()==original

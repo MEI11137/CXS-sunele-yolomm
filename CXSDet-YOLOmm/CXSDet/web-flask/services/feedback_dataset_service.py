@@ -65,13 +65,15 @@ def add_confirmed_record(record_id: str, target_dataset_id: str, database) -> Fe
         )
         record = conn.execute(
             """
-            SELECT id, human_review_status, corrected_annotations
+            SELECT *
             FROM detection_records WHERE id = ?
             """,
             (record_id,),
         ).fetchone()
         if record is None:
             raise FeedbackValidationError("识别记录不存在")
+        if 'record_status' in record.keys() and record['record_status'] == 'deleted':
+            raise FeedbackValidationError('已删除记录不能新增反馈，请先恢复')
         if record["human_review_status"] != "confirmed":
             raise FeedbackValidationError("只有人工确认的记录才能加入反馈数据集")
         canonical, annotations = _canonical_annotations(record["corrected_annotations"])
@@ -153,9 +155,12 @@ def create_feedback_dataset_draft(
         ).fetchone()
         if source is None:
             raise FeedbackValidationError("源反馈数据集不存在")
+        # Older standalone databases may not yet have the lifecycle column.
+        record_columns = {column[1] for column in conn.execute('PRAGMA table_info(detection_records)')}
+        active_only = " AND COALESCE(dr.record_status, '') <> 'deleted'" if 'record_status' in record_columns else ''
         rows = conn.execute(
             """
-            SELECT fs.id AS feedback_sample_id, dr.id AS record_id,
+            SELECT fs.id AS feedback_sample_id, fs.annotation_hash, dr.id AS record_id,
                    dr.human_review_status, dr.corrected_annotations,
                    dr.original_image_bucket, dr.original_image_object_key,
                    dr.secondary_image_bucket, dr.secondary_image_object_key,
@@ -163,12 +168,12 @@ def create_feedback_dataset_draft(
             FROM feedback_samples fs
             JOIN detection_records dr ON dr.id = fs.record_id
             WHERE fs.dataset_id = ? AND dr.human_review_status = 'confirmed'
-            ORDER BY dr.id, fs.id
-            """,
+            """ + active_only + " ORDER BY dr.id, fs.id",
             (dataset_id,),
         ).fetchall()
     finally:
         conn.close()
+    rows = [row for row in rows if hashlib.sha256(_canonical_annotations(row['corrected_annotations'])[0].encode('utf-8')).hexdigest() == row['annotation_hash']]
     if not rows:
         raise FeedbackValidationError("反馈数据集中还没有已确认样本")
     class_names = dataset_class_names(source["structure_info"])

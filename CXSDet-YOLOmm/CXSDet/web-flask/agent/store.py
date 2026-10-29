@@ -18,11 +18,14 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 9
 
 # 旧库补列清单：表 -> {列名: 列定义}。只有加法，可重复执行。
 _COLUMN_MIGRATIONS: Dict[str, Dict[str, str]] = {
+    "agent_resource": {"deleted_at": "TEXT"},
     "agent_action": {"prepared_id": "TEXT"},
+    "agent_project": {"root_directory": "TEXT"},
+    "agent_session": {"deleted_at": "TEXT", "permission_mode": "TEXT NOT NULL DEFAULT 'request'"},
 }
 
 _PREPARED_PATHS: set = set()
@@ -128,6 +131,31 @@ def query_one(conn: sqlite3.Connection, sql: str, params: Iterable[Any] = ()) ->
 
 
 _SCHEMA_STATEMENTS = [
+    """CREATE TABLE IF NOT EXISTS agent_resource_change (
+        request_key TEXT PRIMARY KEY, action_id TEXT, owner_id INTEGER NOT NULL,
+        project_id TEXT NOT NULL, resource_id TEXT NOT NULL, operation TEXT NOT NULL,
+        outputs_json TEXT NOT NULL, created_at TEXT NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS agent_review_action (
+        request_key TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, project_id TEXT NOT NULL,
+        record_id TEXT NOT NULL, action_id TEXT NOT NULL, status TEXT NOT NULL,
+        outputs_json TEXT, created_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS agent_dev_connection (
+        id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, project_id TEXT NOT NULL,
+        session_id TEXT NOT NULL, source TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL,
+        expires_at INTEGER NOT NULL, revoked_at TEXT, created_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS agent_dev_request (
+        connection_id TEXT NOT NULL, request_id TEXT NOT NULL, text_hash TEXT NOT NULL,
+        response_json TEXT, created_at TEXT NOT NULL, PRIMARY KEY(connection_id, request_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS agent_inspection_run (
+        id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, project_id TEXT NOT NULL,
+        session_id TEXT NOT NULL, task_id TEXT NOT NULL, status TEXT NOT NULL,
+        plan_json TEXT NOT NULL, state_json TEXT NOT NULL DEFAULT '{}',
+        request_key TEXT UNIQUE, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_inspection_task ON agent_inspection_run(task_id)",
     """
     CREATE TABLE IF NOT EXISTS agent_project (
         id TEXT PRIMARY KEY,

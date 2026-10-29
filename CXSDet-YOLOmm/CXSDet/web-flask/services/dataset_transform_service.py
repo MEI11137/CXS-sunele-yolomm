@@ -122,10 +122,11 @@ def _feedback_samples(adapter, dataset_id: str) -> list[dict]:
         rows = conn.execute(
             """SELECT fs.id AS sample_id, fs.annotation_hash, dr.id AS record_id, dr.corrected_annotations,
                       dr.original_image_bucket, dr.original_image_object_key,
-                      dr.secondary_image_bucket, dr.secondary_image_object_key
+                      dr.secondary_image_bucket, dr.secondary_image_object_key, dr.review_version, dr.input_identity_json
                FROM feedback_samples fs
                JOIN detection_records dr ON dr.id = fs.record_id
                WHERE fs.dataset_id=? AND dr.human_review_status='confirmed'
+                 AND COALESCE(dr.record_status, '') <> 'deleted'
                ORDER BY fs.id""",
             (dataset_id,),
         ).fetchall()
@@ -139,7 +140,7 @@ def _feedback_samples(adapter, dataset_id: str) -> list[dict]:
     return current
 
 
-def _merge_feedback(adapter, scan, source):
+def _merge_feedback(adapter, scan, source, arguments=None):
     """Materialize confirmed feedback into a private source copy before planning.
 
     Feedback has no implicit split: an explicit split_policy is required, or
@@ -151,6 +152,8 @@ def _merge_feedback(adapter, scan, source):
     rows = _feedback_samples(adapter, source['dataset_id'])
     if not rows:
         raise ValueError('没有与当前人工标注版本一致的反馈样本，请先人工确认并加入反馈池')
+    if (arguments or {}).get('_feedback_revision_split'):
+        return _revise_feedback(adapter, scan, source, rows, arguments['_feedback_revision_split'])
     for row in rows:
         _, annotations = _canonical_annotations(row['corrected_annotations'])
         _validate_annotations(annotations, scan['class_names'])
@@ -173,6 +176,79 @@ def _merge_feedback(adapter, scan, source):
     return merged
 
 
+def _revise_feedback(adapter, scan, source, rows, new_split):
+    """Revise a private copy: content matches retain their original split/key."""
+    from services.feedback_dataset_service import _canonical_annotations, _yolo_label
+    from services.review_service import _validate_annotations
+    from services.dataset_identity_service import sample_index, match_image, public_match, image_identity
+    root = Path(scan['root'])
+    index = sample_index(scan)
+    applied, decisions = {}, []
+    replaced, added = set(), set()
+    secondary = source.get('secondary_modality')
+    for row in rows:
+        _, annotations = _canonical_annotations(row['corrected_annotations'])
+        _validate_annotations(annotations, scan['class_names'])
+        label_text = _yolo_label(annotations)
+        assets = {'rgb': adapter.storage_client.get(row['original_image_bucket'], row['original_image_object_key'])}
+        if secondary:
+            if not row['secondary_image_bucket'] or not row['secondary_image_object_key']:
+                raise ValueError('反馈缺少配套模态图片，不能回原数据集')
+            assets[secondary] = adapter.storage_client.get(row['secondary_image_bucket'], row['secondary_image_object_key'])
+        digest = hashlib.sha256(assets['rgb']).hexdigest()
+        metadata = json.loads(row.get('input_identity_json') or '{}')
+        match = match_image(assets['rgb'], index, (metadata.get('rgb') or {}).get('original_name', ''))
+        details = public_match(match)
+        if match['classification'] == 'ambiguous':
+            source.setdefault('identity_conflicts', []).append({'code': 'SAMPLE_IDENTITY_AMBIGUOUS',
+                'message': f"记录 {row['record_id']} 的来源不唯一或只有同名线索，请核对原样本，不能自动覆盖或新增"})
+            decisions.append({'record_id': row['record_id'], 'review_version': row['review_version'],
+                              'action': 'needs_match_confirmation', **details})
+            continue
+        matches = match['candidates']
+        identity_key = matches[0]['key'] if matches else (match['image'].get('pixel_sha256') or digest)
+        signature = (label_text, tuple((key, image_identity(value).get('pixel_sha256') or hashlib.sha256(value).hexdigest()) for key, value in sorted(assets.items())))
+        if identity_key in applied and applied[identity_key] != signature:
+            raise ValueError('同一图片存在不同的复核标注或配套模态，请先处理冲突')
+        already_applied = identity_key in applied
+        applied[identity_key] = signature
+        keys = []
+        if matches:
+            for sample in matches:
+                if secondary:
+                    paired = sample['modalities'].get(secondary)
+                    if not paired or match_image(assets[secondary], [{'identity': image_identity(Path(paired).read_bytes(), legacy=True)}])['classification'] != 'existing':
+                        raise ValueError('反馈 RGB 与原图对应，但配套模态不一致，不能自动覆盖')
+                if not sample['label']:
+                    raise ValueError('原样本缺少标签文件，请先修复原数据集')
+                Path(sample['label']).write_text(label_text, encoding='utf-8')
+                keys.append(sample['key']); replaced.add(sample['key'])
+            action = 'replace_annotation'
+        else:
+            # Stable feedback key prevents repeated records of the same image becoming duplicates.
+            key = 'feedback_' + identity_key
+            for modality, payload in assets.items():
+                if already_applied: continue
+                directory = 'images' if modality == 'rgb' else 'images_' + modality
+                object_key = row['original_image_object_key'] if modality == 'rgb' else row['secondary_image_object_key']
+                target = root / directory / new_split / (key + (Path(object_key).suffix.lower() or '.jpg'))
+                target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(payload)
+            label = root / 'labels' / new_split / (key + '.txt')
+            label.parent.mkdir(parents=True, exist_ok=True); label.write_text(label_text, encoding='utf-8')
+            keys.append(new_split + '/' + key); added.add(identity_key)
+            action = 'add_sample'
+        decisions.append({'sample_id': row['sample_id'], 'record_id': row['record_id'],
+                          'review_version': row['review_version'], 'annotation_hash': row['annotation_hash'],
+                          'action': action, 'sample_keys': keys, **details})
+    source['feedback_samples'] = decisions
+    source['revision'] = {'feedback_count': len(rows), 'replaced_samples': len(replaced),
+                          'added_samples': len(added), 'new_sample_split': new_split,
+                          'ambiguous_samples': len(source.get('identity_conflicts', []))}
+    merged = scan_dataset_tree(root)
+    merged['_workspace'] = scan['_workspace']
+    return merged
+
+
 def _input_fingerprint(scan):
     items = []
     for sample in sorted(scan['samples'], key=lambda s: s['key']):
@@ -186,7 +262,7 @@ def _plan(scan: dict, arguments: dict, source: dict, provided_classes: list[str]
     source_classes = list(scan["class_names"]) if not scan["class_names_derived"] else []
     if provided_classes:
         source_classes = list(provided_classes)
-    conflicts: list[dict] = []
+    conflicts: list[dict] = list(source.get('identity_conflicts', []))
     warnings: list[dict] = []
     if scan.get('sample_count', len(scan['samples'])) != len(scan['samples']):
         conflicts.append({'code': 'SCAN_TRUNCATED', 'message': '源样本超过扫描上限，不能把部分扫描结果当成完整候选'})
@@ -375,7 +451,7 @@ def plan_from_dataset(adapter, dataset_resource, arguments: dict) -> dict:
     try:
         source['project_id'] = dataset_resource.project_id
         if arguments.get('include_feedback'):
-            scan = _merge_feedback(adapter, scan, source)
+            scan = _merge_feedback(adapter, scan, source, arguments)
         plan = _plan(scan, arguments, source, arguments.get("class_names"))
         plan['input_fingerprint'] = _input_fingerprint(scan)
     finally:
@@ -606,9 +682,10 @@ def build_candidate_from_dataset(adapter, dataset_resource, arguments: dict,
     try:
         source["project_id"] = dataset_resource.project_id
         if arguments.get('include_feedback'):
-            scan = _merge_feedback(adapter, scan, source)
+            scan = _merge_feedback(adapter, scan, source, arguments)
         plan = _plan(scan, arguments, source, arguments.get("class_names"))
-        if plan.get('blocked') or _input_fingerprint(scan) != preview.get('input_fingerprint'):
+        if (plan.get('blocked') or _input_fingerprint(scan) != preview.get('input_fingerprint')
+                or source.get('feedback_samples') != preview.get('source', {}).get('feedback_samples')):
             from services.tool_common import ToolRefused
             raise ToolRefused('TRANSFORM_INPUT_CHANGED', '源文件、反馈或标注已变化，或存在未解决冲突，请重新预览并确认')
         return _execute(adapter, scan, source, arguments, plan, "dataset", dataset_resource.id, source.get('feedback_samples'))

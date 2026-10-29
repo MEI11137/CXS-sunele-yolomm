@@ -95,7 +95,9 @@ def build_messages(
     for message in recent:
         role = message["role"]
         if role == "user":
-            history.append({"role": "user", "content": message["content"]})
+            review = [ref['review_context'] for ref in message.get('refs', []) if isinstance(ref, dict) and isinstance(ref.get('review_context'), dict)]
+            suffix = '\n【本条消息发送时的复核页面上下文；草稿未提交，不是人工确认或执行授权】\n' + dumps(review) if review else ''
+            history.append({"role": "user", "content": message["content"] + suffix})
         elif role == "assistant":
             history.append({"role": "assistant", "content": message["content"] or "（无文字）"})
         elif role == "tool":

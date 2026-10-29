@@ -60,6 +60,7 @@ def run_schema_migrations(conn: sqlite3.Connection) -> None:
         "feedback_dataset_id": "TEXT",
         "review_version": "INTEGER NOT NULL DEFAULT 0",
         "request_key": "TEXT",
+        "input_identity_json": "TEXT NOT NULL DEFAULT '{}'",
     }
     video_detection_columns = {
         "dataset_generation_status": "TEXT NOT NULL DEFAULT 'not_requested'",

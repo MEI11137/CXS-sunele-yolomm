@@ -15,7 +15,7 @@ onMounted(async () => {
   // 先用已保存的 Token 校验身份，再决定能加载什么数据
   await auth.bootstrap()
   try {
-    await Promise.all([workspace.load(), inspection.load()])
+    if (auth.isLoggedIn) await Promise.all([workspace.load(), inspection.load()])
   } catch (e) {
     // 未登录时接口会 401：保留空状态，由登录浮层引导，不伪造数据
     console.warn('[海巡智检] 首屏数据加载失败：', e)
@@ -47,7 +47,7 @@ watch(
   () => workspace.currentId,
   () => {
     inspection.loaded = false
-    inspection.load()
+    if (auth.isLoggedIn) void inspection.load().catch(e => console.warn('[海巡智检] 项目巡检数据加载失败', e))
   },
 )
 </script>

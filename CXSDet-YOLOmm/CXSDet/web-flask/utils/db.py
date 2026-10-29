@@ -6,10 +6,11 @@ from config import DB_PATH
 from utils.schema_migrations import run_schema_migrations
 
 class Database:
-    def __init__(self, db_path: str | Path | None = None):
+    def __init__(self, db_path: str | Path | None = None, *, seed_demo: bool = False):
         # 允许显式指定库路径：worker 进程必须和当前 app 用同一个库，
         # 否则训练结果会写进默认库，页面查不到。
         self.db_path = str(db_path) if db_path else DB_PATH
+        self.seed_demo = seed_demo
         self.initialize_db()
 
     def initialize_db(self):
@@ -18,6 +19,8 @@ class Database:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
+        # 正式安装默认为空业务库；仅隔离演示/测试显式选择种子，重启不补回删除项。
+        seed_demo = self.seed_demo and cursor.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='datasets'").fetchone() is None
         
         # 创建用户表
         cursor.execute('''
@@ -167,7 +170,7 @@ class Database:
 
         # 检查是否有默认数据集，如果没有则创建
         cursor.execute("SELECT COUNT(*) FROM datasets WHERE id = 'default-dataset-001'")
-        if cursor.fetchone()[0] == 0:
+        if cursor.fetchone()[0] == 0 and seed_demo:
             # 添加默认数据集
             cursor.execute('''
             INSERT INTO datasets (id, name, description, zip_bucket, zip_object_key, structure_info, upload_time, file_size, status)
@@ -186,7 +189,7 @@ class Database:
             
         # 检查是否有默认模型，如果没有则创建
         cursor.execute("SELECT COUNT(*) FROM models WHERE id = 'default-model-001'")
-        if cursor.fetchone()[0] == 0:
+        if cursor.fetchone()[0] == 0 and seed_demo:
             # 添加默认模型
             cursor.execute('''
             INSERT INTO models (id, name, description, dataset_id, base_model, epochs, batch_size, status, model_bucket, model_object_key, train_result, create_time, start_time, complete_time)

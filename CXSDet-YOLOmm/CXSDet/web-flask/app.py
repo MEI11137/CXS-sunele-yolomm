@@ -26,6 +26,7 @@ def create_app(config_overrides=None):
         DATABASE=DB_PATH,
         TEMP_DIR=TEMP_DIR,
         FILE_STORE_PATH=FILE_STORE_CONFIG['base_path'],
+        PROJECT_FILES_IN_WORKSPACE=True,
     )
     if config_overrides:
         flask_app.config.update(config_overrides)

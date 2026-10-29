@@ -12,4 +12,4 @@ from __future__ import annotations
 __all__ = ["__version__"]
 
 # 对外接口版本：字段与状态含义变化时必须递增，并在开发日志中记录影响。
-__version__ = "1.0.0"
+__version__ = "1.1.0"

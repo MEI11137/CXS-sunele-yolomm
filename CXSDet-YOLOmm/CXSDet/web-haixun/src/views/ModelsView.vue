@@ -3,6 +3,9 @@ import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getAdapter } from '@/services'
 import type { DatasetSummary, ModelSummary } from '@/types'
+import ResourceRecycle from '@/components/ResourceRecycle.vue'
+import { changeResource, useResourceRefresh } from '@/utils/resourceLifecycle'
+import { request } from '@/services/http'
 import { useWorkspaceStore } from '@/stores/workspace'
 const workspace = useWorkspaceStore()
 
@@ -31,6 +34,22 @@ async function train() {
 }
 
 const published = computed(() => models.value.filter((m) => m.is_published))
+const changingResource = ref('')
+async function deleteModel(m: ModelSummary) {
+  if (changingResource.value) return
+  changingResource.value = m.id
+  try { if (await changeResource('model', m.id, 'delete')) { noticeType.value = 'success'; notice.value = '模型已移入回收站，权重和历史来源保留。'; await load() } }
+  catch (e) { noticeType.value = 'error'; notice.value = (e as Error).message }
+  finally { changingResource.value = '' }
+}
+async function unpublish(m: ModelSummary) {
+  if (changingResource.value || !window.confirm(`撤销发布「${m.name}」？不会自动恢复其他模型，也不会删除权重。`)) return
+  changingResource.value = m.id
+  try { await request('/api/model/' + encodeURIComponent(m.id) + '/unpublish', { method: 'POST' }); noticeType.value = 'success'; notice.value = '已撤销发布。'; await load() }
+  catch (e) { noticeType.value = 'error'; notice.value = (e as Error).message }
+  finally { changingResource.value = '' }
+}
+useResourceRefresh(load)
 const unpublished = computed(() => models.value.filter((m) => !m.is_published))
 
 // 状态：0 训练中 / 1 训练完成 / 2 训练失败 / 3 已发布 / 4 训练终止
@@ -284,6 +303,8 @@ function goInspect(modelId: string) {
           <div v-else class="no-metrics">该模型没有记录训练指标</div>
           <div class="card-actions">
             <button class="btn btn-sm" @click="goInspect(m.id)">用它做检测</button>
+            <button class="btn btn-sm" :disabled="!!changingResource" @click="unpublish(m)">撤销发布</button>
+            <button class="btn btn-sm" :disabled="!!changingResource" @click="deleteModel(m)">删除</button>
           </div>
         </div>
       </div>
@@ -309,6 +330,7 @@ function goInspect(modelId: string) {
               {{ publishing === m.id ? '发布中…' : '发布' }}
             </button>
             <span v-if="!canPublish(m)" class="hint">只有「训练完成」的模型可以发布</span>
+            <button class="btn btn-sm" :disabled="!!changingResource" @click="deleteModel(m)">删除</button>
           </div>
         </div>
       </div>
@@ -347,6 +369,7 @@ function goInspect(modelId: string) {
       </div>
     </section>
 
+    <ResourceRecycle :kinds="['model']" @changed="load" />
     <!-- 权重导入 -->
     <div v-if="showImport" class="overlay" @click.self="showImport = false">
       <div class="dialog" role="dialog" aria-label="导入模型权重">

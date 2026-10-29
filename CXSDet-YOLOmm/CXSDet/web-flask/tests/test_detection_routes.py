@@ -35,6 +35,9 @@ def test_detect_route_returns_automatically_saved_record_and_accepts_x_image(mon
 
     def fake_execute_detection(**kwargs):
         captured.update(kwargs)
+        from pathlib import Path
+        captured['original_bytes'] = Path(kwargs['rgb_path']).read_bytes()
+        captured['secondary_bytes'] = Path(kwargs['x_path']).read_bytes()
         return SimpleNamespace(
             record_id="record-auto",
             original_image_url="http://files/original.jpg",
@@ -78,6 +81,10 @@ def test_detect_route_returns_automatically_saved_record_and_accepts_x_image(mon
     assert captured["user_id"] == 3
     assert captured["model_meta"]["secondary_modality"] == "ir"
     assert captured["x_path"] is not None
+    assert captured['original_bytes'] == _jpeg().getvalue()
+    assert captured['secondary_bytes'] == _jpeg((50,50,50)).getvalue()
+    assert captured['input_metadata']['rgb_name'] == 'rgb.jpg'
+    assert captured['input_metadata']['secondary_name'] == 'ir.jpg'
 
 
 def test_detect_route_reports_missing_ir_as_client_error(monkeypatch, tmp_path):

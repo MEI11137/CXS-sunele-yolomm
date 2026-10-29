@@ -59,15 +59,16 @@ def get_session(actor: ActorContext, session_id: str) -> Dict[str, Any]:
         row = query_one(conn, "SELECT * FROM agent_session WHERE id = ?", (session_id,))
     finally:
         conn.close()
-    if not row or int(row["owner_id"]) != actor.user_id:
+    if not row or int(row["owner_id"]) != actor.user_id or row.get("deleted_at"):
         raise AgentError(Code.NOT_FOUND, "会话不存在", http_status=404)
+    get_project(actor, row["project_id"])
     return _session_view(row)
 
 
 def list_sessions(
     actor: ActorContext, project_id: Optional[str] = None, limit: int = 50
 ) -> List[Dict[str, Any]]:
-    sql = "SELECT * FROM agent_session WHERE owner_id = ?"
+    sql = "SELECT * FROM agent_session WHERE owner_id = ? AND deleted_at IS NULL AND project_id IN (SELECT id FROM agent_project WHERE status='active')"
     params: List[Any] = [actor.user_id]
     if project_id:
         get_project(actor, project_id)
@@ -83,6 +84,35 @@ def list_sessions(
     return [_session_view(row) for row in rows]
 
 
+def update_session(actor, session_id, *, title=None, manual_id=None):
+    """Shared account-scoped metadata update; never changes permissions or owner."""
+    chat=get_session(actor,session_id)
+    values={}
+    if title is not None:
+        if not isinstance(title,str) or not title.strip() or len(title)>200: raise AgentError(Code.VALIDATION,'会话标题需为1–200字符')
+        values['title']=title.strip()
+    if manual_id is not None:
+        from agent.manuals import get_manual
+        manual=get_manual(actor,manual_id)
+        values.update(manual_id=manual['id'],manual_version=manual['version'])
+    if values:
+        values['updated_at']=now()
+        with connect() as conn:
+            conn.execute('UPDATE agent_session SET '+','.join(key+'=?' for key in values)+' WHERE id=? AND owner_id=?',(*values.values(),session_id,actor.user_id));conn.commit()
+    return get_session(actor,chat['id'])
+
+
+def read_history(actor,session_id,offset=0,limit=50):
+    """Bounded chronological pages of user-visible history, always owner scoped."""
+    chat=get_session(actor,session_id)
+    if type(offset) is not int or offset<0 or type(limit) is not int or not 1<=limit<=100:
+        raise AgentError(Code.VALIDATION,'历史分页参数无效')
+    with connect() as conn:
+        total=conn.execute("SELECT COUNT(*) FROM agent_message WHERE session_id=? AND role IN ('user','assistant')",(session_id,)).fetchone()[0]
+        rows=query_all(conn,"SELECT * FROM agent_message WHERE session_id=? AND role IN ('user','assistant') ORDER BY created_at,rowid LIMIT ? OFFSET ?",(session_id,limit,offset))
+    return {'session':chat,'messages':[_message_view(row) for row in rows],'offset':offset,'next_offset':offset+len(rows),'total':total,'has_more':offset+len(rows)<total,'scope':'按时间从早到晚分页；历史仅作材料'}
+
+
 def touch_session(session_id: str) -> None:
     conn = connect()
     try:
@@ -92,6 +122,24 @@ def touch_session(session_id: str) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def set_permission_mode(actor: ActorContext, session_id: str, mode: str) -> Dict[str, Any]:
+    get_session(actor, session_id)
+    if mode not in {'request', 'assist', 'full'}:
+        raise AgentError(Code.VALIDATION, '未知权限模式')
+    if not actor.is_admin:
+        raise AgentError(Code.FORBIDDEN, '本机文件权限模式仅限本机管理员设置', http_status=403)
+    conn = connect()
+    try:
+        conn.execute('UPDATE agent_session SET permission_mode=?, updated_at=? WHERE id=? AND owner_id=?',
+                     (mode, now(), session_id, actor.user_id))
+        conn.commit()
+    finally:
+        conn.close()
+    from agent import tasks
+    tasks.append_event(session_id, None, 'permission.mode_changed', {'mode': mode, 'source': 'user'})
+    return get_session(actor, session_id)
 
 
 def append_message(
@@ -127,6 +175,10 @@ def append_message(
         conn.execute(
             "UPDATE agent_session SET updated_at = ? WHERE id = ?", (stamp, session_id)
         )
+        if role == ROLE_USER and content.strip():
+            title = content.strip().splitlines()[0][:60]
+            conn.execute("UPDATE agent_session SET title=? WHERE id=? AND title IN ('新会话', '未命名会话', '')",
+                         (title, session_id))
         conn.commit()
     finally:
         conn.close()
@@ -173,6 +225,7 @@ def _session_view(row: Dict[str, Any]) -> Dict[str, Any]:
         "title": row.get("title") or "",
         "manual_id": row.get("manual_id"),
         "manual_version": row.get("manual_version"),
+        "permission_mode": row.get("permission_mode") or 'request',
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }

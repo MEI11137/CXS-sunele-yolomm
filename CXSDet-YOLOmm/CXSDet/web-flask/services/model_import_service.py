@@ -13,6 +13,8 @@ from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
 
 from config import TEMP_DIR
+from services.project_storage import ProjectTempPath
+TEMP_DIR = ProjectTempPath(TEMP_DIR)
 from services.training_service import MULTIMODAL_BASELINE_YAML
 from services.yolo_runtime import load_detector
 

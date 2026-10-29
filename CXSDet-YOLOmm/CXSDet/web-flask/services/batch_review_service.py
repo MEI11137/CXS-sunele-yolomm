@@ -50,14 +50,12 @@ def _load_accessible_record(record_id: str, user_id: int, is_admin_user: bool, d
     conn = database.get_connection()
     conn.row_factory = sqlite3.Row
     try:
-        if is_admin_user:
-            return conn.execute(
-                "SELECT id, user_id FROM detection_records WHERE id = ?", (record_id,)
-            ).fetchone()
-        return conn.execute(
-            "SELECT id, user_id FROM detection_records WHERE id = ? AND user_id = ?",
-            (record_id, user_id),
-        ).fetchone()
+        sql = 'SELECT * FROM detection_records WHERE id = ?'
+        params = (record_id,)
+        if not is_admin_user:
+            sql += ' AND user_id = ?'; params += (user_id,)
+        row = conn.execute(sql, params).fetchone()
+        return None if row and 'record_status' in row.keys() and row['record_status'] == 'deleted' else row
     finally:
         conn.close()
 

@@ -78,6 +78,7 @@ def create_action(
     resource_revisions: Optional[Dict[str, Any]] = None,
     revision: int = 1,
     prepared_id: Optional[str] = None,
+    automatic_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """创建确认卡。
 
@@ -92,6 +93,8 @@ def create_action(
     # 标题随预览一起持久化，避免前端只能看到工具内部名
     preview_payload = dict(preview or {})
     preview_payload.setdefault("tool_title", tool_title)
+    if automatic_mode:
+        preview_payload['approval'] = {'source': 'session_policy', 'mode': automatic_mode}
 
     conn = connect()
     try:
@@ -106,6 +109,13 @@ def create_action(
                     "同一请求键对应了不同参数，拒绝执行",
                     http_status=409,
                 )
+            if automatic_mode and existing['status'] == STATUS_PENDING:
+                # A fresh server-side preview replaces the old pending snapshot under
+                # the same request key. This never revives rejected/completed actions.
+                conn.execute('UPDATE agent_action SET preview_json=?,prepared_id=?,created_at=?,updated_at=? WHERE id=? AND status=?',
+                             (dumps(preview_payload), prepared_id, now(), now(), existing['id'], STATUS_PENDING))
+                conn.commit()
+                existing = query_one(conn, 'SELECT * FROM agent_action WHERE id=?', (existing['id'],))
             return _action_view(existing)
 
         action_id = new_id("act")
@@ -144,6 +154,8 @@ def create_action(
     finally:
         conn.close()
 
+    if automatic_mode:
+        return _action_view(row)
     task_store.append_event(
         task["session_id"],
         task_id,
@@ -240,7 +252,8 @@ def check_still_valid(row: Dict[str, Any]) -> None:
         )
 
 
-def confirm(actor: ActorContext, action_id: str, *, expected_revision: Optional[int] = None) -> Dict[str, Any]:
+def confirm(actor: ActorContext, action_id: str, *, expected_revision: Optional[int] = None,
+            decision_source: str = 'human') -> Dict[str, Any]:
     """领取执行权。返回 ``{"claimed": bool, "action": {...}}``。"""
     row = get_action(actor, action_id)
     if row["status"] in (STATUS_REJECTED,):
@@ -294,7 +307,8 @@ def confirm(actor: ActorContext, action_id: str, *, expected_revision: Optional[
         task_store.EVENT_ACTION_DECIDED,
         {
             "action_id": action_id,
-            "decision": "confirmed",
+            "decision": "policy_approved" if decision_source == 'session_policy' else "confirmed",
+            "decision_source": decision_source,
             "claimed": claimed,
             "decided_by": actor.user_id,
         },
@@ -342,12 +356,12 @@ def reject(actor: ActorContext, action_id: str, reason: str = "") -> Dict[str, A
         {"action_id": action_id, "decision": "rejected", "reason": reason},
     )
     if changed:
-        task_store.set_status(
-            row["task_id"],
-            task_store.STATUS_RUNNING,
-            summary="动作被拒绝，等待新的指令",
-            emit=True,
-        )
+        task = task_store.get_task_by_id(row['task_id'])
+        if task['status'] not in task_store.TERMINAL_STATUSES:
+            pending = list_actions(row['task_id'], [STATUS_PENDING])
+            task_store.clear_waiting(row['task_id'])
+            task_store.set_status(row['task_id'], task_store.STATUS_AWAITING_ACTION if pending else task_store.STATUS_AWAITING_INPUT,
+                                  summary='动作被拒绝，等待新的指令', emit=True, force=True)
     return _action_view(fresh)
 
 

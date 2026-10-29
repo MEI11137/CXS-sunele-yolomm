@@ -243,6 +243,7 @@ export function mapConfirmation(value: unknown): Confirmation | null {
     status,
     execution_state: mapExecutionState(obj.execution_state),
     operation_id: typeof obj.operation_id === 'string' ? obj.operation_id : null,
+    result: raw(obj.result),
   }
 }
 
@@ -253,6 +254,7 @@ export function mapEvent(value: unknown): AgentEvent | null {
   if (!eventId) return null
   return {
     event_id: eventId,
+    created_at: toMillis(obj.created_at, 0),
     sequence: num(obj.sequence),
     task_id: str(obj.task_id),
     type: str(obj.type),
@@ -265,6 +267,7 @@ export function mapWorkspace(value: unknown): Workspace {
   const obj = raw(value)
   const requirements = raw(obj.requirements)
   return {
+    root_directory: str(obj.root_directory) || undefined,
     id: str(obj.id),
     name: str(obj.name),
     description: str(obj.description),
@@ -292,6 +295,7 @@ export function mergeRequirements(
 export function mapSession(value: unknown) {
   const obj = raw(value)
   return {
+    permission_mode: obj.permission_mode === 'assist' || obj.permission_mode === 'full' ? obj.permission_mode : 'request',
     id: str(obj.id),
     project_id: str(obj.project_id),
     title: str(obj.title) || '未命名会话',
@@ -309,6 +313,7 @@ export function mapMessage(value: unknown): ChatMessage | null {
   const id = str(obj.id) || str(obj.message_id)
   if (!id) return null
   const roleRaw = str(obj.role)
+  if (roleRaw === 'tool' || roleRaw === 'system_event') return null
   const role = roleRaw === 'user' || roleRaw === 'system' ? roleRaw : 'assistant'
   return {
     id,

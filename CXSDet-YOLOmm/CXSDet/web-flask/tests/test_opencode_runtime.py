@@ -89,6 +89,7 @@ class _ModelHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.requests.append(body)
+        self.server.connection_requests.append((self.path, self.headers.get("Authorization"), body.get("model")))
         step = self.server.steps.pop(0) if self.server.steps else {"text": "测试模型完成。"}
         delta = {"role": "assistant"}
         if "tool" in step:
@@ -157,6 +158,7 @@ class OpenCodeProtocolTest(unittest.TestCase):
         self.addCleanup(self.http.shutdown)
         self.model = ThreadingHTTPServer(("127.0.0.1", 0), _ModelHandler)
         self.model.steps, self.model.requests = [], []
+        self.model.connection_requests = []
         threading.Thread(target=self.model.serve_forever, daemon=True).start()
         self.addCleanup(self.model.server_close)
         self.addCleanup(self.model.shutdown)
@@ -202,6 +204,34 @@ class OpenCodeProtocolTest(unittest.TestCase):
         self.assertEqual(messages[-1]["content"], "已读取真实项目。")
         self.assertGreaterEqual(len(self.model.requests), 2)
 
+    def test_saved_connection_is_shared_and_changes_rebuild_engine(self):
+        """网页保存的同一连接供 AI 客户端与真实 OpenCode 使用，不读独立客户端配置。"""
+        self.model.steps = [{"text": "旧连接回答。"}]
+        self.runtime.handle_message(self.actor, self.session["id"], "验证当前连接")
+        self.wait(self.idle)
+        previous = self.runtime.pool.find(self.actor, self.session["id"])
+        self.assertEqual(self.model.connection_requests[-1],
+                         ("/v1/chat/completions", "Bearer fixture-key-not-real", "fixture-model"))
+        updated = connections.save_connection(self.actor, provider="custom",
+            api_url=f"http://127.0.0.1:{self.model.server_port}/updated/v1",
+            model="updated-model", api_key="updated-fixture-key")
+        self.assertNotIn("updated-fixture-key", json.dumps(updated))
+        self.model.steps = [{"text": "新连接回答。"}]
+        self.runtime.handle_message(self.actor, self.session["id"], "验证更改后的连接")
+        self.wait(self.idle)
+        engine = self.runtime.pool.find(self.actor, self.session["id"])
+        self.assertIsNot(engine, previous)
+        self.assertIsNotNone(previous.process.poll())
+        self.assertNotIn(previous.token, self.runtime.pool.tokens)
+        self.assertEqual(engine.credentials, connections.model_client(self.actor).credentials)
+        self.assertEqual(self.model.connection_requests[-1],
+                         ("/updated/v1/chat/completions", "Bearer updated-fixture-key", "updated-model"))
+        connections.delete_connection(self.actor)
+        count = len(self.model.requests)
+        with self.assertRaises(AgentError):
+            self.runtime.handle_message(self.actor, self.session["id"], "删除连接后不能回退其他 Key")
+        self.assertEqual(len(self.model.requests), count)
+
     def test_business_write_confirmation_does_not_block_unrelated_chat(self):
         self.model.steps = [{"tool": "save_review_note", "args": {"text": "人工确认的笔记"}},
                             {"text": "等待你确认保存。"}]
@@ -223,7 +253,13 @@ class OpenCodeProtocolTest(unittest.TestCase):
         self.assertEqual(self.provider.path.read_text(encoding="utf-8"), "人工确认的笔记")
 
     def test_native_file_write_requires_confirm_and_records_real_result(self):
+        actual_project = self.root / "用户选择的项目"
+        actual_project.mkdir()
+        self.app.config["TEMP_DIR"] = str(self.root / "runtime")
+        permissions.update_project(self.actor, self.project["id"], root_directory=str(actual_project))
         engine = self.runtime._engine(self.actor, self.session)
+        self.assertEqual(engine.workspace, actual_project.resolve())
+        self.assertFalse(engine.root.is_relative_to(actual_project))
         target = engine.workspace / "native.txt"
         self.model.steps = [{"tool": "write", "args": {"filePath": str(target), "content": "OpenCode 真正写入"}},
                             {"text": "文件已保存。"}]
@@ -236,6 +272,45 @@ class OpenCodeProtocolTest(unittest.TestCase):
         self.wait(self.idle)
         self.assertEqual(target.read_text(encoding="utf-8"), "OpenCode 真正写入")
         self.assertEqual(actions.get_action(self.actor, pending["id"])["status"], actions.STATUS_SUCCEEDED)
+
+    def test_opencode_can_open_project_page_through_real_mcp(self):
+        self.model.steps = [{"tool": "workspace_open_page", "args": {"project_id": self.project['id'], "page": "review"}},
+                            {"text": "已请求打开人工复核界面，请人工操作。"}]
+        self.runtime.handle_message(self.actor,self.session['id'],"打开当前项目的人工复核界面")
+        self.wait(self.idle)
+        navigation = [event for event in tasks.list_events(self.session['id']) if event['type'] == 'workspace.navigate']
+        self.assertEqual(len(navigation),1)
+        self.assertEqual(navigation[0]['payload']['path'],'/projects/'+self.project['id']+'/review')
+
+    def test_opencode_uploads_local_project_image_after_confirmation(self):
+        from PIL import Image
+        project_folder = self.root / 'project-image'; project_folder.mkdir()
+        self.app.config.update(TEMP_DIR=str(self.root/'runtime'), FILE_STORE_PATH=str(self.root/'store'))
+        self.app.config['PROJECT_FILE_ACCESS'] = lambda uid,pid,action: uid == self.actor.user_id and pid == self.project['id']
+        permissions.update_project(self.actor,self.project['id'],root_directory=str(project_folder))
+        Image.new('RGB',(2,2)).save(project_folder/'image.png')
+        self.model.steps = [{'tool':'workspace_attach_file','args':{'project_id':self.project['id'],'path':'image.png'}}, {'text':'文件已登记为项目附件。'}]
+        result = self.runtime.handle_message(self.actor,self.session['id'],'上传项目目录中的 image.png')
+        self.wait(lambda: bool(actions.list_actions(result['task']['id'],[actions.STATUS_PENDING])))
+        action = actions.list_actions(result['task']['id'],[actions.STATUS_PENDING])[0]
+        self.assertEqual(action['tool_name'],'workspace_attach_file')
+        self.runtime.confirm_action(self.actor,action['id'])
+        self.wait(self.idle)
+        self.assertEqual(actions.get_action(self.actor,action['id'])['status'],actions.STATUS_SUCCEEDED)
+        self.assertTrue((project_folder/'image.png').is_file())
+
+    def test_binding_folder_restarts_engine_and_revokes_previous_bridge_token(self):
+        previous = self.runtime._engine(self.actor, self.session)
+        previous_token = previous.token
+        actual_project = self.root / "新绑定目录"
+        actual_project.mkdir()
+        self.app.config["TEMP_DIR"] = str(self.root / "runtime")
+        permissions.update_project(self.actor, self.project["id"], root_directory=str(actual_project))
+        engine = self.runtime._engine(self.actor, self.session)
+        self.assertIsNot(engine, previous)
+        self.assertEqual(engine.workspace, actual_project.resolve())
+        self.assertNotIn(previous_token, self.runtime.pool.tokens)
+        self.assertIsNotNone(previous.process.poll())
 
     def test_bridge_rejects_missing_token_and_cross_user_resource(self):
         client = self.app.test_client()
@@ -262,6 +337,61 @@ class OpenCodeProtocolTest(unittest.TestCase):
         confirmed = actions.get_action(self.actor, pending["id"])
         self.assertEqual(confirmed["status"], actions.STATUS_SUCCEEDED)
         self.assertIn("POWERSHELL_OK", dumps_for_test(confirmed["result"]))
+
+    @unittest.skipUnless(os.name == 'nt', '本机 PowerShell 自动批准验收')
+    def test_native_batch_read_runs_without_manual_confirmation(self):
+        engine = self.runtime._engine(self.actor, self.session)
+        (engine.workspace / 'sample.txt').write_text('READ_OK', encoding='utf-8')
+        self.model.steps = [{'tool': 'bash', 'args': {
+            'command': 'Get-ChildItem -LiteralPath . -File; Get-Content -LiteralPath sample.txt',
+            'description': '列目录并读取项目样本'}}, {'text': '只读查询已完成。'}]
+        result = self.runtime.handle_message(self.actor, self.session['id'], '查看项目内文件')
+        self.wait(self.idle)
+        self.assertFalse(actions.list_actions(result['task']['id'], [actions.STATUS_PENDING]))
+        audited = actions.list_actions(result['task']['id'])
+        self.assertTrue(any(item['status'] == actions.STATUS_SUCCEEDED for item in audited))
+        self.assertIn('READ_OK', dumps_for_test(audited))
+
+    def test_assist_edits_auto_but_bulk_delete_is_one_manual_approval(self):
+        sessions.set_permission_mode(self.actor, self.session['id'], 'assist')
+        engine = self.runtime._engine(self.actor, self.session)
+        file = engine.workspace / 'created.txt'
+        self.model.steps = [{'tool': 'write', 'args': {'filePath': str(file), 'content': 'auto write'}},
+                            {'text': '项目文件已创建。'}]
+        result = self.runtime.handle_message(self.actor, self.session['id'], '创建项目文件')
+        self.wait(self.idle)
+        self.assertEqual(file.read_text(), 'auto write')
+        self.assertFalse(actions.list_actions(result['task']['id'], [actions.STATUS_PENDING]))
+
+        second = engine.workspace / 'second.txt'; second.write_text('second', encoding='utf-8')
+        sessions.set_permission_mode(self.actor, self.session['id'], 'full')
+        command = f"Remove-Item -LiteralPath '{file}','{second}' -Force"
+        self.model.steps = [{'tool': 'bash', 'args': {'command': command, 'description': '整批删除两个测试文件'}}, {'text': '整批文件已处理。'}]
+        result = self.runtime.handle_message(self.actor, self.session['id'], '删除刚才这两个文件')
+        self.wait(lambda: bool(actions.list_actions(result['task']['id'], [actions.STATUS_PENDING])))
+        pending = actions.list_actions(result['task']['id'], [actions.STATUS_PENDING])
+        self.assertEqual(len(pending), 1)
+        self.assertTrue(file.exists() and second.exists())
+        self.assertIn('海巡助手', pending[0]['tool_title'])
+        self.runtime.confirm_action(self.actor, pending[0]['id'])
+        self.wait(self.idle)
+        self.assertFalse(file.exists() or second.exists())
+        self.runtime.confirm_action(self.actor, pending[0]['id'])
+        self.assertFalse(actions.list_actions(result['task']['id'], [actions.STATUS_PENDING]))
+
+    def test_explicit_mode_change_approves_eligible_pending_edit_and_records_policy(self):
+        engine = self.runtime._engine(self.actor, self.session)
+        target = engine.workspace / 'approved-by-mode.txt'
+        self.model.steps = [{'tool': 'write', 'args': {'filePath': str(target), 'content': 'mode change'}},
+                            {'text': '已按新模式完成。'}]
+        result = self.runtime.handle_message(self.actor, self.session['id'], '创建待批准的文件')
+        self.wait(lambda: bool(actions.list_actions(result['task']['id'], [actions.STATUS_PENDING])))
+        self.assertFalse(target.exists())
+        sessions.set_permission_mode(self.actor, self.session['id'], 'assist')
+        self.wait(self.idle)
+        self.assertEqual(target.read_text(), 'mode change')
+        events = tasks.list_events(self.session['id'])
+        self.assertTrue(any(event['type'] == 'permission.auto_approved' and event['payload']['mode'] == 'assist' for event in events))
 
     def test_reject_cannot_create_native_file(self):
         engine = self.runtime._engine(self.actor, self.session)

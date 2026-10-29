@@ -4,6 +4,7 @@ import { useGuideStore } from '@/stores/guide'
 import { getAdapter } from '@/services'
 import type { ManualInfo } from '@/services'
 import DocumentLibrary from '@/components/DocumentLibrary.vue'
+import { useResourceRefresh } from '@/utils/resourceLifecycle'
 
 const guide = useGuideStore()
 
@@ -13,7 +14,7 @@ const manuals = ref<ManualInfo[]>([])
 const loading = ref(false)
 const loadError = ref('')
 
-onMounted(async () => {
+async function load() {
   loading.value = true
   try {
     const [overview, list] = await Promise.all([
@@ -27,7 +28,9 @@ onMounted(async () => {
   } finally {
     loading.value = false
   }
-})
+}
+onMounted(load)
+useResourceRefresh(load)
 </script>
 
 <template>
@@ -48,7 +51,7 @@ onMounted(async () => {
           <li><strong>工作区</strong>：影像、会话、任务、记录和统计按项目归属。</li>
           <li><strong>图片巡检</strong>：选择影像、指定检测模型，先核对计划再执行。</li>
           <li><strong>人工复核</strong>：在原图上修正类别、调整检测框，确认无缺陷后提交。</li>
-          <li><strong>巡检助手</strong>：右侧全局对话栏，可发起巡检、核对计划、处理复核。</li>
+          <li><strong>海巡助手</strong>：右侧全局对话栏，可发起巡检、核对计划、处理复核。</li>
         </ul>
       </div>
     </section>

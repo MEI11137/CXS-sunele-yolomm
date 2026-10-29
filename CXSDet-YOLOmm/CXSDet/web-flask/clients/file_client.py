@@ -14,7 +14,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import quote
 
-from config import FILE_STORE_CONFIG
+from config import FILE_STORE_CONFIG, DB_PATH
 
 
 class FileClient:
@@ -25,10 +25,16 @@ class FileClient:
         base_path: str | Path | None = None,
         access_url: str | None = None,
         max_size: int | None = None,
+        database_path: str | Path | None = None,
     ) -> None:
         self.base_path = Path(base_path or FILE_STORE_CONFIG["base_path"]).resolve()
         self.server_url = (access_url or FILE_STORE_CONFIG["access_url"]).rstrip("/")
         self.max_size = max_size if max_size is not None else FILE_STORE_CONFIG["max_size"]
+        self.database_path = str(database_path) if database_path else None
+
+    def _database(self):
+        from flask import current_app, has_app_context
+        return self.database_path or (current_app.config['DATABASE'] if has_app_context() else DB_PATH)
 
     def _path(self, bucket: str, object_key: str) -> Path:
         if (
@@ -43,15 +49,43 @@ class FileClient:
         parts = object_key.split("/")
         if any(not part or part in {".", ".."} or ":" in part or "\x00" in part for part in parts):
             raise ValueError("Invalid object key")
-        bucket_path = (self.base_path / bucket).resolve()
-        if not bucket_path.is_relative_to(self.base_path):
+        if not bucket.startswith('workspace.'):
+            from services.project_storage import legacy_location
+            alias = legacy_location(self._database(), bucket, object_key)
+            if alias:
+                if not alias[0].startswith('workspace.'):
+                    raise ValueError('Invalid workspace file alias')
+                return self._path(*alias)
+        if bucket.startswith('workspace.'):
+            from services.project_storage import root_for
+            parts_bucket = bucket.split('.')
+            if len(parts_bucket) != 3:
+                raise ValueError('Invalid workspace bucket')
+            root = root_for(self._database(), parts_bucket[1])
+            if root is None:
+                raise ValueError('项目文件夹未绑定，不能读取或写入项目文件')
+            bucket_path = root / 'artifacts' / parts_bucket[2]
+            if bucket_path.resolve() != bucket_path.absolute():
+                raise ValueError('Workspace storage contains redirected directories')
+        else:
+            root = self.base_path
+            bucket_path = (root / bucket).resolve()
+        if not bucket_path.is_relative_to(root):
             raise ValueError("Storage bucket escapes configured root")
         path = bucket_path.joinpath(*parts).resolve()
-        if not path.is_relative_to(bucket_path):
+        if not path.is_relative_to(bucket_path) or (bucket.startswith('workspace.') and path != bucket_path.joinpath(*parts).absolute()):
             raise ValueError("Object key escapes storage bucket")
         return path
 
     def upload(self, bucket: str, file_path: str, is_cache: bool = False) -> dict:
+        from services.project_storage import current_scope
+        scope = current_scope()
+        if scope and bucket != 'avatars' and Path(self._database()).resolve() != Path(scope[0]).resolve():
+            raise ValueError('文件存储与项目数据库不一致')
+        if scope and bucket.startswith('workspace.') and not bucket.startswith(f'workspace.{scope[1]}.'):
+            raise ValueError('不能向其他项目的文件目录写入')
+        if scope and bucket != 'avatars' and not bucket.startswith('workspace.'):
+            bucket = f'workspace.{scope[1]}.{bucket}'
         source = Path(file_path)
         if not source.is_file():
             raise FileNotFoundError(file_path)

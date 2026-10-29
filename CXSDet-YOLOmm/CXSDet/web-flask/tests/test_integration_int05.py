@@ -22,7 +22,7 @@ from services.business_tools import (
 from services.tool_common import ToolConflict
 from tests.test_business_tool_chain import Fixture
 
-HUMAN_ONLY = ("review.submit_human", "draft.assign_splits", "mcp.save_connection")
+HUMAN_ONLY = ("review.submit_human", "mcp.save_connection")
 
 
 # --------------------------------------------------------------------------- #
@@ -70,10 +70,9 @@ def test_agent_entry_cannot_submit_a_human_decision(tmp_path):
 
 def test_human_page_entry_is_a_separate_server_side_argument(tmp_path):
     adapter = _adapter(tmp_path)
-    with pytest.raises(PermissionError):
-        adapter.prepare_tool(7, "draft.assign_splits", {
-            "draft_id": "d1", "sample_ids": ["s1"], "split": "train",
-        })
+    # INT-29：用户要求划分可由 Agent 按明确指令完成，人工标签决定仍受保护。
+    assert TOOL_SPECS['draft.assign_splits'].agent_executable is True
+    assert TOOL_SPECS['draft.assign_splits'].descriptor['effect'] == 'write'
     with pytest.raises(PermissionError):
         adapter.prepare_tool(7, "mcp.save_connection", {
             "name": "x", "transport": "http",

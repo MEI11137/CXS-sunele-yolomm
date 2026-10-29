@@ -88,3 +88,19 @@ def test_human_review_detects_optimistic_lock_conflict(tmp_path):
     submit_human_review("r1", 9, 0, [], "no_defect", db)
     with pytest.raises(ReviewConflictError):
         submit_human_review("r1", 9, 0, [], "no_defect", db)
+
+
+def test_repeated_rejection_keeps_version_and_audit_but_allows_reassessment(tmp_path):
+    from services.review_service import ReviewConflictError, submit_human_review
+
+    db, path = _database(tmp_path)
+    first = submit_human_review("r1", 9, 0, [], "rejected", db)
+    repeat = submit_human_review("r1", 9, first.new_version, [], "rejected", db)
+    assert first.new_version == repeat.new_version == 1
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM detection_records").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM detection_record_reviews").fetchone()[0] == 1
+    with pytest.raises(ReviewConflictError):
+        submit_human_review("r1", 9, 0, [], "rejected", db)
+    reassessed = submit_human_review("r1", 9, 1, [], "no_defect", db)
+    assert reassessed.status == "confirmed" and reassessed.new_version == 2

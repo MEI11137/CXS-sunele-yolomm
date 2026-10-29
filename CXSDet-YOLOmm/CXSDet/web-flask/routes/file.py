@@ -50,7 +50,7 @@ def _identity(allow_cookie: bool = False) -> int | None:
 
 
 def _storage() -> FileClient:
-    return FileClient(base_path=current_app.config["FILE_STORE_PATH"])
+    return FileClient(base_path=current_app.config["FILE_STORE_PATH"], database_path=current_app.config['DATABASE'])
 
 
 def _access() -> FileAccess:
@@ -203,6 +203,15 @@ def upload_project_file(project_id):
         allowed = False
     if not allowed:
         return error("项目文件权限未接入或已拒绝", 403), 403
+    from services.project_storage import project_scope
+    try:
+        with project_scope(current_app.config['DATABASE'], project_id):
+            return _upload_project_file(project_id, user_id)
+    except ValueError as exc:
+        return error(str(exc), 409), 409
+
+
+def _upload_project_file(project_id, user_id):
     upload = request.files.get("file")
     if upload is None or not upload.filename:
         return error("没有选择文件", 400), 400
@@ -212,7 +221,8 @@ def upload_project_file(project_id):
         return error("旧 DOC 文件请先转换为 DOCX", 400), 400
     if suffix not in _PROJECT_TYPES:
         return error("不支持的文件格式", 400), 400
-    temp_dir = Path(current_app.config["TEMP_DIR"])
+    from services.project_storage import temp_directory
+    temp_dir = Path(temp_directory(current_app.config["TEMP_DIR"]))
     temp_dir.mkdir(parents=True, exist_ok=True)
     temporary = None
     saved = None

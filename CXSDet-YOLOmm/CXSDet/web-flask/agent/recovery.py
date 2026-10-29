@@ -117,6 +117,10 @@ def reconcile_task(
     check_only: bool = False,
 ) -> Dict[str, Any]:
     """核对任务等待的业务状态；满足条件则自动接力继续。"""
+    from agent.inspection_loop import reconcile
+    inspection = reconcile(actor, task_id)
+    if inspection is not None:
+        return inspection
     task = task_store.get_task(actor, task_id)
     if task["status"] not in (
         task_store.STATUS_AWAITING_HUMAN,

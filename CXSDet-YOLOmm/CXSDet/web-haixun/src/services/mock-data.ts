@@ -117,7 +117,7 @@ export const mockSessions: Session[] = [
         id: 'm1',
         session_id: 's1',
         role: 'assistant',
-        content: '你好，我是海巡智检巡检助手。我可以协助你发起叶片巡检、核对检测计划，以及处理人工复核。请先选择一个工作区，或直接告诉我你的需求。',
+        content: '你好，我是海巡助手。我可以协助你发起叶片巡检、核对检测计划，以及处理人工复核。请先选择一个工作区，或直接告诉我你的需求。',
         created_at: Date.now() - 1000 * 60 * 30,
       },
     ],

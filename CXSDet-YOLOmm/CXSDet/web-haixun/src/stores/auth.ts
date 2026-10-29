@@ -119,9 +119,7 @@ export const useAuthStore = defineStore('auth', () => {
     }
 
     const workspace = useWorkspaceStore()
-    workspace.workspaces = []
-    workspace.currentId = ''
-    workspace.loaded = false
+    workspace.reset()
 
     const session = useSessionStore()
     session.reset()
@@ -169,6 +167,10 @@ export const useAuthStore = defineStore('auth', () => {
       }
       const next = await getAdapter().login(username.trim(), password)
       applyUser(next)
+      const workspace = useWorkspaceStore()
+      workspace.reset()
+      // 登录成功后重载本人项目，不依赖页面重新挂载，也不能沿用匿名空列表。
+      await workspace.load().catch(e => console.warn('[海巡智检] 登录后项目加载失败', e))
     } catch (e) {
       // 登录失败不产生登录态
       error.value = (e as Error).message || '登录失败'

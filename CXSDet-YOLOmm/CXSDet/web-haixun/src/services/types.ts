@@ -28,6 +28,10 @@ import type {
 } from '@/types'
 
 export type Mode = 'mock' | 'real'
+export interface RecycleContents {
+  projects: { id: string; name: string; updated_at: string }[]
+  sessions: { id: string; title: string; project_id: string; project_name: string; deleted_at: string }[]
+}
 
 /** 后端尚未提供的能力。调用即失败，不伪造成功。 */
 export class NotSupportedError extends Error {
@@ -95,6 +99,7 @@ export interface HumanReviewAnnotation {
   class_name: string
   class_id: number
   bbox: [number, number, number, number]
+  severity?: 'low' | 'medium' | 'high'
 }
 
 export interface HumanReviewInput {
@@ -109,6 +114,7 @@ export interface PageQuery {
   page?: number
   pageSize?: number
   search?: string
+  recordKind?: 'formal' | 'draft' | 'all'
 }
 
 /** 复核队列条目（由检测记录映射而来，字段名沿用旧页面）。 */
@@ -119,11 +125,12 @@ export interface DefectItem {
   thumbnail: string
   suspectedType: string
   confidence: number
-  reviewStatus: 'pending' | 'reviewing' | 'done'
+  reviewStatus: 'pending' | 'reviewing' | 'done' | 'rejected'
   severity: 'low' | 'medium' | 'high'
 }
 
 export interface SendMessageOptions {
+  reviewContext?: import('@/utils/reviewBridge').ReviewPageContext
   /** 已登记的项目资源 id：后端只认这个，不认文件名 */
   resourceRefs?: Array<{ id: string; kind?: ResourceKind; display_name?: string }>
   onDelta?: (delta: string) => void
@@ -148,15 +155,25 @@ export interface ApiAdapter {
   // -------------------------------------------------------------- 工作区
   listWorkspaces(): Promise<Workspace[]>
   createWorkspace(input: {
+    root_directory?: string
     name: string
     description: string
     requirements: string
   }): Promise<Workspace>
   updateWorkspace(id: string, patch: Partial<Workspace>): Promise<Workspace>
+  deleteWorkspace(id: string): Promise<void>
+  deleteSession(id: string): Promise<void>
+  listRecycle(): Promise<RecycleContents>
+  restoreProject(id: string): Promise<void>
+  restoreSession(id: string): Promise<void>
+  browseLocalFolders(path?: string): Promise<import('@/types').LocalFolderListing>
+  createLocalFolder(parent: string, name: string): Promise<{ path: string }>
   getOverview(): Promise<WorkspaceOverview>
 
   // ---------------------------------------------------------- 个人连接
   getConnection(): Promise<PersonalConnection>
+  setSessionPermissionMode(sessionId: string, mode: 'request' | 'assist' | 'full'): Promise<Session>
+  listConnectionModels(): Promise<{ models: string[]; current: string; discovery_error: string }>
   saveConnection(input: {
     provider: string
     apiUrl: string
@@ -191,6 +208,9 @@ export interface ApiAdapter {
   getTaskSnapshot(taskId: string): Promise<TaskSnapshot>
   listTasks(projectId: string): Promise<AgentTask[]>
   createFeedbackDraft(datasetId: string): Promise<Record<string, unknown>>
+  previewFeedbackRevision(datasetId: string, name: string, newSampleSplit: string): Promise<Record<string, unknown>>
+  executeFeedbackRevision(datasetId: string, operationId: string): Promise<Record<string, unknown>>
+  inspectDataset(datasetId: string, page: number, search: string): Promise<Record<string, unknown>>
   listDraftSamples(draftId: string, page: number): Promise<Record<string, unknown>>
   assignDraftSamples(draftId: string, sampleIds: string[], split: string): Promise<Record<string, unknown>>
   finalizeDraft(draftId: string): Promise<Record<string, unknown>>
@@ -225,6 +245,7 @@ export interface ApiAdapter {
   listRecords(query?: PageQuery & { projectId?: string }): Promise<PageResult<DetectionRecordSummary>>
   getRecord(recordId: string): Promise<DetectionRecordSummary | null>
   requestAiReview(recordId: string): Promise<Record<string, unknown>>
+  requestAiReviews(recordIds: string[]): Promise<Record<string, unknown>>
   submitHumanReview(recordId: string, input: HumanReviewInput): Promise<Record<string, unknown>>
   addFeedback(recordId: string, input: { datasetId: string }): Promise<Record<string, unknown>>
   /** 批量回流：每条记录自动回到它所属模型的原训练数据集 */

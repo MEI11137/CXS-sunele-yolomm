@@ -21,6 +21,8 @@ from services.video_dataset_service import VideoDatasetConfig, generate_video_da
 from utils.tracking_counter import UniqueTrackCounter
 from utils.video_writer import create_browser_video_writer
 from config import TEMP_DIR, YOLO_CLASSES_CONFIG
+from services.project_storage import ProjectTempPath
+TEMP_DIR = ProjectTempPath(TEMP_DIR)
 
 video_detection_bp = Blueprint('video_detection', __name__, url_prefix='/api/video-detection')
 
@@ -52,6 +54,17 @@ def get_class_color(class_name):
         return (0, 255, 0)
 
 def run_video_detection_process(
+    record_id, user_id, model_id, model_name, video_path, confidence_threshold, frame_rate,
+    dataset_config=None, dataset_model_meta=None, secondary_video_path=None, project_id=None,
+):
+    from config import DB_PATH
+    from services.project_storage import resource_scope
+    with resource_scope(DB_PATH, 'video_detection_records', record_id, project_id):
+        return _run_video_detection_process(record_id, user_id, model_id, model_name, video_path,
+            confidence_threshold, frame_rate, dataset_config, dataset_model_meta, secondary_video_path)
+
+
+def _run_video_detection_process(
     record_id, user_id, model_id, model_name, video_path, confidence_threshold, frame_rate,
     dataset_config=None, dataset_model_meta=None, secondary_video_path=None,
 ):
@@ -827,6 +840,8 @@ def detect_video():
             
             if affected_rows > 0:
                 # 创建并启动视频处理进程
+                from services.project_storage import current_scope
+                scope = current_scope()
                 processing_process = multiprocessing.Process(
                     target=run_video_detection_process,
                     args=(record_id, g.user_id, model_id, model_data['name'], 
@@ -834,7 +849,7 @@ def detect_video():
                           ({'enabled': True, 'draft_id': draft_id, 'config': dataset_config.__dict__}
                            if dataset_config.enabled else None),
                           annotation_model if dataset_config.enabled else None,
-                          secondary_video_path)
+                          secondary_video_path, *([scope[1]] if scope else [])),
                 )
                 processing_process.daemon = True
                 video_processing[record_id] = processing_process

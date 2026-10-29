@@ -274,6 +274,24 @@ class BusinessToolAdapter:
         conn.row_factory = sqlite3.Row
         return conn
 
+    @property
+    def work_dir(self):
+        from services.project_storage import temp_directory
+        return temp_directory(self._work_dir)
+
+    @work_dir.setter
+    def work_dir(self, value):
+        self._work_dir = value
+
+    @property
+    def candidate_root(self):
+        from services.project_storage import directory
+        return directory('datasets/candidates', self._candidate_root)
+
+    @candidate_root.setter
+    def candidate_root(self, value):
+        self._candidate_root = value
+
     # ------------------------------------------------------------------ tools
 
     @staticmethod
@@ -369,6 +387,8 @@ class BusinessToolAdapter:
             raise ValueError("Resource resolver returned an invalid snapshot")
         for action in actions:
             self._check_access(principal, action, resource)
+        from services.project_storage import resource_selected
+        resource_selected(self.database_path, resource.project_id)
         return resource
 
     def _resource(self, principal: int, resource_id: str, spec) -> ResourceSnapshot:
@@ -482,11 +502,7 @@ class BusinessToolAdapter:
     def _read_record(self, record_id: str) -> dict:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT id, user_id, model_id, human_review_status, review_version, "
-                "corrected_annotations, detection_result, original_image_bucket, "
-                "original_image_object_key, secondary_image_bucket, "
-                "secondary_image_object_key, ai_review_status, ai_review_result "
-                "FROM detection_records WHERE id=?", (record_id,),
+                "SELECT * FROM detection_records WHERE id=?", (record_id,),
             ).fetchone()
         if row is None:
             raise FileNotFoundError("Detection record is not registered")
@@ -544,6 +560,9 @@ class BusinessToolAdapter:
             "error": json.loads(row["error_json"]) if row["error_json"] else None,
         }
 
+    from services.project_storage import scoped_operation
+
+    @scoped_operation
     def prepare_tool(self, principal: int, tool_name: str, arguments: dict,
                      *, entry: str = ENTRY_AGENT) -> dict:
         spec = self._spec(tool_name)
@@ -597,6 +616,7 @@ class BusinessToolAdapter:
             return recheck(self, principal, arguments, preview)
         return self._resource(principal, arguments[spec.id_field], spec)
 
+    @scoped_operation
     def execute_tool(self, principal: int, prepared_id: str, request_key: str,
                      *, entry: str = ENTRY_AGENT) -> dict:
         if not isinstance(request_key, str) or not 0 < len(request_key) <= 128:
@@ -660,7 +680,9 @@ class BusinessToolAdapter:
 
         handler = self._handlers()[prepared["tool_name"]]
         try:
-            outputs, refs = handler.execute(self, principal, arguments, preview, resource)
+            from services.project_storage import project_scope
+            with project_scope(self.database_path, resource.project_id):
+                outputs, refs = handler.execute(self, principal, arguments, preview, resource)
             with self._connect() as conn:
                 conn.execute(
                     "UPDATE business_tool_operations SET status='succeeded', outputs_json=?, "

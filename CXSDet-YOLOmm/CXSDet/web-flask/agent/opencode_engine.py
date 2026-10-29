@@ -41,13 +41,13 @@ def binary_path():
 
 
 class OpenCodeEngine:
-    def __init__(self, actor, session, credentials, root, origin):
+    def __init__(self, actor, session, credentials, root, origin, *, workspace=None):
         self.owner_id = actor.user_id
         self.site_session = session["id"]
         self.project_id = session["project_id"]
         self.credentials = credentials
         self.root = Path(root)
-        self.workspace = self.root / "workspace"
+        self.workspace = Path(workspace) if workspace else self.root / "workspace"
         self.token = secrets.token_urlsafe(32)
         self.password = secrets.token_urlsafe(32)
         self.origin = local_origin(origin)
@@ -60,6 +60,7 @@ class OpenCodeEngine:
         self.lock = threading.RLock()
         self.seen_parts = set()
         self.native_actions = {}
+        self.permission_decisions = {}
         self.catalogue_key = ""
         self.fingerprint = hashlib.sha256(json.dumps(credentials.__dict__, sort_keys=True).encode()).hexdigest()
         self.native_enabled = actor.is_admin
@@ -75,15 +76,19 @@ class OpenCodeEngine:
         for secret in (self.credentials.api_key, self.token, self.password):
             if secret:
                 value = value.replace(secret, "[redacted]")
-        return value
+        from agent.guard import redact
+        return redact(value)
 
     def configuration(self):
+        from agent.native_policy import powershell_binary
         # 命令拥有操作系统账号权限：仅本机管理员可以逐次确认，普通用户不能启用。
         permissions = {"*": "deny", "haixun_*": "allow", "read": "allow",
             "glob": "allow", "grep": "allow", "list": "allow", "external_directory": "deny",
             "edit": "ask" if self.native_enabled else "deny",
             "bash": "ask" if self.native_enabled else "deny", "todowrite": "allow", "todoread": "allow"}
         return {"$schema": "https://opencode.ai/config.json", "share": "disabled",
+            **({"shell": powershell_binary()} if powershell_binary() else {}),
+            "formatter": False, "lsp": False,
             "autoupdate": False, "enabled_providers": ["haixun"],
             "model": "haixun/" + self.credentials.model,
             "small_model": "haixun/" + self.credentials.model,
@@ -104,7 +109,12 @@ class OpenCodeEngine:
             timeout=12, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         if version.returncode or version.stdout.strip() != "1.19.4":
             raise AgentError(Code.TOOL_BACKEND_UNAVAILABLE, "此适配器已验证 OpenCode 1.19.4；请使用对应版本", http_status=503)
-        for folder in ("workspace", "config", "data", "cache", "state", "temp"):
+        if not self.workspace.is_dir():
+            if self.workspace == self.root / "workspace":
+                self.workspace.mkdir(parents=True, exist_ok=True)
+            else:
+                raise AgentError(Code.VALIDATION, "项目文件夹已不存在，不能启动 Agent")
+        for folder in ("config", "data", "cache", "state", "temp"):
             (self.root / folder).mkdir(parents=True, exist_ok=True)
         # 最小继承环境，避免把站点或其他服务的 Key 自动传给命令工具。
         keep = {"PATH", "SystemRoot", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE",
@@ -157,6 +167,7 @@ class OpenCodeEngine:
 
     def abort(self):
         self.generation += 1
+        self.permission_decisions.clear()
         if self.process and self.process.poll() is None and self.remote_session:
             try:
                 self.request("POST", f"/session/{self.remote_session}/abort", {})
@@ -186,17 +197,19 @@ class EnginePool:
         self.lock = threading.RLock()
         atexit.register(self.close)
 
-    def get(self, actor, session, credentials, root, origin, *, catalogue_key=""):
+    def get(self, actor, session, credentials, root, origin, *, catalogue_key="", workspace=None):
         # 同一会话首次并发请求只能启动一次；MCP 回调不取得此启动锁。
         with self.lock:
-            return self._get_locked(actor, session, credentials, root, origin, catalogue_key=catalogue_key)
+            return self._get_locked(actor, session, credentials, root, origin, catalogue_key=catalogue_key, workspace=workspace)
 
-    def _get_locked(self, actor, session, credentials, root, origin, *, catalogue_key):
+    def _get_locked(self, actor, session, credentials, root, origin, *, catalogue_key, workspace):
         key = (actor.user_id, session["id"])
         fingerprint = hashlib.sha256(json.dumps(credentials.__dict__, sort_keys=True).encode()).hexdigest()
         with self.lock:
             engine = self.engines.get(key)
+            expected_workspace = Path(workspace) if workspace else Path(root) / "workspace"
             if engine and (engine.fingerprint != fingerprint or engine.catalogue_key != catalogue_key
+                           or engine.workspace != expected_workspace
                            or not engine.process or engine.process.poll() is not None):
                 self.tokens.pop(engine.token, None)
                 engine.close()
@@ -211,7 +224,7 @@ class EnginePool:
                 self.tokens.pop(idle.token, None)
                 self.engines.pop((idle.owner_id, idle.site_session), None)
                 idle.close()
-            engine = OpenCodeEngine(actor, session, credentials, root, origin)
+            engine = OpenCodeEngine(actor, session, credentials, root, origin, workspace=workspace)
             engine.catalogue_key = catalogue_key
             self.engines[key] = engine
             self.tokens[engine.token] = engine
@@ -226,6 +239,17 @@ class EnginePool:
 
     def find(self, actor, session_id):
         return self.engines.get((actor.user_id, session_id))
+
+    def discard(self, owner_id, *, project_id=None, session_id=None):
+        with self.lock:
+            targets = [engine for engine in self.engines.values() if engine.owner_id == owner_id
+                       and (project_id is None or engine.project_id == project_id)
+                       and (session_id is None or engine.site_session == session_id)]
+            for engine in targets:
+                self.tokens.pop(engine.token, None)
+                self.engines.pop((engine.owner_id, engine.site_session), None)
+        for engine in targets:
+            engine.close()
 
     def close(self):
         for engine in list(self.engines.values()):

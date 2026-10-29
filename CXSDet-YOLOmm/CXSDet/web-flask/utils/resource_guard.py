@@ -21,6 +21,35 @@ from utils.response import error
 _LOGIN_HINT = "登录状态无效，请重新登录"
 
 
+def validate_project_request(user_id):
+    """原页面使用显式项目范围；项目来自路由，服务端重新核对实际资源归属。"""
+    from agent import permissions, resources
+    from agent.identity import load_actor
+    from agent.errors import AgentError
+    project_id = request.headers.get('X-Project-Id')
+    try:
+        actor = load_actor(int(user_id))
+        permissions.get_project(actor, project_id)
+        payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            return error('请求体必须是对象',400), 400
+        explicit = request.form.get('project_id') or payload.get('project_id')
+        if explicit and str(explicit) != project_id:
+            return error('操作目标与当前项目不一致',403), 403
+        checks = {'dataset_id':'dataset','model_id':'model','parent_model_id':'model','record_id':'detection_record','draft_id':'draft'}
+        references = [(kind, (request.view_args or {}).get(param) or request.form.get(param) or payload.get(param) or request.args.get(param)) for param,kind in checks.items()]
+        batch = payload.get('record_ids', [])
+        if isinstance(batch, list): references.extend(('detection_record', value) for value in batch)
+        for kind, value in references:
+            if not value: continue
+            resource = resources.ensure_kind(kind,str(value))
+            if not resource or resource.get('project_id') != project_id:
+                return error('资源不存在或不属于当前项目',403), 403
+        return None
+    except AgentError as exc:
+        return error(exc.message,exc.http_status), exc.http_status
+
+
 def _param_value(param: str) -> Optional[str]:
     view_args = request.view_args or {}
     if param in view_args and view_args[param]:
@@ -151,7 +180,7 @@ def project_target_required(func):
         payload = request.get_json(silent=True) or {}
         if not isinstance(payload, dict):
             return error('请求体必须是对象', 400), 400
-        project_id = request.form.get('project_id') or payload.get('project_id')
+        project_id = request.form.get('project_id') or payload.get('project_id') or request.headers.get('X-Project-Id')
         if project_id:
             try:
                 actor = load_actor(_current_user_id())
@@ -175,6 +204,7 @@ def register_new(
     from agent import resources
 
     table = resources.SOURCE_TABLE_BY_KIND.get(kind)
+    project_id = project_id or request.headers.get('X-Project-Id')
     user_id = _current_user_id()
     if not table or not business_id or not user_id:
         return
@@ -211,14 +241,26 @@ def visible_ids(kind: str, action: str = "read") -> Optional[set]:
         actor = load_actor(user_id)
     except Exception:  # noqa: BLE001 - 未登录/停用按空集处理
         return set()
-    if actor.is_admin:
-        return None
-
+    project_id = request.headers.get('X-Project-Id')
+    if project_id:
+        try: permissions.get_project(actor, project_id)
+        except Exception: return set()
+        conn = connect()
+        try:
+            table = resources.SOURCE_TABLE_BY_KIND.get(kind)
+            rows = query_all(conn,"SELECT source_id FROM agent_resource WHERE source_table=? AND project_id=? AND source_id IS NOT NULL AND deleted_at IS NULL",(table,project_id))
+            return {str(row['source_id']) for row in rows}
+        finally: conn.close()
     table = resources.SOURCE_TABLE_BY_KIND.get(kind)
     if not table:
         return set()
     conn = connect()
     try:
+        deleted = {str(row['source_id']) for row in query_all(conn, 'SELECT source_id FROM agent_resource WHERE source_table=? AND deleted_at IS NOT NULL', (table,))}
+        if actor.is_admin:
+            if not deleted:
+                return None
+            return {str(row['id']) for row in query_all(conn, f'SELECT id FROM {table}')} - deleted
         rows = query_all(
             conn,
             "SELECT source_id, owner_id, access_policy FROM agent_resource "
@@ -237,7 +279,7 @@ def visible_ids(kind: str, action: str = "read") -> Optional[set]:
         elif read_only and row.get("access_policy") == permissions.POLICY_SHARED_READONLY:
             allowed.add(str(row["source_id"]))
     allowed |= derived
-    return allowed
+    return allowed - deleted
 
 
 def _derived_ids(conn, kind: str, user_id: int) -> set:

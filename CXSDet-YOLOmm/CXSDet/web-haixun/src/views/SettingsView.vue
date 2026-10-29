@@ -2,11 +2,15 @@
 import { ref, computed, onMounted } from 'vue'
 import { useThemeStore } from '@/stores/theme'
 import { useGuideStore } from '@/stores/guide'
+import { useWorkspaceStore } from '@/stores/workspace'
+import { projectPath } from '@/utils/projectRoutes'
 import { getAdapter } from '@/services'
 import type { CapabilityEntry, PersonalConnection } from '@/types'
 
 const theme = useThemeStore()
 const guide = useGuideStore()
+const workspace = useWorkspaceStore()
+const settingsProject = computed(() => workspace.current?.origin === 'system' ? null : workspace.current)
 
 // 外观
 function setTheme(t: 'light' | 'dark') {
@@ -109,7 +113,7 @@ async function saveConn(closeAfter = true): Promise<boolean> {
     connState.value = 'idle'
     if (closeAfter) {
       showConnDialog.value = false
-      connNotice.value = '个人连接已保存到本机，Key 由服务端加密存储。'
+      connNotice.value = '连接已保存，海巡助手与后端引擎共用此配置；下一次对话使用新配置。'
     }
     return true
   } catch (e) {
@@ -125,13 +129,13 @@ async function testConnection() {
   connState.value = 'testing'
   connNotice.value = ''
   try {
-    if (connForm.value.apiKey.trim() || !configured.value) {
-      const saved = await saveConn(false)
-      if (!saved) {
-        connState.value = 'error'
-        return
-      }
+    // 同步地址、模型与 Key 后再检测，Key 留空时由服务端沿用。
+    const saved = await saveConn(false)
+    if (!saved) {
+      connState.value = 'error'
+      return
     }
+    connState.value = 'testing'
     connection.value = await getAdapter().checkConnection()
     connState.value = 'idle'
     const missing = connection.value?.missing_capabilities ?? []
@@ -163,6 +167,23 @@ async function deleteConn() {
     <div class="page-header">
       <h1 class="page-title">设置</h1>
     </div>
+
+    <section class="section">
+      <h2 class="section-title">项目功能</h2>
+      <p class="setting-desc">{{ settingsProject ? `当前项目：${settingsProject.name}` : '请先在左侧选择项目，再打开对应功能。' }}</p>
+      <div class="panel setting-card">
+        <div class="setting-row">
+          <div class="setting-info"><div class="setting-name">资料与手册</div><div class="setting-desc">查看当前项目的资料、文档与任务手册</div></div>
+          <RouterLink v-if="settingsProject" class="btn" :to="projectPath(settingsProject.id, 'manual')">打开资料与手册</RouterLink>
+          <button v-else class="btn" disabled>请先选择项目</button>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info"><div class="setting-name">扩展与连接</div><div class="setting-desc">管理当前项目的授权目录、MCP 扩展和工具连接</div></div>
+          <RouterLink v-if="settingsProject" class="btn" data-guide="extensions" :to="projectPath(settingsProject.id, 'extensions')">打开扩展与连接</RouterLink>
+          <button v-else class="btn" disabled>请先选择项目</button>
+        </div>
+      </div>
+    </section>
 
     <!-- 外观 -->
     <section class="section">
@@ -201,12 +222,12 @@ async function deleteConn() {
 
     <!-- 个人连接 -->
     <section class="section">
-      <h2 class="section-title">个人连接</h2>
+      <h2 class="section-title">大模型连接</h2>
       <div class="panel setting-card">
         <div class="setting-row">
           <div class="setting-info">
             <div class="setting-name">助手大模型</div>
-            <div class="setting-desc">配置巡检助手使用的大模型，与检测模型相互独立；Key 由服务端加密保存</div>
+            <div class="setting-desc">网页对话、AI 核查与后端助手引擎共用这一份 API Key、接口地址和模型配置。Key 由服务端加密保存，修改后下一次对话生效。</div>
           </div>
           <div class="setting-action">
             <span v-if="configured" class="tag tag-success">

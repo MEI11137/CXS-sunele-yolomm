@@ -16,6 +16,8 @@ from services.yolo_runtime import (
     load_detector,
     predict_image,
     resolve_inference_inputs,
+    read_image,
+    write_image,
 )
 
 
@@ -35,7 +37,7 @@ class DetectionRecordResult:
 
 
 def _draw_detections(rgb_path: str, detections: list[dict], output_path: str) -> str:
-    image = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
+    image = read_image(rgb_path)
     if image is None:
         raise RuntimeError(f"无法读取待绘制图片: {rgb_path}")
     for detection in detections:
@@ -55,7 +57,7 @@ def _draw_detections(rgb_path: str, detections: list[dict], output_path: str) ->
         )
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if not cv2.imwrite(str(destination), image):
+    if not write_image(destination, image):
         raise RuntimeError(f"无法写入检测结果图: {destination}")
     return str(destination)
 
@@ -72,19 +74,37 @@ def execute_detection(
     detector_loader: Callable = load_detector,
     predictor: Callable = predict_image,
     request_key: str | None = None,
+    input_metadata: dict | None = None,
 ) -> DetectionRecordResult:
     """Persist inputs, inference output and a record as one compensating workflow."""
     workspace = Path(work_dir)
     workspace.mkdir(parents=True, exist_ok=True)
-    resolved = resolve_inference_inputs(model_meta, rgb_path, x_path, str(workspace))
+    from PIL import Image
+    def inference_path(path, role):
+        # Keep source bytes; only the detector's private input may need a compatible format.
+        with Image.open(path) as image:
+            if image.format in {'JPEG', 'PNG'} and image.mode == 'RGB':
+                return path
+            converted = workspace / (role + '-inference.png')
+            image.convert('RGB').save(converted, 'PNG')
+            return str(converted)
+    resolved = resolve_inference_inputs(model_meta, inference_path(rgb_path, 'rgb'),
+                                        inference_path(x_path, 'x') if x_path else None, str(workspace))
+    secondary_source = x_path or resolved.x_path
+    from services.dataset_identity_service import image_identity
+    metadata = input_metadata or {}
+    identity = {'rgb': image_identity(Path(rgb_path).read_bytes(), metadata.get('rgb_name') or Path(rgb_path).name),
+                'reference_dataset_id': model_meta.get('dataset_id'), 'asset_id': metadata.get('asset_id')}
+    if secondary_source and resolved.x_path:
+        identity['secondary'] = image_identity(Path(secondary_source).read_bytes(), metadata.get('secondary_name') or Path(secondary_source).name)
     uploaded: list[dict] = []
     try:
-        original = storage_client.upload("detection_original", resolved.rgb_path)
+        original = storage_client.upload("detection_original", rgb_path)
         uploaded.append(original)
 
         secondary = None
         if resolved.x_path:
-            secondary = storage_client.upload("detection_secondary", resolved.x_path)
+            secondary = storage_client.upload("detection_secondary", secondary_source)
             uploaded.append(secondary)
 
         if not model_meta.get("model_bucket") or not model_meta.get("model_object_key"):
@@ -100,12 +120,21 @@ def execute_detection(
             model_meta.get("model_yaml"),
         )
         output: DetectionOutput = predictor(detector, resolved, confidence)
+        # 权重里的显示名可为英文；网站人工复核/反馈统一使用所属数据集的类别索引表。
+        from utils.dataset_classes import dataset_class_names
+        dataset = database.query('SELECT structure_info FROM datasets WHERE id=?',
+                                 (model_meta['dataset_id'],), fetchone=True) if model_meta.get('dataset_id') else None
+        class_names = dataset_class_names(dataset['structure_info']) if dataset else []
         detections = []
         for item in output.detections:
             normalized = dict(item)
             class_id = int(normalized.get("class_id", normalized.get("class", 0)))
             normalized["class_id"] = class_id
             normalized["class"] = class_id
+            if class_names:
+                if class_id < 0 or class_id >= len(class_names):
+                    raise ValueError('权重输出类别索引超出关联数据集类别表，请核对权重与数据集')
+                normalized['class_name'] = class_names[class_id]
             normalized["confidence"] = float(normalized.get("confidence", 0.0))
             normalized["bbox"] = [float(value) for value in normalized.get("bbox", [])]
             detections.append(normalized)
@@ -127,8 +156,8 @@ def execute_detection(
                 secondary_image_origin,
                 result_image_bucket, result_image_object_key,
                 detection_result, confidence_threshold, create_time,
-                title, description, record_status, request_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                title, description, record_status, request_key, input_identity_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record_id,
@@ -149,6 +178,7 @@ def execute_detection(
                 "检测成功后由系统自动保存",
                 "completed",
                 request_key,
+                json.dumps(identity, ensure_ascii=False),
             ),
         )
         if affected <= 0:

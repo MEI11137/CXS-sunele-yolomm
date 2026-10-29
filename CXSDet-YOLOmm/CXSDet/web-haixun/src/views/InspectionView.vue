@@ -250,7 +250,7 @@ async function generatePlan() {
     const msg = (e as Error).message
     // 未配置个人模型连接时，明确告知并可改用直接检测入口
     notice.value = /连接|能力|AGENT_MODEL/.test(msg)
-      ? `Agent 规划不可用：${msg}。可先在「设置 → 个人连接」配置模型，或使用下方「直接检测」。`
+      ? `海巡助手规划不可用：${msg}。可先在「设置 → 个人连接」配置模型，或使用下方「直接检测」。`
       : `生成计划失败：${msg}`
   }
 }

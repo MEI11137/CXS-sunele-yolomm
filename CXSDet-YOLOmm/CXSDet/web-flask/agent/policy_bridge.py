@@ -221,7 +221,7 @@ class AgentPolicyBridge:
             if resources.ensure_kind(kind, resource_id) is None:
                 return None
             row = self._index_row(table, resource_id)
-        if row is None:
+        if row is None or row.get('deleted_at'):
             return None
         owner_id = int(row["owner_id"])
         policy = row.get("access_policy") or permissions.POLICY_PRIVATE

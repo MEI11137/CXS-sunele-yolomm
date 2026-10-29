@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import numpy as np
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -63,7 +64,7 @@ def activate_vendored_ultralytics() -> str:
 
 def generate_edge_image(rgb_path: str, output_path: str) -> str:
     """Generate a 3-channel Canny edge image compatible with RGB+X models."""
-    image = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
+    image = read_image(rgb_path)
     if image is None:
         raise ModelRuntimeError(f"无法读取RGB图片: {rgb_path}")
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -71,9 +72,24 @@ def generate_edge_image(rgb_path: str, output_path: str) -> str:
     edge_three_channel = cv2.cvtColor(edge, cv2.COLOR_GRAY2BGR)
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if not cv2.imwrite(str(destination), edge_three_channel):
+    if not write_image(destination, edge_three_channel):
         raise ModelRuntimeError(f"无法写入edge图片: {destination}")
     return str(destination)
+
+
+def read_image(path):
+    """Windows OpenCV imread 不支持部分中文路径；先由 Python 读取文件字节。"""
+    try:
+        return cv2.imdecode(np.frombuffer(Path(path).read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
+    except (OSError, cv2.error):
+        return None
+
+
+def write_image(path, image):
+    ok, encoded = cv2.imencode(Path(path).suffix or '.png', image)
+    if ok:
+        Path(path).write_bytes(encoded.tobytes())
+    return bool(ok)
 
 
 def resolve_inference_inputs(

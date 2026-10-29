@@ -163,6 +163,25 @@ def run_training_job(
     database_path: str | Path = DB_PATH,
     file_store_path: str | Path | None = None,
     temp_root: str | Path | None = None,
+    project_id: str | None = None,
+) -> dict:
+    from services.project_storage import resource_scope
+    try:
+        with resource_scope(database_path, 'models', model_id, project_id):
+            return _run_training_job(model_id, dataset_id, base_model, epochs, batch_size,
+                                     parent_model_id, database_path, file_store_path, temp_root)
+    except (OSError, ValueError) as exc:
+        from utils.db import Database
+        Database(database_path).execute('UPDATE models SET status=?,complete_time=?,train_result=? WHERE id=?',
+            (MODEL_STATUS['FAILED'], datetime.now().isoformat(), json.dumps({'error': str(exc)}, ensure_ascii=False), model_id))
+        return {'model_id': model_id, 'status': 'failed', 'error': str(exc)}
+    finally:
+        release_training_lock(database_path, model_id)
+
+
+def _run_training_job(
+    model_id, dataset_id, base_model, epochs, batch_size, parent_model_id,
+    database_path, file_store_path, temp_root,
 ) -> dict:
     """Execute one run for an already registered model row.
 
@@ -177,9 +196,11 @@ def run_training_job(
     from utils.db import Database
 
     database = Database(database_path)
-    storage = FileClient(base_path=file_store_path) if file_store_path else FileClient()
-    base_temp = str(temp_root or TEMP_DIR)
+    storage = FileClient(base_path=file_store_path, database_path=database_path)
+    from services.project_storage import temp_directory, directory, current_scope
+    base_temp = str(temp_directory(temp_root or TEMP_DIR))
     temp_dir = os.path.join(base_temp, f"model_training_{model_id}_{uuid.uuid4().hex[:8]}")
+    output_dir = directory('training/' + model_id, os.path.join(temp_dir, 'output'))
     outcome: dict = {"model_id": model_id, "status": "failed"}
     try:
         database.execute(
@@ -237,7 +258,7 @@ def run_training_job(
             runtime_yaml=runtime_yaml,
             epochs=epochs,
             batch_size=batch_size,
-            output_dir=os.path.join(temp_dir, "output"),
+            output_dir=output_dir,
             secondary_modality=dataset.get("secondary_modality"),
         ))
         upload = storage.upload("models", training_result.best_weight_path)
@@ -258,6 +279,8 @@ def run_training_job(
         )
         outcome["status"] = "completed"
         outcome["metrics"] = training_result.metrics
+        if current_scope():
+            (Path(output_dir) / 'metrics.json').write_text(json.dumps(training_result.metrics, ensure_ascii=False, indent=2), encoding='utf-8')
     except Exception as exc:
         try:
             database.execute(
@@ -267,6 +290,8 @@ def run_training_job(
             )
         finally:
             outcome["error"] = str(exc)
+            if current_scope():
+                (Path(output_dir) / 'failure.json').write_text(json.dumps({'error': str(exc)}, ensure_ascii=False), encoding='utf-8')
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
         release_training_lock(database_path, model_id)

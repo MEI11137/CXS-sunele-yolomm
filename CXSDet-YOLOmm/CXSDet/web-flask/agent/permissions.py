@@ -33,10 +33,14 @@ def create_project(
     *,
     origin: str = ORIGIN_USER,
     owner_id: Optional[int] = None,
+    root_directory: Optional[str] = None,
+    requirements: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     clean = (name or "").strip()
     if not clean:
         raise AgentError(Code.VALIDATION, "项目名称不能为空")
+    if requirements is not None:
+        _validate_requirements(requirements)
     # owner_id 只允许后台迁移使用；HTTP 入口传入的值会被忽略
     target_owner = owner_id if actor.source != "http" and owner_id else actor.user_id
     if actor.source == "http":
@@ -44,6 +48,10 @@ def create_project(
 
     conn = connect()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        if root_directory is not None:
+            from agent.project_folders import validate_root
+            root_directory = validate_root(actor, root_directory, conn)
         exists = query_one(
             conn,
             "SELECT id FROM agent_project WHERE owner_id = ? AND name = ?",
@@ -56,8 +64,8 @@ def create_project(
         conn.execute(
             "INSERT INTO agent_project "
             "(id, owner_id, name, description, requirements_json, origin, status, "
-            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)",
-            (project_id, target_owner, clean, description, dumps({}), origin, stamp, stamp),
+            " created_at, updated_at, root_directory) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
+            (project_id, target_owner, clean, description, dumps(requirements or {}), origin, stamp, stamp, root_directory),
         )
         conn.commit()
     finally:
@@ -71,7 +79,7 @@ def get_project(actor: ActorContext, project_id: str) -> Dict[str, Any]:
         row = query_one(conn, "SELECT * FROM agent_project WHERE id = ?", (project_id,))
     finally:
         conn.close()
-    if not row:
+    if not row or row.get("status") != "active":
         raise AgentError(Code.PROJECT_NOT_FOUND, "项目不存在", http_status=404)
     if int(row["owner_id"]) != actor.user_id:
         # 不暴露其他用户的项目是否存在
@@ -88,7 +96,7 @@ def find_project(project_id: str) -> Optional[Dict[str, Any]]:
         row = query_one(conn, "SELECT * FROM agent_project WHERE id = ?", (project_id,))
     finally:
         conn.close()
-    return _project_view(row) if row else None
+    return _project_view(row) if row and row.get("status") == "active" else None
 
 
 def project_access_policy(project: Dict[str, Any]) -> str:
@@ -120,6 +128,7 @@ def update_project(
     name: Optional[str] = None,
     description: Optional[str] = None,
     requirements: Optional[Dict[str, Any]] = None,
+    root_directory: Optional[str] = None,
 ) -> Dict[str, Any]:
     project = get_project(actor, project_id)
     updates: List[str] = []
@@ -137,13 +146,22 @@ def update_project(
         _validate_requirements(requirements)
         updates.append("requirements_json = ?")
         params.append(dumps(requirements))
-    if not updates:
+    if not updates and root_directory is None:
         return project
     updates.append("updated_at = ?")
     params.append(now())
     params.append(project_id)
     conn = connect()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        if root_directory is not None:
+            from agent.project_folders import validate_root
+            actual = query_one(conn, "SELECT root_directory FROM agent_project WHERE id=?", (project_id,))
+            if actual["root_directory"]:
+                raise AgentError(Code.VALIDATION, "工作区已绑定目录，不能直接更换；请新建工作区")
+            folder = validate_root(actor, root_directory, conn, project_id)
+            updates.insert(0, "root_directory = ?")
+            params.insert(0, folder)
         conn.execute(f"UPDATE agent_project SET {', '.join(updates)} WHERE id = ?", params)
         conn.commit()
     finally:
@@ -187,6 +205,7 @@ def _project_view(row: Dict[str, Any]) -> Dict[str, Any]:
         "id": row["id"],
         "name": row["name"],
         "description": row.get("description") or "",
+        "root_directory": row.get("root_directory"),
         "owner_id": int(row["owner_id"]),
         "origin": row.get("origin") or ORIGIN_USER,
         "status": row.get("status") or "active",
@@ -290,12 +309,18 @@ def list_project_resources(
     kinds: Optional[Iterable[str]] = None,
 ) -> List[Dict[str, Any]]:
     get_project(actor, project_id)
-    sql = "SELECT * FROM agent_resource WHERE project_id = ?"
+    sql = "SELECT * FROM agent_resource WHERE project_id = ? AND deleted_at IS NULL"
     params: List[Any] = [project_id]
     kind_list = [k for k in (kinds or []) if k]
     if kind_list:
-        sql += " AND kind IN (" + ",".join("?" for _ in kind_list) + ")"
+        from agent.resources import SOURCE_TABLE_BY_KIND
+        tables = sorted({SOURCE_TABLE_BY_KIND[k] for k in kind_list if k in SOURCE_TABLE_BY_KIND})
+        sql += " AND (kind IN (" + ",".join("?" for _ in kind_list) + ")"
         params.extend(kind_list)
+        if tables:
+            sql += " OR source_table IN (" + ",".join("?" for _ in tables) + ")"
+            params.extend(tables)
+        sql += ")"
     sql += " ORDER BY updated_at DESC"
     conn = connect()
     try:
@@ -340,29 +365,37 @@ def resolve_resource(actor: ActorContext, ref: Any) -> Dict[str, Any]:
                     conn, "SELECT * FROM agent_resource WHERE id = ?", (ref["id"],)
                 )
                 if not resource_row and ref.get("kind"):
+                    from agent.resources import SOURCE_TABLE_BY_KIND
+                    table = SOURCE_TABLE_BY_KIND.get(ref['kind'])
                     resource_row = query_one(
                         conn,
-                        "SELECT * FROM agent_resource WHERE source_id = ? AND kind = ?",
-                        (ref["id"], ref["kind"]),
+                        "SELECT * FROM agent_resource WHERE source_id = ? AND " + ("source_table = ?" if table else "kind = ?"),
+                        (ref["id"], table or ref["kind"]),
                     )
         else:
             raise AgentError(Code.VALIDATION, "资源引用格式不正确")
     finally:
         conn.close()
 
-    if not resource_row:
+    if not resource_row or resource_row.get('deleted_at'):
         raise AgentError(Code.RESOURCE_NOT_FOUND, "引用的资源不存在", http_status=404)
 
     owner_id = int(resource_row["owner_id"])
     if owner_id != actor.user_id and resource_row["access_policy"] != POLICY_SHARED_READONLY:
         # 其他用户的私有资源统一按"不存在"处理，避免探测
         raise AgentError(Code.RESOURCE_NOT_FOUND, "引用的资源不存在", http_status=404)
+    if not find_project(resource_row["project_id"]):
+        raise AgentError(Code.RESOURCE_NOT_FOUND, "资源所属项目已移入回收站", http_status=404)
     return _resource_view(resource_row)
 
 
 def require_access(actor: ActorContext, resource: Dict[str, Any], operation: str) -> bool:
     """统一授权入口：原页面与 Agent 工具都必须先过这一关。"""
     op = (operation or "read").lower()
+    if resource.get('deleted_at'):
+        raise AgentError(Code.RESOURCE_NOT_FOUND, '资源已移入回收站，请先恢复', http_status=404)
+    if resource.get("project_id") and not find_project(resource["project_id"]):
+        raise AgentError(Code.RESOURCE_NOT_FOUND, "资源所属项目已移入回收站", http_status=404)
     if op not in READ_OPERATIONS and op not in WRITE_OPERATIONS:
         raise AgentError(Code.VALIDATION, f"未知的操作类型：{operation}")
     owner_id = int(resource.get("owner_id") or 0)
@@ -405,6 +438,7 @@ def _resource_view(row: Dict[str, Any]) -> Dict[str, Any]:
         "metadata": loads(row.get("metadata_json")),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+        "deleted_at": row.get("deleted_at"),
     }
 
 

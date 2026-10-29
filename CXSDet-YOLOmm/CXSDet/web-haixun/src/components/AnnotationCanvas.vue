@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import type { BoundingBox } from '@/types'
 
 const props = defineProps<{
   boxes: BoundingBox[]
   imageUrl: string
   zoom: number
-  mode: 'draw' | 'select'
+  mode: 'draw' | 'select' | 'pan'
   selectedBoxId: string | null
   /** 新画框使用的类别：由父组件按真实类别表给出，不能写死示例类别 */
   defaultCategory?: string
@@ -16,6 +16,8 @@ const emit = defineEmits<{
   (e: 'update:boxes', boxes: BoundingBox[]): void
   (e: 'select', id: string | null): void
   (e: 'draw', box: BoundingBox): void
+  (e: 'interaction-start'): void
+  (e: 'update:zoom', zoom: number): void
 }>()
 
 const canvasEl = ref<HTMLCanvasElement | null>(null)
@@ -23,6 +25,14 @@ const wrapper = ref<HTMLDivElement | null>(null)
 const img = ref<HTMLImageElement | null>(null)
 const imageLoaded = ref(false)
 const imgNatural = ref({ w: 0, h: 0 })
+const viewport = ref({ w: 800, h: 600 })
+const spaceHeld = ref(false)
+const hovered = ref(false)
+const panning = ref(false)
+let panStart = { x: 0, y: 0, left: 0, top: 0 }
+let resizeObserver: ResizeObserver | undefined
+let imageGeneration = 0
+let wheelAnchor: { x: number; y: number; imageX: number; imageY: number } | null = null
 
 // 拖拽绘制状态
 const drawing = ref(false)
@@ -37,30 +47,32 @@ const dragOriginal = ref<BoundingBox | null>(null)
 // 画布显示尺寸
 const display = computed(() => {
   if (!imgNatural.value.w || !imgNatural.value.h) return { w: 0, h: 0 }
-  const maxW = wrapper.value?.clientWidth ?? 800
-  const scale = Math.min(maxW / imgNatural.value.w, 1)
-  return { w: imgNatural.value.w * scale, h: imgNatural.value.h * scale }
+  const scale = Math.min(viewport.value.w / imgNatural.value.w, viewport.value.h / imgNatural.value.h, 1)
+  return { w: Math.max(1, Math.round(imgNatural.value.w * scale * props.zoom)), h: Math.max(1, Math.round(imgNatural.value.h * scale * props.zoom)) }
 })
 
 // 实际缩放
-const effZoom = computed(() => props.zoom)
+const cursor = computed(() => panning.value ? 'grabbing' : props.mode === 'pan' || spaceHeld.value ? 'grab' : props.mode === 'draw' ? 'crosshair' : 'default')
 
 function loadImage() {
+  const generation = ++imageGeneration
   const el = new Image()
   el.onload = () => {
+    if (generation !== imageGeneration) return
     img.value = el
     imgNatural.value = { w: el.naturalWidth, h: el.naturalHeight }
     imageLoaded.value = true
-    draw()
+    if (wrapper.value) { wrapper.value.scrollLeft = 0; wrapper.value.scrollTop = 0 }
+    void nextTick(draw)
   }
   el.src = props.imageUrl
 }
 
-function canvasPos(e: MouseEvent) {
+function canvasPos(e: PointerEvent) {
   const rect = canvasEl.value!.getBoundingClientRect()
   return {
-    x: (e.clientX - rect.left) / rect.width,
-    y: (e.clientY - rect.top) / rect.height,
+    x: clamp((e.clientX - rect.left) / rect.width, 0, 1),
+    y: clamp((e.clientY - rect.top) / rect.height, 0, 1),
   }
 }
 
@@ -120,7 +132,12 @@ function labelWidth(b: BoundingBox) {
   return label(b).length * 7 + 8
 }
 
-function onMouseDown(e: MouseEvent) {
+function onPointerDown(e: PointerEvent) {
+  if (e.button !== 0 && e.button !== 1) return
+  e.preventDefault()
+  wrapper.value?.focus({ preventScroll: true })
+  canvasEl.value?.setPointerCapture(e.pointerId)
+  if (props.mode === 'pan' || spaceHeld.value || e.button === 1) { startPan(e); return }
   if (props.mode === 'draw') {
     drawing.value = true
     const p = canvasPos(e)
@@ -133,17 +150,30 @@ function onMouseDown(e: MouseEvent) {
       return p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h
     })
     if (hit) {
+      emit('interaction-start')
       draggingBox.value = hit.id
       dragOriginal.value = { ...hit }
       dragOffset.value = { x: p.x - hit.x, y: p.y - hit.y }
       emit('select', hit.id)
     } else {
       emit('select', null)
+      if (props.zoom > 1) startPan(e)
     }
   }
 }
 
-function onMouseMove(e: MouseEvent) {
+function startPan(e: PointerEvent) {
+  if (!wrapper.value) return
+  panning.value = true
+  panStart = { x: e.clientX, y: e.clientY, left: wrapper.value.scrollLeft, top: wrapper.value.scrollTop }
+}
+
+function onPointerMove(e: PointerEvent) {
+  if (panning.value && wrapper.value) {
+    wrapper.value.scrollLeft = panStart.left - (e.clientX - panStart.x)
+    wrapper.value.scrollTop = panStart.top - (e.clientY - panStart.y)
+    return
+  }
   const p = canvasPos(e)
   if (drawing.value) {
     dragCurrent.value = p
@@ -159,7 +189,8 @@ function onMouseMove(e: MouseEvent) {
   }
 }
 
-function onMouseUp() {
+function onPointerUp(e: PointerEvent) {
+  if (e.type === 'pointercancel') drawing.value = false
   if (drawing.value) {
     const x1 = dragStart.value.x
     const y1 = dragStart.value.y
@@ -184,7 +215,34 @@ function onMouseUp() {
   }
   draggingBox.value = null
   dragOriginal.value = null
+  panning.value = false
+  if (canvasEl.value?.hasPointerCapture(e.pointerId)) canvasEl.value.releasePointerCapture(e.pointerId)
 }
+
+function keyDown(e: KeyboardEvent) {
+  const focused = document.activeElement as HTMLElement | null
+  if (focused?.matches('input, textarea, select, [contenteditable="true"]')) return
+  if (e.code === 'Space' && (hovered.value || wrapper.value?.contains(focused))) { e.preventDefault(); spaceHeld.value = true }
+}
+function keyUp(e: KeyboardEvent) { if (e.code === 'Space') spaceHeld.value = false }
+function resetKeys() { spaceHeld.value = false; panning.value = false }
+
+function onWheel(event: WheelEvent) {
+  const el = wrapper.value
+  if (!el || !imageLoaded.value || drawing.value || draggingBox.value || panning.value || !event.deltaY) return
+  const zoom = Math.round(clamp(props.zoom + (event.deltaY < 0 ? .1 : -.1), .5, 3) * 100) / 100
+  if (zoom === props.zoom) return
+  const rect = el.getBoundingClientRect()
+  const x = event.clientX - rect.left - el.clientLeft
+  const y = event.clientY - rect.top - el.clientTop
+  wheelAnchor = { x, y, imageX: (el.scrollLeft + x) / display.value.w, imageY: (el.scrollTop + y) / display.value.h }
+  emit('update:zoom', zoom)
+}
+
+defineExpose({ focusBox: (box: BoundingBox) => {
+  const el = wrapper.value
+  if (el) { el.scrollLeft = (box.x + box.w / 2) * display.value.w - el.clientWidth / 2; el.scrollTop = (box.y + box.h / 2) * display.value.h - el.clientHeight / 2 }
+} })
 
 function clamp(v: number, min: number, max: number) {
   return Math.max(min, Math.min(v, max))
@@ -196,26 +254,50 @@ watch(() => props.imageUrl, () => {
 })
 
 watch(() => props.boxes, () => draw(), { deep: true })
-watch(() => props.zoom, () => draw())
+watch(() => props.zoom, (zoom, previous) => {
+  const el = wrapper.value
+  const anchor = wheelAnchor
+  wheelAnchor = null
+  const x = el ? (el.scrollLeft + el.clientWidth / 2) / previous : 0
+  const y = el ? (el.scrollTop + el.clientHeight / 2) / previous : 0
+  void nextTick(() => { draw(); if (el) {
+    el.scrollLeft = anchor ? anchor.imageX * display.value.w - anchor.x : x * zoom - el.clientWidth / 2
+    el.scrollTop = anchor ? anchor.imageY * display.value.h - anchor.y : y * zoom - el.clientHeight / 2
+  } })
+})
+watch(display, () => void nextTick(draw))
 watch(() => props.selectedBoxId, () => draw())
 
 onMounted(() => {
   loadImage()
-  window.addEventListener('mouseup', onMouseUp)
+  resizeObserver = new ResizeObserver(() => {
+    if (wrapper.value) viewport.value = { w: wrapper.value.clientWidth, h: wrapper.value.clientHeight }
+  })
+  if (wrapper.value) resizeObserver.observe(wrapper.value)
+  window.addEventListener('keydown', keyDown)
+  window.addEventListener('keyup', keyUp)
+  window.addEventListener('blur', resetKeys)
 })
 onBeforeUnmount(() => {
-  window.removeEventListener('mouseup', onMouseUp)
+  imageGeneration++
+  resizeObserver?.disconnect()
+  window.removeEventListener('keydown', keyDown)
+  window.removeEventListener('keyup', keyUp)
+  window.removeEventListener('blur', resetKeys)
 })
 </script>
 
 <template>
-  <div ref="wrapper" class="anno-wrapper" :style="{ transform: `scale(${effZoom})`, transformOrigin: 'top left' }">
+  <div ref="wrapper" class="anno-wrapper" tabindex="0" aria-label="标注画布，滚轮缩放；平移模式、空格加拖动或中键移动视野" @wheel.prevent="onWheel" @pointerenter="hovered = true" @pointerleave="hovered = false">
     <canvas
       ref="canvasEl"
       class="anno-canvas"
-      :style="{ cursor: mode === 'draw' ? 'crosshair' : 'move' }"
-      @mousedown="onMouseDown"
-      @mousemove="onMouseMove"
+      :style="{ cursor, width: display.w + 'px', height: display.h + 'px' }"
+      @pointerdown="onPointerDown"
+      @pointermove="onPointerMove"
+      @pointerup="onPointerUp"
+      @pointercancel="onPointerUp"
+      @auxclick.prevent
     ></canvas>
   </div>
 </template>
@@ -223,11 +305,16 @@ onBeforeUnmount(() => {
 <style scoped>
 .anno-wrapper {
   width: 100%;
-  transition: transform 0.15s ease;
+  height: clamp(260px, 65vh, 720px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  outline-offset: -2px;
 }
 .anno-canvas {
   display: block;
-  max-width: 100%;
+  max-width: none;
+  touch-action: none;
+  user-select: none;
   border-radius: 4px;
 }
 </style>

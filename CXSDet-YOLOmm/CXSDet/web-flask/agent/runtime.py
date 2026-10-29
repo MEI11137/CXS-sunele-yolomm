@@ -228,13 +228,10 @@ class AgentRuntime:
         claimed_info = actions.confirm(actor, action_id, expected_revision=expected_revision)
         action = claimed_info["action"]
         task = task_store.get_task(actor, action["task_id"])
-        session = session_store.get_session(actor, task["session_id"])
-        project = permissions.get_project(actor, task["project_id"])
-
         if not claimed_info["claimed"]:
             # 已领取/已完成：不重复执行，直接返回当前真实状态
             return {
-                "session_id": session["id"],
+                "session_id": action["session_id"],
                 "task": task_store.snapshot(task),
                 "status": task["status"],
                 "action": action,
@@ -243,6 +240,8 @@ class AgentRuntime:
                 "events_after": sequence_before,
             }
 
+        session = session_store.get_session(actor, task["session_id"])
+        project = permissions.get_project(actor, task["project_id"])
         spec, provider, source = self.registry.resolve(action["tool_name"], actor)
         if str(spec.version) != str(action["tool_version"]):
             actions.supersede_pending(task["id"], "工具版本已变化")
@@ -295,7 +294,7 @@ class AgentRuntime:
             return {
                 "session_id": session["id"],
                 "task": task_store.snapshot(task_store.get_task_by_id(task["id"])),
-                "status": task_store.STATUS_AWAITING_BUSINESS,
+                "status": outcome.get('status', task_store.STATUS_AWAITING_BUSINESS),
                 "action": actions.get_action(actor, action["id"]),
                 "reply": outcome["reply"],
                 "plan": task.get("plan"),
@@ -625,6 +624,7 @@ class AgentRuntime:
             return None
 
         # 3) 确认策略
+        automatic_mode = self._automatic_business_mode(actor, session, spec, source)
         need_confirm = grants.needs_confirmation(
             actor, spec, project_id=project["id"], source=source
         )
@@ -637,7 +637,8 @@ class AgentRuntime:
             if spec.supports_preview and provider is not None:
                 if source in PREPARE_BEFORE_APPROVAL_SOURCES:
                     try:
-                        prepared = provider.prepare(actor, spec, arguments, None) or {}
+                        prepared = provider.prepare(actor, spec, arguments,
+                            {"project_id": project["id"], "task_id": task["id"]}) or {}
                     except AgentError as exc:
                         # 预检失败或被业务拦截：不能生成"确认后即可执行"的动作
                         self._feedback_tool_error(
@@ -655,6 +656,8 @@ class AgentRuntime:
                     preview["prepare_after_approval"] = True
             if unverified:
                 preview.setdefault("unverified_refs", unverified)
+            if automatic_mode and isinstance(preview, dict) and preview.get('project_id') not in (None, project['id']):
+                automatic_mode = None  # Cross-project writes need a concrete target card.
             action = actions.create_action(
                 actor,
                 task_id=task["id"],
@@ -663,12 +666,47 @@ class AgentRuntime:
                 tool_title=spec.title,
                 parameters=arguments,
                 preview=preview,
-                target_projects=self._target_projects(
-                    actor, project, arguments, resource_projects
-                ),
+                target_projects=provider.confirmation_targets(actor,spec,arguments,{'project_id':project['id'],'task_id':task['id']})
+                    if source == SOURCE_BUSINESS and callable(getattr(provider,'confirmation_targets',None))
+                    else self._target_projects(actor, project, arguments, resource_projects),
                 resource_revisions=revisions,
                 prepared_id=prepared_id,
+                automatic_mode=automatic_mode,
             )
+            if automatic_mode:
+                # The policy grants execution, not an invented human click. Keep
+                # fresh preflight, atomic claim, resource checks and request-key replay.
+                tasks_mode = self._automatic_business_mode(actor, session, spec, source)
+                if tasks_mode != automatic_mode:
+                    self._feedback_tool_error(session, task, spec, '会话权限已改变，请按当前模式重新处理')
+                    return None
+                claimed = actions.confirm(actor, action['id'], expected_revision=action['revision'],
+                                          decision_source='session_policy')
+                task_store.append_event(session['id'], task['id'], 'permission.auto_approved',
+                    {'action_id': action['id'], 'tool': spec.name, 'mode': automatic_mode,
+                     'kind': 'business', 'approval_source': 'session_policy', 'human_clicked': False})
+                if not claimed['claimed']:
+                    self._feedback_tool_error(session, task, spec, '该业务动作已领取或处理，请读取实际状态，不重复执行')
+                    return None
+                task = task_store.get_task_by_id(task['id'])
+                try:
+                    outcome = self._execute_tool(actor, project, task, spec, provider, source, arguments,
+                        action_id=action['id'], request_key=action['request_key'], prepared_id=prepared_id)
+                except AgentError as exc:
+                    uncertain = exc.execution_state == ExecutionState.UNKNOWN
+                    actions.mark_result(action['id'], status=actions.STATUS_UNKNOWN if uncertain else actions.STATUS_FAILED,
+                        result={'error': exc.to_dict()}, error_code=exc.code, execution_state=exc.execution_state)
+                    self._feedback_tool_error(session, task, spec, exc.message, code=exc.code)
+                    if uncertain:
+                        task_store.set_status(task['id'], task_store.STATUS_UNKNOWN, summary='自动业务结果待核实，不自动重做', force=True)
+                        return {'session_id':session['id'], 'task':task_store.snapshot(task_store.get_task_by_id(task['id'])),
+                                'status':task_store.STATUS_UNKNOWN, 'reply':'执行结果待核实，未自动重试。', 'action':None}
+                    return None
+                state.executed_tool_names.append(spec.name)
+                if outcome['long_running']:
+                    return {'session_id': session['id'], 'task': task_store.snapshot(task_store.get_task_by_id(task['id'])),
+                            'status': task_store.STATUS_AWAITING_BUSINESS, 'reply': outcome['reply'], 'action': None, 'plan': task.get('plan')}
+                return None
             task = task_store.get_task_by_id(task["id"])
             return {
                 "session_id": session["id"],
@@ -734,6 +772,7 @@ class AgentRuntime:
             task_id=task["id"],
             authorization={
                 "confirmed": bool(action_id),
+                "action_id": action_id,
                 "source": source,
                 "tool_version": spec.version,
                 "stub": spec.source == "stub",
@@ -871,6 +910,9 @@ class AgentRuntime:
                 {"action_id": action_id, "status": result.status},
             )
 
+        if result.outputs.get('context_closed'):
+            task_store.set_status(task['id'],task_store.STATUS_STOPPED,summary='当前项目或会话已删除，后续操作已停止',force=True)
+            return {'long_running':True,'status':task_store.STATUS_STOPPED,'reply':'已移入回收站，文件保留，当前任务停止。','result':payload}
         memory.refresh(task["id"])
 
         latest = task_store.get_task_by_id(task['id'])
@@ -1008,6 +1050,9 @@ class AgentRuntime:
     # ------------------------------------------------------------------ #
     # 门禁与辅助
     # ------------------------------------------------------------------ #
+    def _automatic_business_mode(self, actor, session, spec, source):
+        return None
+
     def _guard_arguments(
         self, actor: ActorContext, arguments: Dict[str, Any]
     ) -> tuple[Dict[str, Any], List[str], List[str]]:

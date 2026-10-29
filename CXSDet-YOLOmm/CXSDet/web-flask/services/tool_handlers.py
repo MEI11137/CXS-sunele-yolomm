@@ -337,6 +337,90 @@ class DatasetTransform(BaseHandler):
                             "source_dataset_id": resource.id}]
 
 
+@handler("dataset.split")
+class DatasetSplit(BaseHandler):
+    def prepare(self, adapter, principal, arguments):
+        import math
+        from services.dataset_transform_service import plan_from_dataset
+        from services.project_storage import project_scope
+        ratios = arguments['split_policy']
+        if (set(ratios) - {'train', 'val', 'test'} or
+                any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0 or value > 1 for value in ratios.values()) or
+                abs(sum(ratios.values()) - 1) > 1e-8 or ratios.get('train', 0) <= 0 or ratios.get('val', 0) <= 0):
+            raise ToolRefused('INVALID_SPLIT_POLICY', '比例合计须为1，训练和验证比例大于0，测试比例不小于0')
+        resource = adapter._resource(principal, arguments['dataset_id'], _spec('dataset.split'))
+        with project_scope(adapter.database_path, resource.project_id):
+            plan = plan_from_dataset(adapter, resource, arguments)
+        if not plan['counts'].get('train') or not plan['counts'].get('val'):
+            plan['conflicts'].append({'code': 'EMPTY_SPLIT', 'message': '取整后训练集或验证集为空，请调整比例或补充独立样本'})
+            plan['blocked'] = True
+        plan['impact'] = '按明确比例生成并登记新数据集，RGB/配套模态/标签一起划分；原数据集不改，不启动训练。整数数量以本预览为准。'
+        return resource, plan
+
+    def execute(self, adapter, principal, arguments, preview, resource):
+        from services.dataset_transform_service import build_candidate_from_dataset, register_candidate
+        if preview.get('blocked'):
+            raise ToolRefused('SPLIT_BLOCKED', '划分存在冲突，请先检查预览', preview.get('conflicts') or [])
+        candidate = build_candidate_from_dataset(adapter, resource, arguments, preview)
+        record = register_candidate(adapter, principal, candidate['candidate_id'])
+        outputs = {'dataset_id': record['dataset_id'], 'source_dataset_id': resource.id, 'name': record['name'],
+                   'split_counts': record['split_counts'], 'total_samples': record['total_samples'],
+                   'candidate_id': candidate['candidate_id'], 'output_dir': candidate['output_dir']}
+        return outputs, [{'type': 'dataset', 'id': record['dataset_id'], 'version': '1',
+                          'project_id': resource.project_id, 'source_dataset_id': resource.id}]
+
+
+@handler('dataset.inspect_samples')
+class DatasetInspectSamples(BaseHandler):
+    def prepare(self, adapter, principal, arguments):
+        resource = adapter._resource(principal, arguments['dataset_id'], _spec('dataset.inspect_samples'))
+        if arguments.get('record_id'):
+            record = adapter.resolve(principal, 'record', arguments['record_id'], ('detection:read',))
+            if record.project_id != resource.project_id:
+                raise ToolRefused('RECORD_PROJECT_MISMATCH', '只核对当前项目的识别记录')
+        return resource, {'effect': 'read', 'dataset_id': resource.id}
+
+    def recheck(self, adapter, principal, arguments, preview):
+        return self.prepare(adapter, principal, arguments)[0]
+
+    def execute(self, adapter, principal, arguments, preview, resource):
+        from services.dataset_identity_service import inspect_dataset
+        record = adapter._read_record(arguments['record_id']) if arguments.get('record_id') else None
+        return inspect_dataset(adapter, resource, record=record, page=arguments.get('page', 1),
+                               page_size=arguments.get('page_size', 50), search=arguments.get('search', '')), []
+
+
+@handler('dataset.feedback_revision')
+class DatasetFeedbackRevision(BaseHandler):
+    @staticmethod
+    def _arguments(arguments):
+        return {'dataset_id': arguments['dataset_id'], 'name': arguments['name'],
+                'description': '人工复核反馈修订；保留来源数据集 ' + arguments['dataset_id'],
+                'include_feedback': True, '_feedback_revision_split': arguments['new_sample_split']}
+
+    def prepare(self, adapter, principal, arguments):
+        from services.dataset_transform_service import plan_from_dataset
+        from services.project_storage import project_scope
+        resource = adapter._resource(principal, arguments['dataset_id'], _spec('dataset.feedback_revision'))
+        with project_scope(adapter.database_path, resource.project_id):
+            plan = plan_from_dataset(adapter, resource, self._arguments(arguments))
+        plan['impact'] = '回原数据集生成修订版：匹配图片只修正标注并保留原划分，新图片放入指定集合。原版本和模型保留，不启动训练。'
+        return resource, plan
+
+    def execute(self, adapter, principal, arguments, preview, resource):
+        from services.dataset_transform_service import build_candidate_from_dataset, register_candidate
+        if preview.get('blocked'):
+            raise ToolRefused('FEEDBACK_REVISION_BLOCKED', '反馈修订存在冲突，请先处理预览', preview.get('conflicts'))
+        candidate = build_candidate_from_dataset(adapter, resource, self._arguments(arguments), preview)
+        record = register_candidate(adapter, principal, candidate['candidate_id'])
+        adapter.database().execute('UPDATE datasets SET parent_dataset_id=? WHERE id=?', (resource.id, record['dataset_id']))
+        return {'dataset_id': record['dataset_id'], 'source_dataset_id': resource.id, 'name': record['name'],
+                'total_samples': record['total_samples'], 'split_counts': record['split_counts'],
+                'output_dir': candidate['output_dir'], 'candidate_id': candidate['candidate_id']}, [
+                    {'type': 'dataset', 'id': record['dataset_id'], 'version': '1',
+                     'project_id': resource.project_id, 'source_dataset_id': resource.id}]
+
+
 @handler("dataset.register_candidate")
 class DatasetRegisterCandidate(BaseHandler):
     def _candidate(self, adapter, principal, candidate_id: str):
@@ -791,6 +875,7 @@ class DetectionRun(BaseHandler):
             raise ToolConflict("Output project changed; prepare again")
         model = adapter._model_row(arguments["model_id"])
         secondary_path = None
+        secondary = None
         workspace = _work_dir(adapter, "detection")
         rgb_path = adapter.file_assets.materialize(asset["bucket"], asset["object_key"])
         try:
@@ -814,6 +899,8 @@ class DetectionRun(BaseHandler):
                 work_dir=str(workspace),
                 storage_client=adapter.storage_client,
                 database=adapter.database(),
+                input_metadata={'rgb_name': asset.get('original_name'), 'asset_id': asset['id'],
+                                'secondary_name': secondary.get('original_name') if secondary else None},
                 **kwargs,
             )
         finally:
@@ -1105,15 +1192,11 @@ class FeedbackAddConfirmed(BaseHandler):
 @handler("draft.create_from_feedback")
 class DraftCreateFromFeedback(BaseHandler):
     def prepare(self, adapter, principal, arguments):
+        from services.dataset_transform_service import _feedback_samples
         resource = adapter._resource(principal, arguments["dataset_id"],
                                      _spec("draft.create_from_feedback"))
-        with adapter.connect() as conn:
-            confirmed = conn.execute(
-                "SELECT COUNT(*) FROM feedback_samples fs "
-                "JOIN detection_records dr ON dr.id = fs.record_id "
-                "WHERE fs.dataset_id=? AND dr.human_review_status='confirmed'",
-                (resource.id,),
-            ).fetchone()[0]
+        samples = _feedback_samples(adapter, resource.id)
+        confirmed = len(samples)
         dataset = adapter._dataset_row(resource.id)
         blockers = []
         if not confirmed:
@@ -1124,6 +1207,7 @@ class DraftCreateFromFeedback(BaseHandler):
             "dataset": {"id": dataset["id"], "name": dataset["name"],
                         "dataset_mode": dataset.get("dataset_mode")},
             "confirmed_samples": confirmed,
+            "feedback_snapshot": samples,
             "proposed_name": f"{dataset['name']} 反馈草稿",
             "blocked": bool(blockers),
             "blocked_reasons": blockers,
@@ -1133,10 +1217,13 @@ class DraftCreateFromFeedback(BaseHandler):
 
     def execute(self, adapter, principal, arguments, preview, resource):
         from services.feedback_dataset_service import create_feedback_dataset_draft
+        from services.dataset_transform_service import _feedback_samples
 
         if preview.get("blocked"):
             raise ToolRefused("NO_CONFIRMED_SAMPLES", "没有可用的已确认反馈样本",
                               preview.get("blocked_reasons") or [])
+        if _feedback_samples(adapter, resource.id) != preview.get('feedback_snapshot'):
+            raise ToolRefused('FEEDBACK_CHANGED', '反馈或人工标注已改变，请重新预览确认')
         workspace = _work_dir(adapter, "feedback-draft")
         draft = create_feedback_dataset_draft(
             dataset_id=resource.id,
@@ -1401,6 +1488,8 @@ def _launch_training(adapter, child, parent_model_id: str) -> None:
 
     # worker 必须继承当前 app 的库/存储/临时目录，否则训练结果写进另一份库
     storage_path = getattr(adapter.storage_client, "base_path", None)
+    from services.project_storage import current_scope
+    scope = current_scope()
     payload = {
         "model_id": child.model_id,
         "dataset_id": child.dataset_id,
@@ -1411,6 +1500,7 @@ def _launch_training(adapter, child, parent_model_id: str) -> None:
         "database_path": adapter.database_path,
         "file_store_path": str(storage_path) if storage_path else None,
         "temp_root": str(adapter.work_dir or TEMP_DIR),
+        "project_id": scope[1] if scope else None,
     }
     if callable(adapter.training_launcher):
         adapter.training_launcher(**payload)

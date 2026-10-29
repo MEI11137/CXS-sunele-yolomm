@@ -46,9 +46,7 @@ class IntegrationAssemblyTest(unittest.TestCase):
             self.addCleanup(self._restore_env, key)
 
         self.db_path = str(self.tmp / "app.sqlite3")
-        database = Database()
-        database.db_path = self.db_path
-        database.initialize_db()
+        database = Database(self.db_path, seed_demo=True)
         conn = sqlite3.connect(self.db_path)
         try:
             # initialize_db 会预置默认管理员；这里换成两个固定 ID 的账号，
@@ -188,11 +186,11 @@ class IntegrationAssemblyTest(unittest.TestCase):
         self.assertIn("model.unpublish", names)
 
     def test_human_only_tools_are_not_offered_to_the_agent(self) -> None:
-        """人工复核、样本划分、连接配置不进 LLM 工具清单。"""
+        """人工最终结论、连接配置不进普通 LLM 工具清单；划分可按用户指令执行。"""
         names = {tool["name"] for tool in self.adapter.list_tools(1)}
-        for blocked in ("review.submit_human", "draft.assign_splits",
-                        "mcp.save_connection"):
+        for blocked in ("review.submit_human", "mcp.save_connection"):
             self.assertNotIn(blocked, names)
+        self.assertIn('draft.assign_splits', names)
 
     def test_publish_scope_is_owner_and_project(self) -> None:
         """归档范围解析走真实归属，而不是整表同模态。"""

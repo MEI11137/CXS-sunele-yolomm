@@ -96,6 +96,8 @@ TOOL_TITLES = {
     "dataset.get_state": "数据集状态",
     "dataset.import": "导入数据集",
     "dataset.transform": "派生数据集",
+    "dataset.feedback_revision": "回原数据集生成修订版",
+    "dataset.inspect_samples": "核对数据集文件来源与重复项",
     "dataset.register_candidate": "登记候选数据集",
     "model.import_weight": "导入模型权重",
     "model.get_state": "模型状态",

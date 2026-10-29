@@ -342,12 +342,17 @@ def test_detection_save_cannot_claim_or_delete_foreign_file(file_app, monkeypatc
 
     file_app.register_blueprint(detection_bp)
     with sqlite3.connect(file_app.config["DATABASE"]) as conn:
+        conn.execute("ALTER TABLE detection_records ADD COLUMN review_version INTEGER DEFAULT 0")
+        conn.execute("ALTER TABLE detection_records ADD COLUMN record_status TEXT DEFAULT 'completed'")
         conn.execute(
             "INSERT INTO detection_records (id, user_id, original_image_bucket, "
             "original_image_object_key) VALUES ('victim', 7, 'detection_original', 'private.png')"
         )
+        conn.execute("INSERT INTO detection_records (id,user_id,original_image_bucket,original_image_object_key) VALUES ('forged',8,'detection_original','private.png')")
 
     class FakeDB:
+        def get_connection(self):
+            return sqlite3.connect(file_app.config['DATABASE'])
         def query(self, *_args, **_kwargs):
             return {
                 "original_image_bucket": "detection_original",

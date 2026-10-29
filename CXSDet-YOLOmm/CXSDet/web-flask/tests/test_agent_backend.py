@@ -233,6 +233,69 @@ class AgentBackendTest(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, Code.VALIDATION)
 
+    def test_permission_mode_is_persisted_owner_only_and_not_model_controlled(self):
+        session = self._session()
+        self.assertEqual(sessions.get_session(self.a1, session['id'])['permission_mode'], 'request')
+        with self.assertRaises(AgentError):
+            sessions.set_permission_mode(self.a1, session['id'], 'assist')
+        conn = store.connect()
+        try:
+            conn.execute('UPDATE user SET role=1 WHERE id=1')
+            conn.commit()
+        finally:
+            conn.close()
+        self.a1 = identity.load_actor(1)
+        updated = sessions.set_permission_mode(self.a1, session['id'], 'assist')
+        self.assertEqual(updated['permission_mode'], 'assist')
+        self.assertEqual(sessions.list_sessions(self.a1)[0]['permission_mode'], 'assist')
+        with self.assertRaises(AgentError):
+            sessions.set_permission_mode(self.a2, session['id'], 'full')
+        with self.assertRaises(AgentError):
+            sessions.set_permission_mode(self.a1, session['id'], 'anything')
+        from agent.routes import agent_bp
+        from utils.jwt_util import generate_token
+        self.app.register_blueprint(agent_bp)
+        client = self.app.test_client()
+        url = f"/api/agent/sessions/{session['id']}/permission-mode"
+        self.assertEqual(client.put(url, json={'mode': 'full'}).status_code, 401)
+        response = client.put(url, headers={'Authorization': 'Bearer ' + generate_token(1)}, json={'mode': 'request'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['data']['permission_mode'], 'request')
+
+    def test_model_directory_is_authenticated_personal_and_has_safe_fallback(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        from agent.routes import agent_bp
+        from utils.jwt_util import generate_token
+
+        self.app.register_blueprint(agent_bp)
+        client = self.app.test_client()
+        self.assertEqual(client.get('/api/agent/connection/models').status_code, 401)
+        headers = {'Authorization': 'Bearer ' + generate_token(1)}
+        self.assertEqual(client.get('/api/agent/connection/models', headers=headers).status_code, 409)
+        connections.save_connection(self.a1, provider='custom', api_url='https://fixture.invalid/v1',
+                                    model='current-model', api_key='directory-fixture-key')
+        sdk = Mock()
+        sdk.with_options.return_value = sdk
+        sdk.models.list.return_value = SimpleNamespace(data=[SimpleNamespace(id='other-model'),
+            SimpleNamespace(id='other-model'), SimpleNamespace(id='unsafe\nname'),
+            SimpleNamespace(id='directory-fixture-key')])
+        factory = Mock(return_value=sdk)
+        with patch.object(connections, '_gateway_factory', factory):
+            result = client.get('/api/agent/connection/models', headers=headers)
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(result.get_json()['data']['models'], ['current-model', 'other-model'])
+            factory.assert_called_with(api_key='directory-fixture-key', base_url='https://fixture.invalid/v1')
+            self.assertNotIn('directory-fixture-key', result.get_data(as_text=True))
+            sdk.models.list.side_effect = RuntimeError('raw directory-fixture-key')
+            fallback = client.get('/api/agent/connection/models', headers=headers).get_json()['data']
+            self.assertEqual(fallback['models'], ['current-model'])
+            self.assertTrue(fallback['discovery_error'])
+            self.assertNotIn('directory-fixture-key', str(fallback))
+            other = client.get('/api/agent/connection/models',
+                               headers={'Authorization': 'Bearer ' + generate_token(2)})
+            self.assertEqual(other.status_code, 409)
+
     # -- B-03 事件流 ---------------------------------------------------------
     def test_event_sequence_supports_resume_and_dedup(self) -> None:
         session = self._session()

@@ -18,6 +18,8 @@ from utils.jwt_util import token_required
 from utils.resource_guard import register_new, resource_required, visible_ids, project_target_required
 from utils.models import Dataset
 from config import TEMP_DIR
+from services.project_storage import ProjectTempPath
+TEMP_DIR = ProjectTempPath(TEMP_DIR)
 from services.dataset_import_service import DatasetImportError, import_dataset_archive
 from services.feedback_dataset_service import (
     FeedbackValidationError,
@@ -79,7 +81,8 @@ def upload_dataset():
             return error("数据集名称已存在")
             
         # 保存临时文件
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as temp_file:
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.zip', dir=TEMP_DIR) as temp_file:
             file.save(temp_file.name)
             temp_file_path = temp_file.name
             
@@ -333,40 +336,11 @@ def update_dataset(dataset_id):
         return error(f"更新数据集信息失败: {str(e)}")
 
 @dataset_bp.route('/<dataset_id>', methods=['DELETE'])
-@resource_required('dataset', 'dataset_id', 'write')
+@token_required
 def delete_dataset(dataset_id):
-    """删除数据集"""
-    try:
-        # 获取数据集信息
-        dataset_data = db.query('''
-            SELECT zip_bucket, zip_object_key FROM datasets 
-            WHERE id = ?
-        ''', (dataset_id,), fetchone=True)
-        
-        if not dataset_data:
-            return error("数据集不存在", 404)
-            
-        bucket = dataset_data['zip_bucket']
-        object_key = dataset_data['zip_object_key']
-        
-        # 删除文件服务中的文件
-        try:
-            file_client.delete(bucket, object_key)
-        except Exception as e:
-            print(f"删除文件服务中的文件失败: {e}")
-            
-        # 直接删除数据集记录
-        affected_rows = db.execute('''
-            DELETE FROM datasets WHERE id = ?
-        ''', (dataset_id,))
-        
-        if affected_rows > 0:
-            return success(None, "数据集删除成功")
-        else:
-            return error("删除失败")
-        
-    except Exception as e:
-        return error(f"删除数据集失败: {str(e)}")
+    """兼容原删除入口，统一使用可恢复删除，不物理删除源文件。"""
+    from agent.extension_routes import _resource_mutation
+    return _resource_mutation('dataset', dataset_id, 'delete')
 
 @dataset_bp.route('/<dataset_id>/download', methods=['GET'])
 @resource_required('dataset', 'dataset_id', 'read')
@@ -573,6 +547,8 @@ def finalize_dataset_draft(draft_id):
     try:
         with tempfile.TemporaryDirectory(prefix=f'draft_finalize_{secure_filename(draft_id)}_', dir=TEMP_DIR) as work_dir:
             result = finalize_draft(draft_id, work_dir, db, file_client)
+        if request.headers.get('X-Project-Id'):
+            register_new('dataset', result.to_dict().get('dataset_id') or draft_id)
         return success(result.to_dict(), "数据集已标记为可训练")
     except DraftValidationError as exc:
         return error(str(exc), 400)
@@ -581,6 +557,13 @@ def finalize_dataset_draft(draft_id):
 
 
 def _retry_video_draft_worker(draft_id):
+    from config import DB_PATH
+    from services.project_storage import resource_scope
+    with resource_scope(DB_PATH, 'dataset_drafts', draft_id):
+        return _retry_video_draft_in_workspace(draft_id)
+
+
+def _retry_video_draft_in_workspace(draft_id):
     """Regenerate a failed video draft from its persisted source objects."""
     from utils.db import Database
 
@@ -713,6 +696,8 @@ def build_feedback_dataset_version(dataset_id):
             result = create_feedback_dataset_draft(
                 dataset_id, work_dir, g.user_id, db, file_client
             )
+        if request.headers.get('X-Project-Id'):
+            register_new('draft', result.id)
         return success(result.to_dict(), "反馈样本已生成待划分数据集")
     except FeedbackValidationError as exc:
         return error(str(exc), 400), 400
@@ -720,5 +705,112 @@ def build_feedback_dataset_version(dataset_id):
         return error(str(exc), 400), 400
     except Exception as exc:
         return error(f"生成反馈待划分数据集失败: {str(exc)}")
+
+
+@dataset_bp.route('/<dataset_id>/split/preview', methods=['POST'])
+@resource_required('dataset', 'dataset_id', 'read')
+def preview_dataset_split(dataset_id):
+    from flask import current_app
+    from agent.errors import AgentError
+    from agent.routes import _failure
+    try:
+        backend = current_app.extensions['haixun_agent']['business_backend']
+        source = backend.resolve(g.user_id, 'dataset', dataset_id, ('dataset:read', 'dataset:create'))
+        if source.project_id != request.headers.get('X-Project-Id'):
+            return error('数据集不属于当前项目', 403), 403
+        payload = request.get_json(silent=True) or {}
+        prepared = backend.prepare_tool(g.user_id, 'dataset.split', {'dataset_id': dataset_id, 'name': payload.get('name'), 'split_policy': payload.get('split_policy')})
+        return success(prepared)
+    except AgentError as exc:
+        return _failure(exc)
+    except (ValueError, PermissionError, FileNotFoundError) as exc:
+        return error(str(exc), 400), 400
+
+
+@dataset_bp.route('/<dataset_id>/feedback-revision/preview', methods=['POST'])
+@dataset_bp.route('/<dataset_id>/feedback-revision', methods=['POST'])
+@resource_required('dataset', 'dataset_id', 'read')
+def feedback_revision(dataset_id):
+    """Manual UI and embedded Agent share the same prepared, idempotent handler."""
+    from flask import current_app
+    from agent.errors import AgentError
+    from agent.routes import _failure
+    from services.tool_common import ToolConflict
+    try:
+        backend = current_app.extensions['haixun_agent']['business_backend']
+        source = backend.resolve(g.user_id, 'dataset', dataset_id, ('dataset:read', 'dataset:create'))
+        if source.project_id != request.headers.get('X-Project-Id'):
+            return error('数据集不属于当前项目', 403), 403
+        payload = request.get_json(silent=True) or {}
+        if request.path.endswith('/preview'):
+            result = backend.prepare_tool(g.user_id, 'dataset.feedback_revision', {
+                'dataset_id': dataset_id, 'name': payload.get('name'),
+                'new_sample_split': payload.get('new_sample_split')})
+        else:
+            operation_id = str(payload.get('operation_id') or '')
+            with backend.connect() as conn:
+                row = conn.execute('SELECT * FROM business_tool_operations WHERE operation_id=? AND principal_id=?',
+                                   (operation_id, str(g.user_id))).fetchone()
+            if not row or row['tool_name'] != 'dataset.feedback_revision':
+                return error('修订预览不存在，请重新检查', 404), 404
+            args, scope = json.loads(row['arguments_json']), json.loads(row['resource_json'])
+            if args['dataset_id'] != dataset_id or scope['project_id'] != source.project_id:
+                return error('预览与当前数据集或项目不一致', 403), 403
+            result = backend.execute_tool(g.user_id, operation_id, 'manual-feedback-revision:' + operation_id)
+            if result.get('status') == 'succeeded':
+                register_new('dataset', result['outputs']['dataset_id'])
+        return success(result)
+    except AgentError as exc:
+        return _failure(exc)
+    except ToolConflict as exc:
+        return error(str(exc), 409), 409
+    except (ValueError, PermissionError, FileNotFoundError) as exc:
+        return error(str(exc), 400), 400
+
+
+@dataset_bp.route('/<dataset_id>/inspect', methods=['GET'])
+@resource_required('dataset', 'dataset_id', 'read')
+def inspect_dataset_samples(dataset_id):
+    from flask import current_app
+    from agent.errors import AgentError
+    from agent.routes import _failure
+    try:
+        backend = current_app.extensions['haixun_agent']['business_backend']
+        resource = backend.resolve(g.user_id, 'dataset', dataset_id, ('dataset:read',))
+        if resource.project_id != request.headers.get('X-Project-Id'):
+            return error('数据集不属于当前项目', 403), 403
+        arguments = {'dataset_id': dataset_id, 'page': int(request.args.get('page', 1)),
+                     'page_size': int(request.args.get('page_size', 50)), 'search': request.args.get('search', '')}
+        if request.args.get('record_id'):
+            arguments['record_id'] = request.args['record_id']
+        prepared = backend.prepare_tool(g.user_id, 'dataset.inspect_samples', arguments)
+        result = backend.execute_tool(g.user_id, prepared['operation_id'], 'inspect:' + prepared['operation_id'])
+        return success(result['outputs'])
+    except AgentError as exc:
+        return _failure(exc)
+    except (ValueError, PermissionError, FileNotFoundError) as exc:
+        return error(str(exc), 400), 400
+
+
+@dataset_bp.route('/<dataset_id>/split', methods=['POST'])
+@resource_required('dataset', 'dataset_id', 'read')
+def execute_dataset_split(dataset_id):
+    from flask import current_app
+    try:
+        backend = current_app.extensions['haixun_agent']['business_backend']
+        prepared_id = str((request.get_json(silent=True) or {}).get('operation_id') or '')
+        with backend.connect() as conn:
+            row = conn.execute('SELECT * FROM business_tool_operations WHERE operation_id=? AND principal_id=?', (prepared_id, str(g.user_id))).fetchone()
+        if not row or row['tool_name'] != 'dataset.split':
+            return error('划分预览不存在，请重新检查', 404), 404
+        args, resource = json.loads(row['arguments_json']), json.loads(row['resource_json'])
+        if args['dataset_id'] != dataset_id or resource['project_id'] != request.headers.get('X-Project-Id'):
+            return error('预览与当前数据集或项目不一致', 403), 403
+        result = backend.execute_tool(g.user_id, prepared_id, 'manual-split:' + prepared_id)
+        if result.get('status') == 'succeeded':
+            register_new('dataset', result['outputs']['dataset_id'])
+        return success(result)
+    except (ValueError, PermissionError, FileNotFoundError) as exc:
+        return error(str(exc), 400), 400
 
 

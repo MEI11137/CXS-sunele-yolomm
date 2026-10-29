@@ -19,7 +19,7 @@ const steps: GuideStep[] = [
     anchor: 'bottom',
   },
   {
-    title: '连接你的巡检助手',
+    title: '连接你的海巡助手',
     desc: '在「扩展与连接」中配置助手使用的大模型。这是个人大模型连接，可跳过，且与检测模型相互独立。',
     target: '[data-guide="extensions"]',
     anchor: 'left',

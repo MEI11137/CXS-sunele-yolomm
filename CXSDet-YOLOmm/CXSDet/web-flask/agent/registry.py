@@ -58,6 +58,8 @@ def register_agent(app) -> Dict[str, Any]:
             if needs_recovery:
                 backend = app.extensions['haixun_agent']['business_backend']
                 report['unknown_business_operations'] = backend.reconcile_unfinished()
+                from agent.inspection_loop import interrupt_on_startup
+                interrupt_on_startup()
         except Exception as exc:  # noqa: BLE001
             report["business_error"] = f"{type(exc).__name__}: {exc}"[:400]
 
@@ -66,6 +68,9 @@ def register_agent(app) -> Dict[str, Any]:
     from agent.opencode_runtime import opencode_bp
     if "opencode_bridge" not in app.blueprints:
         app.register_blueprint(opencode_bp)
+    from agent.dev_bridge import dev_bp
+    if 'agent_dev_bridge' not in app.blueprints:
+        app.register_blueprint(dev_bp)
     return report
 
 

@@ -70,6 +70,7 @@ export class MockAdapter extends BaseAdapter {
   }
 
   async createWorkspace(input: {
+    root_directory?: string
     name: string
     description: string
     requirements: string
@@ -78,6 +79,7 @@ export class MockAdapter extends BaseAdapter {
     const ws: Workspace = {
       id: 'ws-' + Date.now(),
       name: input.name,
+      root_directory: input.root_directory,
       description: input.description,
       requirements: input.requirements,
       requirements_raw: input.requirements ? { notes: input.requirements } : {},
@@ -100,6 +102,14 @@ export class MockAdapter extends BaseAdapter {
       return clone(this.workspaces[idx])
     }
     throw new Error('工作区不存在')
+  }
+
+  async browseLocalFolders(): Promise<import('@/types').LocalFolderListing> {
+    throw new Error('本机文件夹功能需要连接真实后端')
+  }
+
+  async createLocalFolder(): Promise<{ path: string }> {
+    throw new Error('本机文件夹功能需要连接真实后端')
   }
 
   async listDefects(_projectId: string): Promise<DefectItem[]> {

@@ -38,6 +38,15 @@ import {
 } from './types'
 
 export abstract class BaseAdapter implements ApiAdapter {
+  async setSessionPermissionMode(_sessionId: string, _mode: 'request' | 'assist' | 'full'): Promise<Session> { return this.unsupported('会话权限模式') }
+  async listConnectionModels(): Promise<{ models: string[]; current: string; discovery_error: string }> { return this.unsupported('模型目录') }
+  async deleteWorkspace(_id: string): Promise<void> { return this.unsupported('删除项目') }
+  async deleteSession(_id: string): Promise<void> { return this.unsupported('删除会话') }
+  async listRecycle(): Promise<import('./types').RecycleContents> { return this.unsupported('回收站') }
+  async restoreProject(_id: string): Promise<void> { return this.unsupported('恢复项目') }
+  async restoreSession(_id: string): Promise<void> { return this.unsupported('恢复会话') }
+  async browseLocalFolders(_path?: string): Promise<import('@/types').LocalFolderListing> { return this.unsupported('浏览本机文件夹') }
+  async createLocalFolder(_parent: string, _name: string): Promise<{ path: string }> { return this.unsupported('新建本机文件夹') }
   async listDirectories(_projectId: string): Promise<Array<Record<string, unknown>>> { return this.unsupported('授权目录') }
   async authorizeDirectory(_projectId: string, _root: string, _label: string): Promise<Record<string, unknown>> { return this.unsupported('授权本机目录') }
   async disableDirectory(_id: string): Promise<void> { return this.unsupported('停用目录') }
@@ -51,6 +60,9 @@ export abstract class BaseAdapter implements ApiAdapter {
   async searchDocument(_id: string, _query: string): Promise<Record<string, unknown>> { return this.unsupported('文档检索') }
   async listTasks(_projectId: string): Promise<AgentTask[]> { return this.unsupported('任务列表') }
   async createFeedbackDraft(_datasetId: string): Promise<Record<string, unknown>> { return this.unsupported('生成反馈草稿') }
+  async previewFeedbackRevision(_datasetId: string, _name: string, _newSampleSplit: string): Promise<Record<string, unknown>> { return this.unsupported('预览回原数据集') }
+  async executeFeedbackRevision(_datasetId: string, _operationId: string): Promise<Record<string, unknown>> { return this.unsupported('回原数据集生成修订版') }
+  async inspectDataset(_datasetId: string, _page: number, _search: string): Promise<Record<string, unknown>> { return this.unsupported('文件来源与重复检查') }
   async listDraftSamples(_draftId: string, _page: number): Promise<Record<string, unknown>> { return this.unsupported('草稿样本') }
   async assignDraftSamples(_draftId: string, _sampleIds: string[], _split: string): Promise<Record<string, unknown>> { return this.unsupported('人工划分') }
   async finalizeDraft(_draftId: string): Promise<Record<string, unknown>> { return this.unsupported('草稿定稿') }
@@ -180,6 +192,9 @@ export abstract class BaseAdapter implements ApiAdapter {
   }
   async requestAiReview(_recordId?: string): Promise<Record<string, unknown>> {
     return this.unsupported('AI 核查')
+  }
+  async requestAiReviews(_recordIds: string[]): Promise<Record<string, unknown>> {
+    return this.unsupported('批量 AI 核查')
   }
   async submitHumanReview(_recordId?: string, _input?: HumanReviewInput): Promise<Record<string, unknown>> {
     return this.unsupported('人工标签提交')

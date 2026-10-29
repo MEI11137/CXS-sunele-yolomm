@@ -14,6 +14,8 @@ from __future__ import annotations
 import base64
 import io
 import json
+import struct
+import zlib
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -37,10 +39,15 @@ REASON_CAPABILITY_UNSUPPORTED = "capability_unsupported"
 REASON_PARSE_ERROR = "response_not_parsable"
 REASON_EMPTY_RESPONSE = "empty_response"
 
-# 1x1 白色 PNG，用于图片能力探测，避免把用户真实业务图片发出去
-_PROBE_PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
-)
+def _probe_png():
+    # 标准库生成有效的 64x64 RGB PNG，连 CRC 一起生成，避免静态 base64 损坏。
+    def chunk(kind, payload):
+        return struct.pack('!I', len(payload)) + kind + payload + struct.pack('!I', zlib.crc32(kind + payload))
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('!2I5B', 64, 64, 8, 2, 0, 0, 0)) +
+            chunk(b'IDAT', zlib.compress((b'\x00' + b'\xff' * 64 * 3) * 64)) + chunk(b'IEND', b''))
+
+
+_PROBE_PNG = _probe_png()
 
 
 @dataclass(frozen=True)
@@ -109,6 +116,9 @@ def classify_failure(exc: BaseException) -> tuple[str, str]:
         return REASON_RATE_LIMITED, "请求被限流，请稍后再试"
     if "timeout" in lowered or "timed out" in lowered or "connection" in lowered:
         return REASON_NETWORK, "网络连接或请求超时，请检查网络与地址"
+    if status == 400 and any(token in lowered for token in
+                            ("unsupported image", "invalid image", "image is valid", "decode image")):
+        return REASON_PARSE_ERROR, "图片请求被拒绝：图片数据或编码无效，请检查输入文件；这不能证明模型不支持视觉"
     if status == 400 and any(
         token in lowered for token in ("image", "vision", "content", "tool", "function")
     ):
@@ -163,6 +173,20 @@ class OpenAIGateway:
                     max_retries=0,
                 )
         return self._client
+
+    def list_models(self) -> List[str]:
+        """只向本人已配置的服务查询目录，不发起生成或猜测可用模型。"""
+        try:
+            response = self._get_client().with_options(timeout=8.0, max_retries=0).models.list()
+            return sorted({item.id for item in response.data[:500]
+                           if isinstance(item.id, str) and 0 < len(item.id) <= 200
+                           and not any(ord(ch) < 32 for ch in item.id)
+                           and self.credentials.api_key not in item.id})
+        except Exception as exc:
+            _, message = classify_failure(exc)
+            from agent.guard import redact
+            message = redact(message.replace(self.credentials.api_key, "[redacted]"))
+            raise AgentError(Code.MODEL_CALL_FAILED, message, http_status=502) from None
 
     # -- 对话 ---------------------------------------------------------------
     def complete(
@@ -271,11 +295,7 @@ class OpenAIGateway:
             return _capability_entry(STATUS_FAILED, exc.details.get("reason", ""), exc.message)
         except BaseException as exc:  # noqa: BLE001
             reason, message = classify_failure(exc)
-            if reason in (REASON_AUTH_FAILED, REASON_MODEL_UNAVAILABLE, REASON_NETWORK):
-                return _capability_entry(STATUS_FAILED, reason, message)
-            return _capability_entry(
-                STATUS_FAILED, REASON_CAPABILITY_UNSUPPORTED, "该模型不能接收图片输入"
-            )
+            return _capability_entry(STATUS_FAILED, reason, message)
         return _capability_entry(STATUS_OK, method="real_request")
 
     def probe_tools(self) -> Dict[str, Any]:

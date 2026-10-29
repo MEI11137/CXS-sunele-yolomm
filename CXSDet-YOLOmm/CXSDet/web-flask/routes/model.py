@@ -12,6 +12,8 @@ from utils.jwt_util import token_required
 from utils.resource_guard import register_new, resource_required, resources_required, visible_ids, project_target_required
 from utils.models import Model, ModelVO, MODEL_STATUS
 from config import DB_PATH, TEMP_DIR, YOLO_CLASSES_CONFIG
+from services.project_storage import ProjectTempPath
+TEMP_DIR = ProjectTempPath(TEMP_DIR)
 from services.dataset_contract import (
     build_runtime_yaml,
     safe_extract_dataset,
@@ -58,14 +60,14 @@ training_processes = {}
 
 def run_training_process(
     model_id, dataset_id, base_model, epochs, batch_size, parent_model_id=None,
-    database_path=None, file_store_path=None, temp_root=None,
+    database_path=None, file_store_path=None, temp_root=None, project_id=None,
 ):
     """在后台进程中运行模型训练（实现见 services/training_runner）。"""
     try:
         run_training_job(
             model_id, dataset_id, base_model, epochs, batch_size, parent_model_id,
             database_path=database_path or DB_PATH,
-            file_store_path=file_store_path, temp_root=temp_root,
+            file_store_path=file_store_path, temp_root=temp_root, project_id=project_id,
         )
     finally:
         # 从训练进程字典中移除已完成的进程
@@ -83,10 +85,13 @@ def _lock_db_path():
 
 
 def _worker_paths():
+    from services.project_storage import temp_directory, current_scope
+    scope = current_scope()
     return {
         'database_path': _lock_db_path(),
         'file_store_path': str(current_app.config.get('FILE_STORE_PATH') or getattr(file_client, 'base_path', None)) if (current_app.config.get('FILE_STORE_PATH') or getattr(file_client, 'base_path', None)) else None,
-        'temp_root': str(current_app.config.get('TEMP_DIR') or TEMP_DIR),
+        'temp_root': str(temp_directory(current_app.config.get('TEMP_DIR') or TEMP_DIR)),
+        'project_id': scope[1] if scope else None,
     }
 
 
@@ -362,38 +367,11 @@ def update_model(model_id):
         return error(f"更新模型信息失败: {str(e)}")
 
 @model_bp.route('/<model_id>', methods=['DELETE'])
-@resource_required('model', 'model_id', 'write')
+@token_required
 def delete_model(model_id):
-    """删除模型"""
-    try:
-        # 获取模型信息
-        model_data = db.query('''
-            SELECT model_bucket, model_object_key FROM models 
-            WHERE id = ?
-        ''', (model_id,), fetchone=True)
-        
-        if not model_data:
-            return error("模型不存在", 404)
-        
-        # 删除文件服务中的模型文件
-        if model_data['model_bucket'] and model_data['model_object_key']:
-            try:
-                file_client.delete(model_data['model_bucket'], model_data['model_object_key'])
-            except Exception as e:
-                print(f"删除模型文件失败: {e}")
-        
-        # 删除模型记录
-        affected_rows = db.execute('''
-            DELETE FROM models WHERE id = ?
-        ''', (model_id,))
-        
-        if affected_rows > 0:
-            return success(None, "模型删除成功")
-        else:
-            return error("删除失败")
-        
-    except Exception as e:
-        return error(f"删除模型失败: {str(e)}")
+    """兼容原删除入口；保留权重与历史来源，不再物理删除。"""
+    from agent.extension_routes import _resource_mutation
+    return _resource_mutation('model', model_id, 'delete')
 
 @model_bp.route('/<model_id>/publish', methods=['POST'])
 @resource_required('model', 'model_id', 'publish')

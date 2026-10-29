@@ -391,6 +391,15 @@ def get_document(database_path: str | Path, document_id: str) -> dict:
     return record
 
 
+def read_document_blocks(database_path, document_id, offset=0, limit=20):
+    """Ordered parsed source for preview/tools; caller must authorize the document."""
+    if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 30:
+        raise ValueError('原文分页参数无效')
+    with _connect(database_path) as conn:
+        rows=conn.execute('SELECT ordinal,block_type,page_no,paragraph_no,table_no,text FROM document_blocks WHERE document_id=? ORDER BY ordinal LIMIT ? OFFSET ?', (document_id,limit,offset)).fetchall()
+    return [{**dict(row),'text':row['text'][:4000]} for row in rows]
+
+
 def list_documents(database_path, owner_id, project_id):
     with _connect(database_path) as conn:
         _ensure_tables(conn)

@@ -1,12 +1,14 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useWorkspaceStore } from '@/stores/workspace'
 import AnnotationCanvas from '@/components/AnnotationCanvas.vue'
 import { getAdapter } from '@/services'
-import { ApiError } from '@/services/http'
+import { ApiError, request } from '@/services/http'
 import type { HumanReviewAnnotation } from '@/services'
 import type { BoundingBox, DetectionRecordSummary } from '@/types'
+import { reviewPage, takeReviewEvents } from '@/utils/reviewBridge'
+import { isPendingReview } from '@/utils/reviewStatus'
 
 const route = useRoute()
 const router = useRouter()
@@ -42,11 +44,14 @@ const queueTotal = computed(() => records.value.length)
 // 标注状态（本地 x/y/w/h 归一化；后端是 [x1,y1,x2,y2]）
 const boxes = ref<BoundingBox[]>([])
 const selectedBoxId = ref<string | null>(null)
-const mode = ref<'draw' | 'select'>('select')
+const mode = ref<'draw' | 'select' | 'pan'>('select')
 const zoom = ref(1)
+const pairedZoom = ref(1)
+const annotationCanvas = ref<InstanceType<typeof AnnotationCanvas> | null>(null)
+const draftRevision = ref(Date.now())
 const noDefect = ref(false)
 const viewMode = ref<'original' | 'result' | 'compare'>('original')
-const undoStack = ref<BoundingBox[][]>([])
+const undoStack = ref<Array<{ boxes: BoundingBox[]; noDefect: boolean }>>([])
 
 const submitting = ref(false)
 const notice = ref('')
@@ -80,6 +85,19 @@ function assetUrl(url: string): string {
 
 const originalImage = computed(() => assetUrl(currentRecord.value?.original_image_url ?? ''))
 const resultImage = computed(() => assetUrl(currentRecord.value?.result_image_url ?? ''))
+const secondaryImage = computed(() => assetUrl(currentRecord.value?.secondary_image_url ?? ''))
+const aiReview = computed(() => {
+  const value = currentRecord.value?.ai_review_result
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
+})
+const aiHints = computed(() => {
+  const data = aiReview.value
+  if (!data) return []
+  const values = [...(Array.isArray(data.attention_regions) ? data.attention_regions : []),
+    ...(Array.isArray(data.possible_missed_detections) ? data.possible_missed_detections : [])]
+  return values.filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
+    .map(item => String(item.reason || '请人工检查该区域') + (Array.isArray(item.bbox) ? ' · 坐标 ' + item.bbox.join(', ') : ''))
+})
 
 // --------------------------------------------------------- 坐标转换
 // 三套坐标必须区分清楚：
@@ -129,6 +147,7 @@ function parseStoredAnnotations(raw: unknown): HumanReviewAnnotation[] {
       return {
         class_name: String(obj.class_name ?? ''),
         class_id: Number(obj.class_id ?? obj.class ?? 0),
+        severity: ['low', 'medium', 'high'].includes(String(obj.severity)) ? obj.severity as 'low' | 'medium' | 'high' : 'medium',
         bbox: [Number(bbox[0] ?? 0), Number(bbox[1] ?? 0), Number(bbox[2] ?? 0), Number(bbox[3] ?? 0)] as [
           number,
           number,
@@ -169,7 +188,7 @@ async function loadAnnotation() {
     ? stored
     : r.detections.map((d, index) => ({
         class_name: d.class_name,
-        class_id: d.class || index,
+        class_id: d.class ?? index,
         bbox: normalizeBbox(
           [d.bbox[0], d.bbox[1], d.bbox[2], d.bbox[3]].map((v) => Number(v) || 0),
           naturalSize.value,
@@ -186,7 +205,7 @@ async function loadAnnotation() {
       h,
       category: item.class_name,
       label: categoryLabel(item.class_name),
-      severity: 'medium' as const,
+      severity: item.severity || 'medium',
     }
   })
   noDefect.value = r.human_review_status === 'no_defect' || (r.human_review_status === 'confirmed' && !stored.length)
@@ -194,6 +213,7 @@ async function loadAnnotation() {
   selectedBoxId.value = null
   undoStack.value = []
   zoom.value = 1
+  pairedZoom.value = 1
   annotationLoading.value = false
 }
 
@@ -203,17 +223,28 @@ async function loadQueue() {
   loading.value = true
   loadError.value = ''
   try {
-    const page = await getAdapter().listRecords({ page: 1, pageSize: 50 })
-    // 已人工确认或无缺陷的不再进入待复核队列
-    records.value = page.items.filter(
-      (r) => r.human_review_status !== 'confirmed' && r.human_review_status !== 'no_defect',
+    const flowId = typeof route.query.flow_id === 'string' ? route.query.flow_id : ''
+    const flow = flowId ? await request<{ project_id: string; record_ids: string[]; status: string }>(
+      '/api/agent/inspection-runs/' + encodeURIComponent(flowId)) : null
+    if (flow && flow.project_id !== workspace.currentId) throw new Error('巡检批次不属于当前项目')
+    const page = flow
+      ? { items: await Promise.all(flow.record_ids.map(id => getAdapter().getRecord(id))) }
+      : await getAdapter().listRecords({ page: 1, pageSize: 50 })
+    // 已确认或驳回的记录不再进入待复核队列；历史记录仍可显式打开重审。
+    const items: Array<DetectionRecordSummary | null> = page.items
+    records.value = items.filter(
+      (r): r is DetectionRecordSummary => !!r && isPendingReview(r.human_review_status),
     )
     const requestedId = route.params.defectId
-    if (typeof requestedId === 'string' && !records.value.some(r => r.id === requestedId)) {
+    if (!flow && typeof requestedId === 'string' && !records.value.some(r => r.id === requestedId)) {
       const requested = await getAdapter().getRecord(requestedId)
       if (requested) records.value.unshift(requested)
     }
     if (currentIdx.value >= records.value.length) currentIdx.value = 0
+    if (typeof requestedId === 'string') {
+      const requestedIndex = records.value.findIndex(record => record.id === requestedId)
+      if (requestedIndex >= 0) currentIdx.value = requestedIndex
+    }
     loadAnnotation()
   } catch (e) {
     loadError.value = '读取复核队列失败：' + (e as Error).message
@@ -231,14 +262,71 @@ onMounted(async () => {
     if (idx >= 0) currentIdx.value = idx
   }
 })
+watch(() => [route.query.flow_id, route.params.projectId, route.params.defectId], () => { currentIdx.value = 0; void loadQueue() })
 
-function pushUndo() {
-  undoStack.value.push(JSON.parse(JSON.stringify(boxes.value)))
+watch([boxes, noDefect], () => { draftRevision.value++ }, { deep: true, flush: 'sync' })
+watch([currentRecord, boxes, expectedVersion, selectedBoxId, mode, zoom, viewMode, annotationLoading, draftRevision], () => {
+  const record = currentRecord.value
+  reviewPage.value = record && !annotationLoading.value ? {
+    project_id: workspace.currentId, record_id: record.id, expected_version: expectedVersion.value,
+    draft_revision: draftRevision.value, annotations: boxes.value.map(b => ({ class_name: b.category,
+      class_id: categories.value.find(c => c.name === b.category)?.id ?? -1, bbox: localToRemote(b), severity: b.severity })),
+    selected_index: selectedBoxId.value ? boxes.value.findIndex(b => b.id === selectedBoxId.value) : null,
+    view: viewMode.value, mode: mode.value, zoom: zoom.value,
+  } : null
+}, { deep: true, flush: 'post' })
+
+async function applyReviewEvent({ type, payload }: { type: string; payload: Record<string, unknown> }) {
+  const record = currentRecord.value
+  if (!record || payload.project_id !== workspace.currentId || payload.record_id !== record.id) return
+  if (type === 'review.changed') {
+    notice.value = payload.record_status === 'deleted' ? '这条记录已删除；原图与审计保留。' : '已保存你在对话确认卡中确认的复核结果。'
+    noticeType.value = 'success'
+    await refreshAfterDecision()
+    return
+  }
+  if (type === 'review.draft') {
+    if (payload.editor_revision !== draftRevision.value || payload.expected_version !== expectedVersion.value) {
+      notice.value = '当前草稿已变化，未覆盖你的修改。请重新告诉助手要修改的内容。'; noticeType.value = 'error'; return
+    }
+    pushUndo()
+    const annotations = parseStoredAnnotations(payload.annotations)
+    boxes.value = annotations.map((item, index) => ({ id: `box-${record.id}-${index}`, ...remoteToLocal(item.bbox),
+      category: item.class_name, label: categoryLabel(item.class_name), severity: item.severity || 'medium' }))
+    noDefect.value = false
+    selectedBoxId.value = null
+    notice.value = '助手已更新标注草稿，尚未提交；你可继续修改或提交。'; noticeType.value = 'success'
+    return
+  }
+  if (type !== 'review.view') return
+  const value = String(payload.value ?? '')
+  if (payload.command === 'zoom') zoom.value = Math.max(.5, Math.min(3, Number(value)))
+  if (payload.command === 'fit') fitWindow()
+  if (payload.command === 'mode' && ['pan', 'select', 'draw'].includes(value)) mode.value = value as typeof mode.value
+  if (payload.command === 'view' && ['original', 'result', 'compare'].includes(value)) viewMode.value = value as typeof viewMode.value
+  if (payload.command === 'next') nextItem()
+  if (payload.command === 'previous') prevItem()
+  if (payload.command === 'undo') undo()
+  if (payload.command === 'select') {
+    const box = boxes.value[Number(value)]
+    if (box) { selectBox(box.id); await nextTick(); annotationCanvas.value?.focusBox(box) }
+  }
+}
+function reviewEvent() {
+  if (annotationLoading.value || !currentRecord.value) return
+  for (const event of takeReviewEvents(workspace.currentId, currentRecord.value.id)) void applyReviewEvent(event)
+}
+watch([currentRecord, annotationLoading], () => void nextTick(reviewEvent), { flush: 'post' })
+onMounted(() => window.addEventListener('haixun:review', reviewEvent))
+onBeforeUnmount(() => { window.removeEventListener('haixun:review', reviewEvent); reviewPage.value = null })
+
+function pushUndo(previousNoDefect = noDefect.value) {
+  undoStack.value.push({ boxes: JSON.parse(JSON.stringify(boxes.value)), noDefect: previousNoDefect })
 }
 
 function onDraw(box: BoundingBox) {
-  noDefect.value = false
   pushUndo()
+  noDefect.value = false
   boxes.value.push(box)
   selectedBoxId.value = box.id
 }
@@ -260,8 +348,10 @@ function selectBox(id: string | null) {
 
 function undo() {
   if (!undoStack.value.length) return
-  boxes.value = undoStack.value.pop()!
-  if (boxes.value.length) noDefect.value = false
+  const previous = undoStack.value.pop()!
+  boxes.value = previous.boxes
+  noDefect.value = previous.noDefect
+  selectedBoxId.value = null
 }
 
 function deleteSelected() {
@@ -273,13 +363,15 @@ function deleteSelected() {
 
 function applyEdit() {
   if (!selectedBoxId.value) return
+  pushUndo()
   boxes.value = boxes.value.map((b) =>
-    b.id === selectedBoxId.value ? { ...b, category: editCategory.value, severity: editSeverity.value } : b,
+    b.id === selectedBoxId.value ? { ...b, category: editCategory.value, label: categoryLabel(editCategory.value), severity: editSeverity.value } : b,
   )
 }
 
 function toggleNoDefect() {
-  if (noDefect.value) { pushUndo(); boxes.value = [] }
+  pushUndo(!noDefect.value)
+  if (noDefect.value) boxes.value = []
 }
 
 function changeZoom(delta: number) {
@@ -291,9 +383,17 @@ function fitWindow() {
 }
 
 /** 提交到后端：带真实 expected_version，服务端成功后才更新界面 */
+async function refreshAfterDecision() {
+  if (route.params.defectId) {
+    // 清除历史记录定位，避免刷新时将刚处理完的记录重新插回队列。
+    await router.replace({ path: '/projects/' + workspace.currentId + '/review', query: route.query })
+  } else await loadQueue()
+}
+
 async function submit(decisionOverride?: 'confirmed' | 'no_defect' | 'rejected') {
   const r = currentRecord.value
   if (!r || submitting.value) return
+  if (decisionOverride === 'rejected' && r.human_review_status === 'rejected') return
 
   let decision: 'confirmed' | 'no_defect' | 'rejected'
   if (decisionOverride) {
@@ -320,6 +420,7 @@ async function submit(decisionOverride?: 'confirmed' | 'no_defect' | 'rejected')
     return {
       class_name: b.category,
       class_id: cat?.id ?? -1,
+      severity: b.severity,
       bbox: localToRemote(b),
     }
   })
@@ -335,7 +436,7 @@ async function submit(decisionOverride?: 'confirmed' | 'no_defect' | 'rejected')
     noticeType.value = 'success'
     notice.value =
       decision === 'rejected'
-        ? '已驳回该检测结果，不计入确认样本。'
+        ? '已驳回并移出待复核队列，可在「识别记录 → 已驳回」查看；不会回流训练。'
         : decision === 'no_defect'
           ? '已提交「确认无缺陷」。'
           : `已提交 ${annotations.length} 个标注框。`
@@ -344,7 +445,7 @@ async function submit(decisionOverride?: 'confirmed' | 'no_defect' | 'rejected')
 
     // 服务端成功后才刷新队列；刷新会重建标注，但不清掉本次结果提示
     const message = notice.value
-    await loadQueue()
+    await refreshAfterDecision()
     notice.value = message
     noticeType.value = 'success'
   } catch (e) {
@@ -364,6 +465,19 @@ async function submit(decisionOverride?: 'confirmed' | 'no_defect' | 'rejected')
 function clearNotice() {
   notice.value = ''
   noticeType.value = ''
+}
+
+async function deleteRecord() {
+  const record = currentRecord.value
+  if (!record || submitting.value || !window.confirm(`删除这条识别记录“${record.title || record.id}”？原图、数据集、权重和审计保留，可通过助手恢复。`)) return
+  submitting.value = true
+  try {
+    await request('/api/detection/records/' + encodeURIComponent(record.id), { method: 'DELETE', body: { expected_version: expectedVersion.value } })
+    if (route.params.defectId) await router.replace('/projects/' + workspace.currentId + '/review')
+    await loadQueue()
+    notice.value = '记录已删除，项目文件与回流审计保留。'; noticeType.value = 'success'
+  } catch (error) { notice.value = (error as Error).message; noticeType.value = 'error' }
+  finally { submitting.value = false }
 }
 
 function nextItem() {
@@ -391,6 +505,7 @@ function prevItem() {
       <span class="sep">/</span>
       <span class="current">{{ currentDefect?.turbineId ?? '—' }}</span>
     </div>
+    <p v-if="route.query.flow_id" class="edit-hint">自动巡检本轮疑点队列 · AI 建议仅供参考，提交后助手会核对真实复核进度。</p>
 
     <div v-if="!currentDefect" class="panel empty">
       <div class="empty-title">{{ loading ? '正在读取复核队列…' : loadError ? '复核队列读取失败' : '暂无可复核项' }}</div>
@@ -408,11 +523,12 @@ function prevItem() {
           <div class="review-path">
             <span class="tag">{{ currentDefect.turbineId }}</span>
             <span class="file-name">{{ currentDefect.bladeFile }}</span>
-            <span class="tag" :class="noDefect ? 'tag-success' : ''">rev {{ expectedVersion }}</span>
+            <span class="tag" title="同一条记录的修改版本，不是图片张数">记录版本 {{ expectedVersion }}</span>
+            <span v-if="currentDefect.reviewStatus === 'rejected'" class="tag tag-warn">已驳回 · 可重新标注后提交</span>
           </div>
         </div>
         <div class="review-nav">
-          <span class="num">{{ currentIdx + 1 }} / {{ queueTotal }}</span>
+          <span class="num">第 {{ currentIdx + 1 }} 张 / 共 {{ queueTotal }} 张</span>
           <button class="btn btn-sm" :disabled="currentIdx === 0" @click="prevItem">上一项</button>
           <button class="btn btn-sm" :disabled="currentIdx >= queueTotal - 1" @click="nextItem">下一项</button>
         </div>
@@ -434,38 +550,60 @@ function prevItem() {
               <button class="tool-btn" @click="fitWindow">适应窗口</button>
             </div>
             <div class="toolbar-group">
-              <button class="tool-btn" :class="{ active: mode === 'select' }" @click="mode = 'select'">选择</button>
-              <button class="tool-btn" :class="{ active: mode === 'draw' }" @click="mode = 'draw'">重绘框</button>
-              <button class="tool-btn" :disabled="!selectedBoxId" @click="deleteSelected">删除框</button>
-              <button class="tool-btn" :disabled="!undoStack.length" @click="undo">撤销</button>
+              <button class="tool-btn" :disabled="viewMode === 'result'" :class="{ active: mode === 'select' && viewMode !== 'result' }" @click="mode = 'select'">选择</button>
+              <button class="tool-btn" :class="{ active: mode === 'pan' || viewMode === 'result' }" @click="mode = 'pan'">平移</button>
+              <button class="tool-btn" :disabled="viewMode === 'result'" :class="{ active: mode === 'draw' && viewMode !== 'result' }" @click="mode = 'draw'">重绘框</button>
+              <button class="tool-btn" :disabled="viewMode === 'result' || !selectedBoxId" @click="deleteSelected">删除框</button>
+              <button class="tool-btn" :disabled="viewMode === 'result' || !undoStack.length" @click="undo">撤销</button>
             </div>
           </div>
           <div class="canvas-scroll">
             <AnnotationCanvas
-              v-if="viewMode !== 'result'"
-              :boxes="boxes"
-              :image-url="originalImage"
-              :zoom="zoom"
-              :mode="mode"
+              ref="annotationCanvas"
+              v-if="viewMode !== 'result' || resultImage"
+              :boxes="viewMode === 'result' ? [] : boxes"
+              :image-url="viewMode === 'result' ? resultImage : originalImage"
+              v-model:zoom="zoom"
+              :mode="viewMode === 'result' ? 'pan' : mode"
               :selected-box-id="selectedBoxId"
               :default-category="defaultCategory"
               @draw="onDraw"
               @select="selectBox"
               @update:boxes="onUpdateBoxes"
+              @interaction-start="pushUndo"
             />
             <div v-else class="result-preview">
-              <img v-if="resultImage" :src="resultImage" alt="检测结果图" />
-              <div v-else class="edit-hint">该记录没有结果图。</div>
+              <div class="edit-hint">该记录没有结果图。</div>
             </div>
           </div>
           <div v-if="viewMode === 'compare'" class="compare-strip">
-            <span class="edit-hint">当前显示原图（可编辑标注）；结果图见「结果」</span>
+            <span class="edit-hint">上方为 RGB 原图（可编辑标注）；下方为{{ secondaryImage ? '同一记录的原始配套模态图' : '检测结果图' }}。标注使用 RGB 归一化坐标。</span>
+            <section v-if="secondaryImage || resultImage" class="paired-preview" aria-label="配套模态图片查看区">
+              <div class="canvas-toolbar">
+                <span class="edit-hint">{{ secondaryImage ? '配套模态原图' : '检测结果图' }} · 只读 · 滚轮缩放，拖动平移</span>
+                <div class="toolbar-group" role="group" aria-label="配套图片缩放">
+                  <button class="tool-btn" :disabled="pairedZoom <= 0.5" aria-label="缩小配套图片" @click="pairedZoom = Math.max(0.5, pairedZoom - 0.25)">−</button>
+                  <span class="zoom-val num" role="status" aria-label="配套图片缩放比例">{{ Math.round(pairedZoom * 100) }}%</span>
+                  <button class="tool-btn" :disabled="pairedZoom >= 3" aria-label="放大配套图片" @click="pairedZoom = Math.min(3, pairedZoom + 0.25)">＋</button>
+                  <button class="tool-btn" @click="pairedZoom = 1">配套图片适应窗口</button>
+                </div>
+              </div>
+              <AnnotationCanvas :key="currentRecord?.id" :image-url="secondaryImage || resultImage" :boxes="[]" v-model:zoom="pairedZoom" mode="pan" :selected-box-id="null" />
+            </section>
           </div>
           <div v-if="noDefect" class="no-defect-banner">已标记为「确认无缺陷」</div>
         </div>
 
         <!-- 右侧编辑面板 -->
         <aside class="edit-panel">
+          <div v-if="aiReview" class="panel edit-card ai-review-card">
+            <h3 class="edit-title">AI 核查建议</h3>
+            <p>{{ aiReview.summary }}</p>
+            <p v-if="Array.isArray(aiReview.possible_false_positives) && aiReview.possible_false_positives.length">疑似误报框：{{ aiReview.possible_false_positives.map(value => '#' + (Number(value) + 1)).join('、') }}</p>
+            <ul v-if="aiHints.length"><li v-for="(hint, index) in aiHints" :key="index">{{ hint }}</li></ul>
+            <button v-if="secondaryImage" class="btn btn-sm" @click="viewMode = 'compare'">查看 RGB 与配套模态</button>
+            <p class="edit-hint">请对照图片修正或确认；也可告诉助手准备改动，由你确认后提交。</p>
+          </div>
           <div class="panel edit-card">
             <h3 class="edit-title">缺陷信息</h3>
             <div class="field">
@@ -476,6 +614,7 @@ function prevItem() {
               <span class="field-label">置信度</span>
               <div class="num">{{ (currentDefect.confidence * 100).toFixed(0) }}%</div>
             </div>
+            <div v-if="boxes.length" class="box-list" aria-label="标注框列表"><button v-for="(box, index) in boxes" :key="box.id" class="btn btn-sm" :class="{ selected: selectedBoxId === box.id }" @click="selectBox(box.id); annotationCanvas?.focusBox(box)">#{{ index + 1 }} {{ categoryLabel(box.category) }}</button></div>
 
             <template v-if="selectedBoxId">
               <div class="field">
@@ -508,10 +647,11 @@ function prevItem() {
               <button class="btn btn-primary" :disabled="submitting" @click="submit()">
                 {{ submitting ? '提交中…' : '提交' }}
               </button>
-              <button class="btn" :disabled="submitting" @click="submit('rejected')">驳回该结果</button>
+              <button class="btn" :disabled="submitting || currentDefect.reviewStatus === 'rejected'" @click="submit('rejected')">{{ currentDefect.reviewStatus === 'rejected' ? '已驳回' : '驳回该结果' }}</button>
+              <button class="btn delete-record" :disabled="submitting" @click="deleteRecord">删除此记录</button>
             </div>
             <div class="edit-hint">
-              提交会带上版本号 rev {{ expectedVersion }}；记录被别人更新时会拒绝覆盖并重新加载。
+              记录版本 {{ expectedVersion }} 用于避免覆盖其他人的修改，不代表待复核数量。驳回后保留记录，可在识别记录中重新打开。
             </div>
           </div>
 
@@ -520,21 +660,30 @@ function prevItem() {
             <ul class="tips-list">
               <li>「重绘框」在图上拖拽补框，框坐标使用原图归一化坐标。</li>
               <li>「选择」模式可拖动已有框调整位置。</li>
+              <li>放大后用「平移」、按住空格拖动或鼠标中键移动视野；选择模式下也可拖动空白区域。</li>
+              <li>鼠标放在图片上滚动滚轮即可缩放，顶部百分比同步显示；上滚放大，下滚缩小。</li>
               <li>确认无缺陷提交后，刷新或返回不会恢复旧框。</li>
               <li>提交失败会保留草稿，可重试。</li>
+              <li>可对助手说“放大到150%”“选择第2个框”“把选中框改为热斑”“确认这张无缺陷”或“删除这条记录”。提交和删除仍由你确认。</li>
             </ul>
           </div>
         </aside>
       </div>
 
-      <div v-if="notice" class="notice submit-notice" :class="noticeType === 'error' ? 'notice-error' : 'notice-success'">
-        {{ notice }}
-      </div>
     </template>
+    <div v-if="notice" role="status" class="notice submit-notice" :class="noticeType === 'error' ? 'notice-error' : 'notice-success'">
+      {{ notice }}
+    </div>
   </div>
 </template>
 
 <style scoped>
+.paired-preview { min-width: 0; margin-top: 10px; }
+.box-list { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0 12px; }
+.box-list .selected { border-color: var(--accent, #1d5fbf); }
+.delete-record { color: var(--danger); }
+.ai-review-card p, .ai-review-card li { line-height: 1.7; font-size: 12px; overflow-wrap: anywhere; }
+.ai-review-card ul { padding-left: 18px; }
 .page {
   padding: var(--content-pad);
   max-width: 1200px;
@@ -711,7 +860,12 @@ function prevItem() {
 @media (max-width: 768px) {
   .review-body {
     flex-direction: column;
+    align-items: stretch;
   }
+  .canvas-area { width: 100%; }
+  .review-info, .review-path { min-width: 0; max-width: 100%; }
+  .review-path { flex-wrap: wrap; }
+  .file-name { overflow-wrap: anywhere; max-width: 100%; }
   .edit-panel {
     width: 100%;
   }

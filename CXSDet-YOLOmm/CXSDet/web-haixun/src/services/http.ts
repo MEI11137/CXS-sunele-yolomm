@@ -9,6 +9,8 @@
 // * 未登录/过期统一清掉本地登录态，不留半登录状态。
 
 export const TOKEN_KEY = 'haixun.token'
+let currentProjectScope = ''
+export function setProjectScope(projectId: string) { currentProjectScope = projectId }
 
 /** 后端稳定错误码（与 agent/errors.py 的 Code 对应，只做展示分支用）。 */
 export interface ApiErrorBody {
@@ -154,6 +156,8 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   const { method = 'GET', query, body, form, signal, responseType = 'json', auth = true } = options
 
   const headers: Record<string, string> = { Accept: 'application/json' }
+  if (currentProjectScope && (/^\/api\/(dataset|model|detection)(\/|$)/.test(path) ||
+      /^\/api\/agent\/resources\/lifecycle(\/|$)/.test(path))) headers['X-Project-Id'] = currentProjectScope
   if (body !== undefined) headers['Content-Type'] = 'application/json'
   if (auth) {
     const token = getToken()

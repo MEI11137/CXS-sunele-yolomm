@@ -102,12 +102,14 @@ export interface Confirmation {
   status: 'pending' | 'approved' | 'rejected' | 'expired' | 'unknown'
   execution_state: ExecutionState
   operation_id?: string | null
+  result?: Record<string, unknown>
 }
 
 /** 与后端 agent/errors.py 的 ExecutionState 一致。 */
 export type ExecutionState = 'not_executed' | 'partial' | 'executed' | 'unknown' | 'cancelled'
 
 export interface AgentEvent {
+  created_at?: number
   event_id: string
   sequence: number
   task_id: string
@@ -122,6 +124,7 @@ export interface AgentError {
 }
 
 export interface Workspace {
+  root_directory?: string
   id: string
   name: string
   description: string
@@ -135,6 +138,12 @@ export interface Workspace {
   updated_at: string
 }
 
+export interface LocalFolderListing {
+  path: string
+  parent: string | null
+  directories: { name: string; path: string }[]
+}
+
 export interface Defect {
   id: string
   turbineId: string
@@ -142,7 +151,7 @@ export interface Defect {
   thumbnail: string
   suspectedType: string
   confidence: number
-  reviewStatus: 'pending' | 'reviewing' | 'done'
+  reviewStatus: 'pending' | 'reviewing' | 'done' | 'rejected'
   severity: 'low' | 'medium' | 'high'
 }
 
@@ -210,6 +219,7 @@ export type CardPayload =
   | { kind: 'error'; error: AgentError }
 
 export interface Session {
+  permission_mode?: 'request' | 'assist' | 'full'
   id: string
   project_id: string
   title: string

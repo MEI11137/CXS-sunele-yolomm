@@ -26,6 +26,7 @@ import type {
   Workspace,
 } from '@/types'
 import { http } from './http'
+import { reviewStatus } from '@/utils/reviewStatus'
 import {
   mapAuthUser,
   mapCategories,
@@ -115,6 +116,7 @@ export class RealAdapter extends BaseAdapter {
   }
 
   async createWorkspace(input: {
+    root_directory?: string
     name: string
     description: string
     requirements: string
@@ -122,18 +124,17 @@ export class RealAdapter extends BaseAdapter {
     const project = await http.post<unknown>('/api/agent/projects', {
       name: input.name,
       description: input.description,
+      root_directory: input.root_directory,
+      requirements: input.requirements.trim() ? { notes: input.requirements.trim() } : {},
     })
-    const created = mapWorkspace(project)
-    const notes = input.requirements.trim()
-    if (!notes) return created
-    // requirements 是对象且只有 notes 可写：单独 PATCH，避免创建接口忽略它
-    return this.updateWorkspace(created.id, { requirements: notes })
+    return mapWorkspace(project)
   }
 
   async updateWorkspace(id: string, patch: Partial<Workspace>): Promise<Workspace> {
     const body: Raw = {}
     if (patch.name !== undefined) body.name = patch.name
     if (patch.description !== undefined) body.description = patch.description
+    if (patch.root_directory !== undefined) body.root_directory = patch.root_directory
 
     if (patch.requirements !== undefined) {
       // 整体覆盖会抹掉其他结构化要求，先取现状再合并 notes
@@ -159,11 +160,29 @@ export class RealAdapter extends BaseAdapter {
     }
   }
 
+  async browseLocalFolders(path = ''): Promise<import('@/types').LocalFolderListing> {
+    return http.get('/api/agent/local-folders?path=' + encodeURIComponent(path))
+  }
+
+  async deleteWorkspace(id: string): Promise<void> { await http.del(`/api/agent/projects/${id}`) }
+  async deleteSession(id: string): Promise<void> { await http.del(`/api/agent/sessions/${id}`) }
+  async listRecycle(): Promise<import('./types').RecycleContents> { return http.get('/api/agent/recycle') }
+  async restoreProject(id: string): Promise<void> { await http.post(`/api/agent/projects/${id}/restore`, {}) }
+  async restoreSession(id: string): Promise<void> { await http.post(`/api/agent/sessions/${id}/restore`, {}) }
+
+  async createLocalFolder(parent: string, name: string): Promise<{ path: string }> {
+    return http.post('/api/agent/local-folders', { parent, name })
+  }
+
   // ------------------------------------------------------------ 个人连接
 
   async getConnection(): Promise<PersonalConnection> {
     const data = raw(await http.get<unknown>('/api/agent/connection'))
     return data as unknown as PersonalConnection
+  }
+
+  async listConnectionModels(): Promise<{ models: string[]; current: string; discovery_error: string }> {
+    return http.get('/api/agent/connection/models')
   }
 
   async saveConnection(input: {
@@ -271,7 +290,7 @@ export class RealAdapter extends BaseAdapter {
 
   async listSessions(projectId: string): Promise<Session[]> {
     const data = await http.get<unknown>('/api/agent/sessions', {
-      query: { project_id: projectId || undefined },
+      query: { project_id: projectId || undefined, limit: 200 },
     })
     return asArray(data).map(mapSession) as unknown as Session[]
   }
@@ -289,6 +308,10 @@ export class RealAdapter extends BaseAdapter {
     return mapSession(data) as unknown as Session
   }
 
+  async setSessionPermissionMode(sessionId: string, mode: 'request' | 'assist' | 'full'): Promise<Session> {
+    return mapSession(await http.put(`/api/agent/sessions/${sessionId}/permission-mode`, { mode })) as Session
+  }
+
   async sendMessage(
     sessionId: string,
     content: string,
@@ -298,6 +321,7 @@ export class RealAdapter extends BaseAdapter {
     // 不伪造逐字输出，界面按"等待结果"处理。
     // 附件只以已登记资源 id 传递，绝不把文件名当输入。
     const body: Raw = { text: content }
+    if (options.reviewContext) body.review_context = options.reviewContext
     if (options.resourceRefs?.length) {
       body.resource_refs = options.resourceRefs.map((ref) => ({ id: ref.id }))
     }
@@ -340,6 +364,15 @@ export class RealAdapter extends BaseAdapter {
   async createFeedbackDraft(datasetId: string): Promise<Raw> {
     return raw(await http.post(`/api/dataset/${datasetId}/feedback-version`))
   }
+  async previewFeedbackRevision(datasetId: string, name: string, newSampleSplit: string): Promise<Raw> {
+    return raw(await http.post(`/api/dataset/${datasetId}/feedback-revision/preview`, { name, new_sample_split: newSampleSplit }))
+  }
+  async executeFeedbackRevision(datasetId: string, operationId: string): Promise<Raw> {
+    return raw(await http.post(`/api/dataset/${datasetId}/feedback-revision`, { operation_id: operationId }))
+  }
+  async inspectDataset(datasetId: string, page: number, search: string): Promise<Raw> {
+    return raw(await http.get(`/api/dataset/${datasetId}/inspect`, { query: {page, search, page_size:50} }))
+  }
   async listDraftSamples(draftId: string, page: number): Promise<Raw> {
     return raw(await http.get(`/api/dataset/drafts/${draftId}/samples`, { query: { page, page_size: 50 } }))
   }
@@ -375,23 +408,27 @@ export class RealAdapter extends BaseAdapter {
 
   // ---------------------------------------------------------------- 动作
 
+  private async actionResult(data: unknown, actionId: string): Promise<Confirmation> {
+    // 业务操作返回 {action,...}，原生引擎可能只返回任务快照；以实际动作记录核实。
+    const confirmation = mapConfirmation(raw(data).action) ?? mapConfirmation(data)
+      ?? mapConfirmation(await http.get(`/api/agent/actions/${encodeURIComponent(actionId)}`))
+    if (!confirmation || confirmation.action_id !== actionId) throw new Error('动作结果无法识别，请查看真实任务状态')
+    return confirmation
+  }
+
   async confirmAction(actionId: string, expectedRevision: number): Promise<Confirmation> {
     // 版本必须是整数且来自最近一次读取，避免"确认了旧目标"
     const data = await http.post<unknown>(`/api/agent/actions/${actionId}/confirm`, {
       expected_revision: expectedRevision,
     })
-    const confirmation = mapConfirmation(data)
-    if (!confirmation) throw new Error('确认接口返回的动作结构无法识别')
-    return confirmation
+    return this.actionResult(data, actionId)
   }
 
   async rejectAction(actionId: string, reason?: string): Promise<Confirmation> {
     const data = await http.post<unknown>(`/api/agent/actions/${actionId}/reject`, {
       reason: reason ?? '',
     })
-    const confirmation = mapConfirmation(data)
-    if (!confirmation) throw new Error('拒绝接口返回的动作结构无法识别')
-    return confirmation
+    return this.actionResult(data, actionId)
   }
 
   // ---------------------------------------------------- 工具 / 手册 / 授权
@@ -478,6 +515,11 @@ export class RealAdapter extends BaseAdapter {
   async requestAiReview(recordId: string): Promise<Record<string, unknown>> {
     return raw(await http.post<unknown>(`/api/detection/records/${recordId}/ai-review`))
   }
+  async requestAiReviews(recordIds: string[]): Promise<Record<string, unknown>> {
+    const ids = [...new Set(recordIds)]
+    if (!ids.length || ids.length > 50) throw new Error('请选择 1–50 条记录进行批量核查')
+    return raw(await http.post<unknown>('/api/detection/records/ai-review/batch', { record_ids: ids }))
+  }
 
   async submitHumanReview(
     recordId: string,
@@ -517,6 +559,7 @@ export class RealAdapter extends BaseAdapter {
           page: query.page ?? 1,
           page_size: query.pageSize ?? 20,
           search: query.search,
+          record_kind: query.recordKind,
         },
       }),
     )
@@ -622,8 +665,10 @@ export class RealAdapter extends BaseAdapter {
   }
 
   async addFeedbackBatch(recordIds: string[]): Promise<Record<string, unknown>> {
+    const ids = [...new Set(recordIds)]
+    if (!ids.length || ids.length > 50) throw new Error('请选择 1 至 50 条记录加入反馈池')
     return raw(
-      await http.post<unknown>('/api/detection/records/feedback/batch', { record_ids: recordIds }),
+      await http.post<unknown>('/api/detection/records/feedback/batch', { record_ids: ids }),
     )
   }
 
@@ -656,12 +701,7 @@ export class RealAdapter extends BaseAdapter {
         thumbnail: record.result_image_url || record.original_image_url,
         suspectedType: top?.class_name || record.class_names[0] || '未标注',
         confidence,
-        reviewStatus:
-          record.human_review_status === 'pending'
-            ? 'pending'
-            : record.human_review_status === 'confirmed' || record.human_review_status === 'no_defect'
-              ? 'done'
-              : 'reviewing',
+        reviewStatus: reviewStatus(record.human_review_status),
         severity: confidence >= 0.8 ? 'high' : confidence >= 0.5 ? 'medium' : 'low',
       }
     })
@@ -678,6 +718,6 @@ export class RealAdapter extends BaseAdapter {
 
   async createTask(): Promise<AgentTask> {
     // 任务只能由对话产生；页面直连"创建任务"等于绕过计划与确认
-    return this.unsupported('直接创建任务（请通过对话发起，由 Agent 生成计划后确认）')
+    return this.unsupported('直接创建任务（请通过对话发起，由海巡助手生成计划后确认）')
   }
 }

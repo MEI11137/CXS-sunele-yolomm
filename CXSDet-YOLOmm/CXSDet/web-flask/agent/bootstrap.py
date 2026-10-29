@@ -113,7 +113,7 @@ def configure_business_backend(app, *, overrides: Optional[Dict[str, Any]] = Non
 
         policy = AgentPolicyBridge()
         notifier = BusinessNotifier()
-        storage = overrides.get("storage_client") or FileClient(base_path=base_path)
+        storage = overrides.get("storage_client") or FileClient(base_path=base_path, database_path=db_path)
         gateway = overrides.get("file_assets") or LocalFileAssetGateway(
             db_path,
             storage,

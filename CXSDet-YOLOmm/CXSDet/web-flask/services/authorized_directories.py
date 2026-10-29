@@ -15,6 +15,8 @@ rewrites, moves or renames anything.
 
 from __future__ import annotations
 
+from contextlib import closing
+
 import hashlib
 import json
 import os
@@ -48,7 +50,7 @@ class DirectoryStore:
 
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = str(database_path)
-        with sqlite3.connect(self.database_path) as conn:
+        with closing(sqlite3.connect(self.database_path)) as conn, conn:
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS authorized_directories (
                     id TEXT PRIMARY KEY,
@@ -74,7 +76,7 @@ class DirectoryStore:
         if not real.is_dir():
             raise DirectoryError("路径不是目录")
         directory_id = str(uuid.uuid4())
-        with sqlite3.connect(self.database_path) as conn:
+        with closing(sqlite3.connect(self.database_path)) as conn, conn:
             conn.execute(
                 "INSERT INTO authorized_directories "
                 "(id, project_id, label, root, real_root, created_by, created_at, enabled) "
@@ -85,7 +87,7 @@ class DirectoryStore:
         return self.get(directory_id)
 
     def get(self, directory_id: str) -> dict:
-        with sqlite3.connect(self.database_path) as conn:
+        with closing(sqlite3.connect(self.database_path)) as conn, conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 "SELECT * FROM authorized_directories WHERE id=?", (directory_id,)
@@ -98,7 +100,7 @@ class DirectoryStore:
         return record
 
     def list(self, project_id: str) -> list[dict]:
-        with sqlite3.connect(self.database_path) as conn:
+        with closing(sqlite3.connect(self.database_path)) as conn, conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT * FROM authorized_directories WHERE project_id=? ORDER BY created_at",
@@ -107,7 +109,7 @@ class DirectoryStore:
         return [dict(row) for row in rows]
 
     def disable(self, directory_id: str) -> None:
-        with sqlite3.connect(self.database_path) as conn:
+        with closing(sqlite3.connect(self.database_path)) as conn, conn:
             conn.execute(
                 "UPDATE authorized_directories SET enabled=0 WHERE id=?", (directory_id,),
             )

@@ -11,6 +11,6 @@ def health_check():
     data = {
         'status': 'ok',
         'service': 'algorithm-service',
-        'version': '1.0.0'
+        'version': '1.1.0'
     }
     return success(data, msg='服务状态检查成功') 

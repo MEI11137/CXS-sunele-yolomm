@@ -201,7 +201,6 @@ def workspace() -> Response:
 @auth_required
 def list_projects() -> Response:
     actor = _current()
-    permissions.ensure_default_project(actor)
     return _ok(permissions.list_projects(actor))
 
 
@@ -210,10 +209,14 @@ def list_projects() -> Response:
 def create_project() -> Response:
     actor = _current()
     body = _body()
+    if body.get("root_directory") is not None:
+        _local_folder_actor()
     project = permissions.create_project(
         actor,
         _str_field(body, "name", max_chars=80),
         _str_field(body, "description", required=False, max_chars=2000),
+        root_directory=body.get("root_directory"),
+        requirements=body.get("requirements"),
     )
     return _ok(project, "项目已创建")
 
@@ -225,11 +228,57 @@ def get_project(project_id: str) -> Response:
     return _ok(permissions.get_project(actor, project_id))
 
 
+def _recycle(kind, key, restore=False):
+    from agent import recycle
+    actor = _current()
+    result = recycle.change(actor, kind, key, restore=restore)
+    if not restore:
+        from flask import current_app
+        runtime = current_app.extensions.get("haixun_opencode")
+        if runtime:
+            runtime.pool.discard(actor.user_id, project_id=key if kind == "project" else None,
+                                 session_id=key if kind == "session" else None)
+    return _ok(result, "已恢复" if restore else "已移入回收站，本机文件保留")
+
+
+@agent_bp.delete("/projects/<project_id>")
+@auth_required
+def delete_project(project_id):
+    return _recycle("project", project_id)
+
+
+@agent_bp.post("/projects/<project_id>/restore")
+@auth_required
+def restore_project(project_id):
+    return _recycle("project", project_id, True)
+
+
+@agent_bp.delete("/sessions/<session_id>")
+@auth_required
+def delete_session(session_id):
+    return _recycle("session", session_id)
+
+
+@agent_bp.post("/sessions/<session_id>/restore")
+@auth_required
+def restore_session(session_id):
+    return _recycle("session", session_id, True)
+
+
+@agent_bp.get("/recycle")
+@auth_required
+def list_recycle():
+    from agent import recycle
+    return _ok(recycle.list_deleted(_current()))
+
+
 @agent_bp.patch("/projects/<project_id>")
 @auth_required
 def update_project(project_id: str) -> Response:
     actor = _current()
     body = _body()
+    if body.get("root_directory") is not None:
+        _local_folder_actor()
     requirements = body.get("requirements")
     if requirements is not None and not isinstance(requirements, dict):
         raise AgentError(Code.VALIDATION, "requirements 必须是 JSON 对象")
@@ -241,8 +290,33 @@ def update_project(project_id: str) -> Response:
             _str_field(body, "description", required=False, max_chars=2000) or None
         ),
         requirements=requirements,
+        root_directory=body.get("root_directory"),
     )
     return _ok(project, "项目已更新")
+
+
+def _local_folder_actor():
+    actor = _current()
+    from agent.project_folders import require_local_admin
+    require_local_admin(actor)
+    if request.remote_addr not in {"127.0.0.1", "::1"}:
+        raise AgentError(Code.FORBIDDEN, "本机目录选择只能在本机访问", http_status=403)
+    return actor
+
+
+@agent_bp.get("/local-folders")
+@auth_required
+def browse_local_folders():
+    from agent.project_folders import browse
+    return _ok(browse(_local_folder_actor(), request.args.get("path", "")))
+
+
+@agent_bp.post("/local-folders")
+@auth_required
+def create_local_folder():
+    from agent.project_folders import make_directory
+    body = _body()
+    return _ok(make_directory(_local_folder_actor(), body.get("parent"), body.get("name")), "文件夹已新建")
 
 
 @agent_bp.get("/projects/<project_id>/resources")
@@ -314,6 +388,22 @@ def save_connection() -> Response:
         api_key=_str_field(body, "api_key", required=False, max_chars=400) or None,
     )
     return _ok(view, "连接已保存")
+
+
+@agent_bp.get("/connection/models")
+@auth_required
+def list_connection_models() -> Response:
+    # 目录查询失败保留当前配置；界面仍可手填服务商提供的模型 ID。
+    actor = _current()
+    gateway = connections.model_client(actor)
+    current = gateway.credentials.model
+    try:
+        models = gateway.list_models()
+        return _ok({"models": sorted(set(models + [current])), "current": current,
+                    "discovery_error": ""})
+    except AgentError as exc:
+        return _ok({"models": [current], "current": current,
+                    "discovery_error": exc.message})
 
 
 @agent_bp.delete("/connection")
@@ -422,6 +512,13 @@ def list_messages(session_id: str) -> Response:
     return _ok(session_store.list_messages(session_id, limit=limit))
 
 
+@agent_bp.put('/sessions/<session_id>/permission-mode')
+@auth_required
+def set_session_permission_mode(session_id: str) -> Response:
+    return _ok(session_store.set_permission_mode(_current(), session_id,
+               _str_field(_body(), 'mode')), '权限模式已更新')
+
+
 @agent_bp.post("/sessions/<session_id>/messages")
 @auth_required
 def post_message(session_id: str) -> Response:
@@ -431,6 +528,15 @@ def post_message(session_id: str) -> Response:
     refs = body.get("resource_refs") or []
     if not isinstance(refs, list):
         raise AgentError(Code.VALIDATION, "resource_refs 必须是数组")
+    refs = [{key: value for key, value in ref.items() if key != 'review_context'} if isinstance(ref, dict) else ref for ref in refs]
+    if body.get('review_context') is not None:
+        from agent.review_tools import validate_page_context
+        try:
+            page = validate_page_context(actor, session_id, body['review_context'])
+        except ValueError as exc:
+            raise AgentError(Code.VALIDATION, str(exc)) from exc
+        resource = permissions.resolve_resource(actor, {'source_table': 'detection_records', 'source_id': page['record_id']})
+        refs.append({'id': resource['id'], 'review_context': page})
     result = get_runtime().handle_message(
         actor,
         session_id,
@@ -578,6 +684,16 @@ def reconcile_task(task_id: str) -> Response:
             auto_continue=bool(body.get("auto_continue", True)),
         )
     )
+
+
+@agent_bp.get('/inspection-runs/<run_id>')
+@auth_required
+def get_inspection_run(run_id):
+    from agent.inspection_loop import get_run, reconcile, view
+    actor = _current()
+    run = get_run(actor, run_id, request.headers.get('X-Project-Id') or None)
+    reconcile(actor, run['task_id'])
+    return _ok(view(get_run(actor, run_id)))
 
 
 @agent_bp.get("/tasks/<task_id>/note")

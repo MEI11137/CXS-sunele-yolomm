@@ -64,11 +64,15 @@ def _validate_annotations(
         x1, y1, x2, y2 = coords
         if x2 <= x1 or y2 <= y1:
             raise ReviewValidationError("bbox 右下角必须位于左上角右下方")
+        severity = item.get('severity')
+        if severity is not None and severity not in {'low', 'medium', 'high'}:
+            raise ReviewValidationError('严重程度必须是 low、medium 或 high')
         normalized.append(
             {
                 "class_name": class_name,
                 "class_id": class_id,
                 "bbox": coords,
+                **({'severity': severity} if severity is not None else {}),
             }
         )
     return normalized
@@ -100,6 +104,8 @@ def submit_human_review(
         ).fetchone()
         if record is None:
             raise ReviewValidationError("识别记录不存在")
+        if 'record_status' in record.keys() and record['record_status'] == 'deleted':
+            raise ReviewValidationError('该记录已删除，请先恢复再复核')
         source = None
         if "model_id" in record.keys() and record["model_id"]:
             source = conn.execute(
@@ -120,6 +126,11 @@ def submit_human_review(
             raise ReviewConflictError(
                 f"记录已被其他人更新，当前版本为 {current_version}"
             )
+        # 已驳回的相同决定无需再写一条审计；仍先核对版本，避免吞掉并发修改。
+        if (decision == "rejected" and record["human_review_status"] == "rejected"
+                and json.loads(record["corrected_annotations"] or "[]") == clean):
+            conn.commit()
+            return ReviewResult(record_id, status, decision, current_version, current_version, clean)
         new_version = current_version + 1
         updated = conn.execute(
             """

@@ -6,6 +6,39 @@ from agent.errors import AgentError, Code
 from agent import connections, permissions
 
 
+@agent_bp.get('/resources/lifecycle')
+@auth_required
+def resource_recycle_list():
+    from services.resource_lifecycle import list_deleted
+    return _ok(list_deleted(_current(), request.args.get('project_id') or request.headers.get('X-Project-Id') or ''))
+
+
+@agent_bp.get('/resources/lifecycle/<kind>/<resource_id>')
+@auth_required
+def resource_lifecycle_preview(kind, resource_id):
+    from services.resource_lifecycle import preview
+    return _ok(preview(_current(), request.headers.get('X-Project-Id') or '', kind, resource_id, request.args.get('operation', 'delete')))
+
+
+def _resource_mutation(kind, resource_id, operation=None):
+    from agent.store import new_id
+    from services.resource_lifecycle import change
+    body = _body()
+    try:
+        result = change(_current(), request.headers.get('X-Project-Id') or '', kind, resource_id,
+            operation or body.get('operation'), body.get('expected_revision'), request_key=new_id('manual_resource'))
+        return _ok(result)
+    except AgentError as exc:
+        from agent.routes import _failure
+        return _failure(exc)
+
+
+@agent_bp.post('/resources/lifecycle/<kind>/<resource_id>')
+@auth_required
+def resource_lifecycle_mutate(kind, resource_id):
+    return _resource_mutation(kind, resource_id)
+
+
 def _backend():
     return current_app.extensions["haixun_agent"]["business_backend"]
 
@@ -153,3 +186,23 @@ def search_document(document_id):
         raise AgentError(Code.NOT_FOUND, '文档不存在', http_status=404)
     except ValueError as exc:
         raise AgentError(Code.VALIDATION, str(exc)) from exc
+
+
+@agent_bp.get('/documents/<document_id>/preview')
+@auth_required
+def document_preview(document_id):
+    from services.document_service import get_document, read_document_blocks
+    actor=_current()
+    try:
+        document=get_document(_backend().database_path,document_id)
+        permissions.get_project(actor,document['project_id'])
+        if document['owner_id']!=actor.user_id:
+            raise FileNotFoundError()
+        _backend().file_assets.resolve(actor.user_id,document['asset_id'])
+        offset=int(request.args.get('offset','0'));limit=int(request.args.get('limit','20'))
+        blocks=read_document_blocks(_backend().database_path,document_id,offset,limit)
+        return _ok({'document':document,'blocks':blocks,'next_offset':offset+len(blocks)})
+    except (FileNotFoundError,PermissionError):
+        raise AgentError(Code.NOT_FOUND,'资料不存在或无权访问',http_status=404) from None
+    except ValueError as exc:
+        raise AgentError(Code.VALIDATION,str(exc)) from exc

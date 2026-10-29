@@ -14,6 +14,8 @@ from utils.security_utils import get_current_user
 from utils.models import RealtimeDetectionRecord, RealtimeDetectionRecordVO, PageVO
 from clients.file_client import file_client
 from config import TEMP_DIR, YOLO_CLASSES_CONFIG
+from services.project_storage import ProjectTempPath
+TEMP_DIR = ProjectTempPath(TEMP_DIR)
 
 # 创建蓝图
 realtime_detection_bp = Blueprint('realtime_detection', __name__, url_prefix='/api/realtime-detection')

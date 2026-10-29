@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import closing
+
 import sqlite3
 import tempfile
 import uuid
@@ -33,7 +35,7 @@ class FileAccess:
     def __init__(self, database_path: str | Path, project_access=None) -> None:
         self.database_path = str(database_path)
         self.project_access = project_access
-        with sqlite3.connect(self.database_path) as conn:
+        with closing(sqlite3.connect(self.database_path)) as conn, conn:
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS file_assets (
                     id TEXT PRIMARY KEY,
@@ -76,7 +78,7 @@ class FileAccess:
             if self.project_access is None or self.project_access(owner_id, project_id, "file:create") is not True:
                 raise PermissionError("Project file access unavailable")
         asset_id = str(uuid.uuid4())
-        with sqlite3.connect(self.database_path) as conn:
+        with closing(sqlite3.connect(self.database_path)) as conn, conn:
             conn.execute(
                 "INSERT INTO file_assets "
                 "(id, bucket, object_key, owner_id, project_id, kind, mime_type, "
@@ -89,7 +91,7 @@ class FileAccess:
         return asset_id
 
     def require_account(self, user_id: int) -> None:
-        with sqlite3.connect(self.database_path) as conn:
+        with closing(sqlite3.connect(self.database_path)) as conn, conn:
             columns = self._columns(conn, "user")
             if "id" not in columns:
                 raise PermissionError("Account is not active")
@@ -101,7 +103,7 @@ class FileAccess:
             raise PermissionError("Account is not active")
 
     def get_asset(self, user_id: int, asset_id: str) -> dict:
-        with sqlite3.connect(self.database_path) as conn:
+        with closing(sqlite3.connect(self.database_path)) as conn, conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute("SELECT * FROM file_assets WHERE id=?", (asset_id,)).fetchone()
         if row is None:
@@ -117,7 +119,7 @@ class FileAccess:
         return dict(row)
 
     def require_avatar_assignment(self, user_id: int, bucket: str, object_key: str) -> None:
-        with sqlite3.connect(self.database_path) as conn:
+        with closing(sqlite3.connect(self.database_path)) as conn, conn:
             row = conn.execute(
                 "SELECT owner_id, project_id, kind, status FROM file_assets "
                 "WHERE bucket=? AND object_key=?", (bucket, object_key),
@@ -131,7 +133,7 @@ class FileAccess:
         return {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
 
     def require_read(self, user_id: int, bucket: str, object_key: str) -> None:
-        with sqlite3.connect(self.database_path) as conn:
+        with closing(sqlite3.connect(self.database_path)) as conn, conn:
             conn.row_factory = sqlite3.Row
             asset = conn.execute(
                 "SELECT owner_id, project_id, status FROM file_assets WHERE bucket=? AND object_key=?",
@@ -180,7 +182,7 @@ class FileAccess:
         raise PermissionError("File is not accessible")
 
     def require_delete(self, user_id: int, bucket: str, object_key: str) -> None:
-        with sqlite3.connect(self.database_path) as conn:
+        with closing(sqlite3.connect(self.database_path)) as conn, conn:
             asset = conn.execute(
                 "SELECT owner_id, project_id, status FROM file_assets WHERE bucket=? AND object_key=?",
                 (bucket, object_key),
@@ -189,14 +191,14 @@ class FileAccess:
             raise PermissionError("File deletion is not available")
 
     def mark_deleted(self, bucket: str, object_key: str) -> None:
-        with sqlite3.connect(self.database_path) as conn:
+        with closing(sqlite3.connect(self.database_path)) as conn, conn:
             conn.execute(
                 "UPDATE file_assets SET status='deleted' WHERE bucket=? AND object_key=?",
                 (bucket, object_key),
             )
 
     def get_binding(self, asset_id: str) -> dict | None:
-        with sqlite3.connect(self.database_path) as conn:
+        with closing(sqlite3.connect(self.database_path)) as conn, conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 "SELECT business_type, business_id FROM file_assets WHERE id=?",
@@ -215,7 +217,7 @@ class FileAccess:
         """
         if not business_type or not business_id:
             raise ValueError("Business binding is required")
-        with sqlite3.connect(self.database_path) as conn:
+        with closing(sqlite3.connect(self.database_path)) as conn, conn:
             self.link_business_with(conn, asset_id, business_type, business_id)
 
     def link_business_with(self, conn: sqlite3.Connection, asset_id: str,
@@ -243,7 +245,7 @@ class FileAccess:
 
     def require_import_asset(self, user_id: int, asset_id: str) -> dict:
         """Return a project upload that may be imported into a business resource."""
-        with sqlite3.connect(self.database_path) as conn:
+        with closing(sqlite3.connect(self.database_path)) as conn, conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute("SELECT * FROM file_assets WHERE id=?", (asset_id,)).fetchone()
         if row is None:
@@ -278,8 +280,9 @@ class LocalFileAssetGateway:
     def materialize(self, bucket: str, object_key: str) -> str:
         """Copy the stored object into a private temporary file."""
         suffix = Path(object_key).suffix.lower() or ".bin"
+        from services.project_storage import temp_directory
         with tempfile.NamedTemporaryFile(
-            dir=self.work_dir, suffix=suffix, delete=False
+            dir=temp_directory(self.work_dir), suffix=suffix, delete=False
         ) as output:
             destination = Path(output.name)
         try:

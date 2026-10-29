@@ -13,7 +13,10 @@ from utils.db import db
 from utils.jwt_util import admin_required, token_required
 from utils.models import DetectionRecord, DetectionRecordVO, DETECTION_STATUS
 from utils.security_utils import is_admin
+from utils.resource_guard import visible_ids, register_new
 from config import TEMP_DIR, YOLO_CLASSES_CONFIG
+from services.project_storage import ProjectTempPath
+TEMP_DIR = ProjectTempPath(TEMP_DIR)
 from services.detection_service import execute_detection
 from services.yolo_runtime import MissingModalityError
 from agent.identity import load_actor
@@ -79,6 +82,9 @@ def get_published_models():
             WHERE status = 3 
             ORDER BY create_time DESC
         ''')
+        allowed = visible_ids('model')
+        if allowed is not None:
+            models = [model for model in models if model['id'] in allowed]
         
         return success({
             'models': models
@@ -115,7 +121,7 @@ def _detect_image_v2():
 
         model_data = db.query('''
             SELECT id, name, model_bucket, model_object_key, model_mode,
-                   primary_modality, secondary_modality, model_yaml
+                   primary_modality, secondary_modality, model_yaml, dataset_id
             FROM models WHERE id = ? AND status = 3
         ''', (model_id,), fetchone=True)
         if not model_data:
@@ -123,9 +129,10 @@ def _detect_image_v2():
 
         temp_dir = os.path.join(TEMP_DIR, f"detection_{uuid.uuid4().hex[:8]}")
         os.makedirs(temp_dir, exist_ok=True)
-        rgb_path = os.path.join(temp_dir, 'rgb.jpg')
-        with Image.open(image_file.stream) as image:
-            image.convert('RGB').save(rgb_path, 'JPEG', quality=95)
+        rgb_path = os.path.join(temp_dir, 'rgb.' + extension)
+        image_file.save(rgb_path)
+        with Image.open(rgb_path) as image:
+            image.verify()
 
         x_path = None
         x_file = request.files.get('x_image')
@@ -133,9 +140,10 @@ def _detect_image_v2():
             x_extension = x_file.filename.rsplit('.', 1)[-1].lower() if '.' in x_file.filename else ''
             if x_extension not in allowed_extensions:
                 return error("X模态图片格式不受支持", 400)
-            x_path = os.path.join(temp_dir, 'x.jpg')
-            with Image.open(x_file.stream) as image:
-                image.convert('RGB').save(x_path, 'JPEG', quality=95)
+            x_path = os.path.join(temp_dir, 'x.' + x_extension)
+            x_file.save(x_path)
+            with Image.open(x_path) as image:
+                image.verify()
 
         result = execute_detection(
             user_id=g.user_id,
@@ -147,7 +155,10 @@ def _detect_image_v2():
             storage_client=file_client,
             database=db,
             request_key=request.form.get('request_key') or None,
+            input_metadata={'rgb_name': image_file.filename, 'secondary_name': x_file.filename if x_file else None},
         )
+        if request.headers.get('X-Project-Id'):
+            register_new('detection_record', result.record_id)
         original = result.storage['original']
         secondary = result.storage['secondary']
         result_file = result.storage['result']
@@ -470,8 +481,14 @@ def get_detection_records():
         search = request.args.get('search', '').strip()
         
         # 构建查询条件
-        conditions = []
+        conditions = ["COALESCE(dr.record_status, 'completed') <> 'deleted'"]
         params = []
+        if request.headers.get('X-Project-Id'):
+            allowed = visible_ids('detection_record') or set()
+            if not allowed:
+                return success({'records': [], 'total': 0, 'page': page, 'page_size': page_size})
+            conditions.append('dr.id IN (%s)' % ','.join('?' for _ in allowed))
+            params.extend(sorted(allowed))
         
         # 普通用户只能看到自己的记录，管理员可以看到所有记录
         if not is_admin():
@@ -532,11 +549,11 @@ def review_detection_record(record_id):
     """对已保存的YOLO记录运行结构化视觉大模型复核。"""
     try:
         record = db.query(
-            "SELECT id, user_id FROM detection_records WHERE id = ?",
+            "SELECT * FROM detection_records WHERE id = ?",
             (record_id,),
             fetchone=True
         )
-        if not record or (record.get('user_id') != g.user_id and not is_admin()):
+        if not record or record.get('record_status') == 'deleted' or (record.get('user_id') != g.user_id and not is_admin()):
             return error("识别记录不存在或无权访问", 404)
         review = review_detection(
             record_id, _personal_review_client(), db, file_client
@@ -731,7 +748,7 @@ def get_detection_record(record_id):
             {where_clause}
         ''', tuple(params), fetchone=True)
         
-        if not record_data:
+        if not record_data or record_data.get('record_status') == 'deleted':
             return error("识别记录不存在或无权访问", 404)
         
         record = DetectionRecord(record_data)
@@ -788,54 +805,39 @@ def update_detection_record(record_id):
 @token_required
 def delete_detection_record(record_id):
     """删除图片识别记录"""
+    from services.record_lifecycle import set_deleted
     try:
-        # 检查记录是否存在以及用户权限
-        conditions = ["id = ?"]
-        params = [record_id]
-        
-        if not is_admin():
-            conditions.append("user_id = ?")
-            params.append(g.user_id)
-        
-        where_clause = " WHERE " + " AND ".join(conditions)
-        
-        record_data = db.query(f'''
-            SELECT original_image_bucket, original_image_object_key,
-                   result_image_bucket, result_image_object_key,
-                   enhanced_image_bucket, enhanced_image_object_key
-            FROM detection_records{where_clause}
-        ''', tuple(params), fetchone=True)
-        
-        if not record_data:
-            return error("识别记录不存在或无权访问", 404)
-        
-        # Legacy rows may contain client-supplied keys. Removing a record must
-        # never turn such a key into authority to delete a physical object.
-        access = FileAccess(current_app.config['DATABASE'])
-        for prefix in ('original_image', 'result_image', 'enhanced_image'):
-            bucket = record_data.get(f'{prefix}_bucket')
-            object_key = record_data.get(f'{prefix}_object_key')
-            if not bucket or not object_key:
-                continue
-            try:
-                access.require_delete(g.user_id, bucket, object_key)
-            except PermissionError:
-                continue
-            file_client.delete(bucket, object_key)
-            access.mark_deleted(bucket, object_key)
-        
-        # 删除记录
-        affected_rows = db.execute('''
-            DELETE FROM detection_records WHERE id = ?
-        ''', (record_id,))
-        
-        if affected_rows > 0:
-            return success(None, "记录删除成功")
-        else:
-            return error("删除失败")
-        
-    except Exception as e:
-        return error(f"删除识别记录失败: {str(e)}")
+        payload = request.get_json(silent=True) or {}
+        return success(set_deleted(db, record_id, g.user_id, payload.get('expected_version')), '记录已删除，原图与审计保留，可通过助手恢复')
+    except (ReviewConflictError, ReviewValidationError) as exc:
+        return error(str(exc), 409), 409
+
+
+@detection_bp.route('/records/<record_id>/restore', methods=['POST'])
+@token_required
+def restore_detection_record(record_id):
+    from services.record_lifecycle import set_deleted
+    try:
+        payload = request.get_json(silent=True) or {}
+        return success(set_deleted(db, record_id, g.user_id, payload.get('expected_version'), deleted=False), '记录已恢复')
+    except (ReviewConflictError, ReviewValidationError) as exc:
+        return error(str(exc), 409), 409
+
+
+@detection_bp.route('/records/delete/batch', methods=['POST'])
+@token_required
+def delete_record_batch():
+    from agent.identity import load_actor
+    from services.record_lifecycle import delete_preview, set_deleted_many
+    try:
+        entries = (request.get_json(silent=True) or {}).get('records')
+        delete_preview(load_actor(g.user_id), request.headers.get('X-Project-Id') or '', entries)
+        return success(set_deleted_many(db, entries, g.user_id), '仅所选记录已移入回收站，文件保留')
+    except AgentError as exc:
+        return error(exc.message, exc.http_status), exc.http_status
+    except (ReviewConflictError, ReviewValidationError) as exc:
+        return error(str(exc), 409), 409
+
 
 @detection_bp.route('/enhance-image', methods=['POST'])
 @token_required
