@@ -1,4 +1,4 @@
-"""本机开发入口：Codex/Harness 与内部 OpenCode 对话；不提供业务执行/批准能力。"""
+"""本机开发入口：Codex/Harness 与内部 海巡引擎 对话；不提供业务执行/批准能力。"""
 import hashlib
 import secrets
 import threading

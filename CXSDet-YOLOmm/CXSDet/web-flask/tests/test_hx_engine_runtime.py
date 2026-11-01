@@ -1,4 +1,4 @@
-"""真实 OpenCode/MCP + 本地脚本模型；不使用用户 Key、图片或付费服务。"""
+"""真实 海巡引擎/MCP + 本地脚本模型；不使用用户 Key、图片或付费服务。"""
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -17,8 +17,8 @@ from werkzeug.serving import make_server, WSGIRequestHandler
 from agent import actions, connections, identity, permissions, sessions, store, tasks
 from agent.errors import AgentError
 from agent.llm.provider import ProviderCredentials
-from agent.opencode_engine import OpenCodeEngine, local_origin
-from agent.opencode_runtime import OpenCodeRuntime, opencode_bp, NATIVE_TOOL
+from agent.hx_engine import HxEngine, local_origin
+from agent.hx_engine_runtime import HxEngineRuntime, hxengine_bp, NATIVE_TOOL
 from agent.tools.contract import ToolSpec, RISK_READ, RISK_WRITE, OperationResult
 from agent.tools.registry import ToolRegistry
 
@@ -26,15 +26,15 @@ from agent.tools.registry import ToolRegistry
 class EngineConfigurationTest(unittest.TestCase):
     def engine(self, admin=True):
         actor = identity.ActorContext(1, ("admin",) if admin else ())
-        return OpenCodeEngine(actor, {"id": "site-session", "project_id": "project"},
+        return HxEngine(actor, {"id": "site-session", "project_id": "project"},
             ProviderCredentials("custom", "https://example.invalid/v1", "test-model", "fixture-secret"),
-            Path(tempfile.gettempdir()) / "opencode-config-only", "http://127.0.0.1:5020")
+            Path(tempfile.gettempdir()) / "hxengine-config-only", "http://127.0.0.1:5020")
 
     def test_only_personal_model_is_enabled(self):
         config = self.engine().configuration()
         self.assertEqual(config["enabled_providers"], ["haixun"])
         self.assertEqual(config["model"], "haixun/test-model")
-        self.assertNotIn("opencode", config["provider"])
+        self.assertNotIn("hxengine", config["provider"])
 
     def test_regular_user_cannot_enable_shell_or_writes(self):
         config = self.engine(False).configuration()
@@ -120,10 +120,10 @@ class _QuietRequestHandler(WSGIRequestHandler):
         pass
 
 
-@unittest.skipUnless(os.environ.get("RUN_OPENCODE_INTEGRATION") == "1", "显式启用本机 OpenCode 协议验收")
-class OpenCodeProtocolTest(unittest.TestCase):
+@unittest.skipUnless(os.environ.get("RUN_ENGINE_INTEGRATION") == "1", "显式启用本机 海巡引擎 协议验收")
+class 海巡引擎ProtocolTest(unittest.TestCase):
     def setUp(self):
-        self.folder = tempfile.TemporaryDirectory(prefix="haixun-opencode-", dir=os.environ.get("OPENCODE_TEST_TMP"))
+        self.folder = tempfile.TemporaryDirectory(prefix="haixun-engine-", dir=os.environ.get("HX_ENGINE_TEST_TMP"))
         self.addCleanup(self.folder.cleanup)
         self.root = Path(self.folder.name)
         env = patch.dict(os.environ, {"AGENT_SECRET_PATH": str(self.root / "fixture.key")})
@@ -142,17 +142,17 @@ class OpenCodeProtocolTest(unittest.TestCase):
         self.actor = identity.load_actor(1)
         self.other = identity.load_actor(2)
         self.project = permissions.ensure_default_project(self.actor)
-        self.session = sessions.create_session(self.actor, self.project["id"], "OpenCode 本地协议测试")
+        self.session = sessions.create_session(self.actor, self.project["id"], "海巡引擎 本地协议测试")
         self.provider = _Provider(self.root / "confirmed-note.txt")
         registry = ToolRegistry()
         registry.add_provider(self.provider)
-        self.runtime = OpenCodeRuntime(self.app, registry=registry)
-        self.app.extensions["haixun_opencode"] = self.runtime
-        self.app.register_blueprint(opencode_bp)
+        self.runtime = HxEngineRuntime(self.app, registry=registry)
+        self.app.extensions["haixun_engine"] = self.runtime
+        self.app.register_blueprint(hxengine_bp)
         from agent.routes import agent_bp
         self.app.register_blueprint(agent_bp)
         self.http = make_server("127.0.0.1", 0, self.app, threaded=True, request_handler=_QuietRequestHandler)
-        self.app.config["OPENCODE_BRIDGE_ORIGIN"] = "http://127.0.0.1:" + str(self.http.server_port)
+        self.app.config["HX_ENGINE_BRIDGE_ORIGIN"] = "http://127.0.0.1:" + str(self.http.server_port)
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
         self.addCleanup(self.http.server_close)
         self.addCleanup(self.http.shutdown)
@@ -173,7 +173,7 @@ class OpenCodeProtocolTest(unittest.TestCase):
                 return
             time.sleep(.15)
         messages = [item["content"] for item in sessions.list_messages(self.session["id"])][-4:]
-        self.fail("OpenCode 未达到预期状态；" + repr(messages) + "; 模型请求数=" + str(len(self.model.requests)))
+        self.fail("海巡引擎 未达到预期状态；" + repr(messages) + "; 模型请求数=" + str(len(self.model.requests)))
 
     def idle(self):
         engine = self.runtime.pool.find(self.actor, self.session["id"])
@@ -186,7 +186,7 @@ class OpenCodeProtocolTest(unittest.TestCase):
             headers={"Authorization": "Bearer " + generate_token(1)}, json={"text": "普通问题也请回答"})
         self.assertEqual(response.status_code, 200, response.get_json())
         result = response.get_json()["data"]
-        self.assertEqual(result["engine"], "opencode")
+        self.assertEqual(result["engine"], "hxengine")
         self.wait(self.idle)
         messages = sessions.list_messages(self.session["id"])
         self.assertEqual(messages[-1]["content"], "这是独立的普通问答。")
@@ -205,7 +205,7 @@ class OpenCodeProtocolTest(unittest.TestCase):
         self.assertGreaterEqual(len(self.model.requests), 2)
 
     def test_saved_connection_is_shared_and_changes_rebuild_engine(self):
-        """网页保存的同一连接供 AI 客户端与真实 OpenCode 使用，不读独立客户端配置。"""
+        """网页保存的同一连接供 AI 客户端与真实 海巡引擎 使用，不读独立客户端配置。"""
         self.model.steps = [{"text": "旧连接回答。"}]
         self.runtime.handle_message(self.actor, self.session["id"], "验证当前连接")
         self.wait(self.idle)
@@ -261,7 +261,7 @@ class OpenCodeProtocolTest(unittest.TestCase):
         self.assertEqual(engine.workspace, actual_project.resolve())
         self.assertFalse(engine.root.is_relative_to(actual_project))
         target = engine.workspace / "native.txt"
-        self.model.steps = [{"tool": "write", "args": {"filePath": str(target), "content": "OpenCode 真正写入"}},
+        self.model.steps = [{"tool": "write", "args": {"filePath": str(target), "content": "海巡引擎 真正写入"}},
                             {"text": "文件已保存。"}]
         result = self.runtime.handle_message(self.actor, self.session["id"], "在工作目录创建 native.txt")
         self.wait(lambda: bool(actions.list_actions(result["task"]["id"], [actions.STATUS_PENDING])))
@@ -270,10 +270,10 @@ class OpenCodeProtocolTest(unittest.TestCase):
         self.assertFalse(target.exists())
         self.runtime.confirm_action(self.actor, pending["id"])
         self.wait(self.idle)
-        self.assertEqual(target.read_text(encoding="utf-8"), "OpenCode 真正写入")
+        self.assertEqual(target.read_text(encoding="utf-8"), "海巡引擎 真正写入")
         self.assertEqual(actions.get_action(self.actor, pending["id"])["status"], actions.STATUS_SUCCEEDED)
 
-    def test_opencode_can_open_project_page_through_real_mcp(self):
+    def test_hxengine_can_open_project_page_through_real_mcp(self):
         self.model.steps = [{"tool": "workspace_open_page", "args": {"project_id": self.project['id'], "page": "review"}},
                             {"text": "已请求打开人工复核界面，请人工操作。"}]
         self.runtime.handle_message(self.actor,self.session['id'],"打开当前项目的人工复核界面")
@@ -282,7 +282,7 @@ class OpenCodeProtocolTest(unittest.TestCase):
         self.assertEqual(len(navigation),1)
         self.assertEqual(navigation[0]['payload']['path'],'/projects/'+self.project['id']+'/review')
 
-    def test_opencode_uploads_local_project_image_after_confirmation(self):
+    def test_hxengine_uploads_local_project_image_after_confirmation(self):
         from PIL import Image
         project_folder = self.root / 'project-image'; project_folder.mkdir()
         self.app.config.update(TEMP_DIR=str(self.root/'runtime'), FILE_STORE_PATH=str(self.root/'store'))
@@ -314,12 +314,12 @@ class OpenCodeProtocolTest(unittest.TestCase):
 
     def test_bridge_rejects_missing_token_and_cross_user_resource(self):
         client = self.app.test_client()
-        self.assertEqual(client.get("/api/agent/opencode/bridge/tools").status_code, 401)
+        self.assertEqual(client.get("/api/agent/engine/bridge/tools").status_code, 401)
         engine = self.runtime._engine(self.actor, self.session)
         task = tasks.create_task(self.actor, self.session["id"], self.project["id"], "边界测试")
         engine.busy, engine.task_id = True, task["id"]
         other_project = permissions.ensure_default_project(self.other)
-        response = client.post("/api/agent/opencode/bridge/call", headers={"Authorization": "Bearer " + engine.token},
+        response = client.post("/api/agent/engine/bridge/call", headers={"Authorization": "Bearer " + engine.token},
             json={"name": "project_overview", "arguments": {"project_id": other_project["id"], "user_id": 2}})
         self.assertIn("error", response.get_json())
         self.assertEqual(self.provider.writes, 0)
@@ -433,9 +433,9 @@ class OpenCodeProtocolTest(unittest.TestCase):
         self.assertIsNot(new, old)
         self.assertIsNotNone(old.process.poll())
         client = self.app.test_client()
-        self.assertEqual(client.get('/api/agent/opencode/bridge/tools',
+        self.assertEqual(client.get('/api/agent/engine/bridge/tools',
             headers={'Authorization': 'Bearer ' + old.token}).status_code, 401)
-        response = client.get('/api/agent/opencode/bridge/tools', headers={'Authorization': 'Bearer ' + new.token})
+        response = client.get('/api/agent/engine/bridge/tools', headers={'Authorization': 'Bearer ' + new.token})
         self.assertIn('new_project_reader', [item['name'] for item in response.get_json()['tools']])
 
     def test_unknown_business_state_blocks_another_write(self):
@@ -443,7 +443,7 @@ class OpenCodeProtocolTest(unittest.TestCase):
         task = tasks.create_task(self.actor, self.session['id'], self.project['id'], '核实未知结果')
         tasks.set_status(task['id'], tasks.STATUS_UNKNOWN, force=True)
         engine.busy, engine.task_id = True, task['id']
-        response = self.app.test_client().post('/api/agent/opencode/bridge/call',
+        response = self.app.test_client().post('/api/agent/engine/bridge/call',
             headers={'Authorization': 'Bearer ' + engine.token},
             json={'name': 'save_review_note', 'arguments': {'text': '不能重复写入'}})
         self.assertEqual(response.get_json()['status'], tasks.STATUS_UNKNOWN)

@@ -9,7 +9,7 @@ from flask import Flask
 from PIL import Image
 from agent import guard, identity, permissions, recycle, sessions, store, tasks
 from agent.errors import AgentError
-from agent.opencode_runtime import OpenCodeRuntime
+from agent.hx_engine_runtime import HxEngineRuntime
 from agent.project_tools import ProjectTools
 from agent.tools.registry import ToolRegistry
 from utils.db import Database
@@ -17,7 +17,7 @@ from utils.db import Database
 
 class ProjectAgentExtensionsTest(unittest.TestCase):
     def setUp(self):
-        base = Path(os.environ.get('OPENCODE_TEST_TMP') or Path(__file__).resolve().parents[4] / '.integration-checks')
+        base = Path(os.environ.get('HX_ENGINE_TEST_TMP') or Path(__file__).resolve().parents[4] / '.integration-checks')
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=base, prefix='project-tools-')
         self.addCleanup(self.temp.cleanup)
@@ -109,7 +109,7 @@ class ProjectAgentExtensionsTest(unittest.TestCase):
             with self.subTest(text=text): self.assertIsNone(guard.inspect(text))
 
     def test_accidentally_pasted_secret_never_reaches_model_or_database(self):
-        runtime = OpenCodeRuntime(self.app, registry=ToolRegistry())
+        runtime = HxEngineRuntime(self.app, registry=ToolRegistry())
         self.addCleanup(runtime.pool.close)
         key = 'sk-' + 'a' * 32
         result = runtime.handle_message(self.actor,self.chat['id'],'这是我的密钥 '+key)

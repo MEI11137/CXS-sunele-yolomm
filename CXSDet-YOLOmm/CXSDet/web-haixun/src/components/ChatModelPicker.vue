@@ -66,13 +66,11 @@ async function select(model: string) {
   saving.value = true
   const version = generation
   try {
-    // 提交前重新取本人配置，保留当前服务地址及服务端 Key。
+    // 提交前重新取本人配置；切换只改模型名，Key 与接口地址始终由服务端保留
     const current = await getAdapter().getConnection()
     if (version !== generation) return
-    if (!current.configured || !current.provider || !current.api_url) throw new Error('请先在设置中连接大模型')
-    const result = model === current.model ? current : await getAdapter().saveConnection({
-      provider: current.provider, apiUrl: current.api_url, model,
-    })
+    if (!current.configured) throw new Error('请先在设置中连接大模型')
+    const result = model === current.model ? current : await getAdapter().switchConnectionModel(model)
     if (version !== generation) return
     connection.value = result
     open.value = false

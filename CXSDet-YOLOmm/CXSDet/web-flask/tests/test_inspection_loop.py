@@ -32,7 +32,7 @@ def setup(tmp_path, monkeypatch, request):
         store.reset_schema_cache()
         actor = identity.load_actor(1)
         # 本机项目不能绑定 APPDATA；测试库可在系统临时目录，项目放工作区测试目录。
-        base = Path(os.environ.get('OPENCODE_TEST_TMP') or Path(__file__).resolve().parents[4] / '.integration-checks')
+        base = Path(os.environ.get('HX_ENGINE_TEST_TMP') or Path(__file__).resolve().parents[4] / '.integration-checks')
         base.mkdir(parents=True, exist_ok=True)
         local_project = tempfile.TemporaryDirectory(prefix='loop-project-', dir=base)
         request.addfinalizer(local_project.cleanup)

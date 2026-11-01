@@ -1,4 +1,4 @@
-"""海巡工作区业务扩展；沿用 OpenCode、真实服务和用户确认卡。"""
+"""海巡工作区业务扩展；沿用 海巡引擎、真实服务和用户确认卡。"""
 import hashlib
 
 from agent import actions, permissions, resources, tasks

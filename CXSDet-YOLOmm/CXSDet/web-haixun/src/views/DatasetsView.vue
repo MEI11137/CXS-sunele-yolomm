@@ -62,6 +62,8 @@ const loading = ref(false)
 const loadError = ref('')
 const notice = ref('')
 const noticeType = ref<'success' | 'error' | ''>('')
+/** 与演示网关同口径：超过此大小的 ZIP 会在传输层被截断，提前拦下来。 */
+const MAX_ZIP_BYTES = 256 * 1024 * 1024
 
 const formalDatasets = computed(() => datasets.value.filter((d) => d.record_kind === 'formal'))
 const draftDatasets = computed(() => datasets.value.filter((d) => d.record_kind === 'draft'))
@@ -140,7 +142,15 @@ function openImport() {
 
 function onPickZip(e: Event) {
   const files = (e.target as HTMLInputElement).files
-  importFile.value = files?.[0] ?? null
+  const picked = files?.[0] ?? null
+  notice.value = ''
+  if (picked && picked.size > MAX_ZIP_BYTES) {
+    notice.value = `ZIP 约 ${(picked.size / 1024 / 1024).toFixed(0)} MB，超过 ${MAX_ZIP_BYTES / 1024 / 1024} MB 上限，上传会被中断`
+    noticeType.value = 'error'
+    importFile.value = null
+    return
+  }
+  importFile.value = picked
   if (importFile.value && !importForm.value.name) {
     importForm.value.name = importFile.value.name.replace(/\.zip$/i, '')
   }

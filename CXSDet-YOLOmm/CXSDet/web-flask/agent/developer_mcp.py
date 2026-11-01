@@ -14,7 +14,7 @@ from mcp.types import CallToolResult, TextContent, Tool, ToolAnnotations
 
 
 def relay(path, payload=None):
-    from agent.opencode_engine import local_origin
+    from agent.hx_engine import local_origin
     origin = local_origin(os.environ.get('HAIXUN_DEV_ORIGIN', 'http://127.0.0.1:5020'))
     data = json.dumps(payload, ensure_ascii=False).encode() if payload is not None else None
     req = urllib.request.Request(origin + '/api/agent/dev/' + path, data=data,
@@ -30,7 +30,7 @@ async def main():
         return [Tool(name='haixun_dev_state', description='读取获授权项目的独立开发会话与内部 Agent 真实任务状态',
             inputSchema={'type': 'object', 'properties': {}, 'additionalProperties': False},
             annotations=ToolAnnotations(readOnlyHint=True)),
-            Tool(name='haixun_dev_message', description='向网站内部 OpenCode 发送开发诊断消息，会使用网站已配置的模型。只发送一次，不代替业务执行、操作批准或人工标注。',
+            Tool(name='haixun_dev_message', description='向网站内部 海巡引擎 发送开发诊断消息，会使用网站已配置的模型。只发送一次，不代替业务执行、操作批准或人工标注。',
                 inputSchema={'type': 'object', 'properties': {'text': {'type': 'string'}, 'request_id': {'type': 'string'}},
                              'required': ['text', 'request_id'], 'additionalProperties': False},
                 annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))]

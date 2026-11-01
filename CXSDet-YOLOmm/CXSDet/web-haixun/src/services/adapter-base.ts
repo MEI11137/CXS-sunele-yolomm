@@ -40,6 +40,7 @@ import {
 export abstract class BaseAdapter implements ApiAdapter {
   async setSessionPermissionMode(_sessionId: string, _mode: 'request' | 'assist' | 'full'): Promise<Session> { return this.unsupported('会话权限模式') }
   async listConnectionModels(): Promise<{ models: string[]; current: string; discovery_error: string }> { return this.unsupported('模型目录') }
+  async switchConnectionModel(_model: string): Promise<PersonalConnection> { return this.unsupported('切换模型') }
   async deleteWorkspace(_id: string): Promise<void> { return this.unsupported('删除项目') }
   async deleteSession(_id: string): Promise<void> { return this.unsupported('删除会话') }
   async listRecycle(): Promise<import('./types').RecycleContents> { return this.unsupported('回收站') }

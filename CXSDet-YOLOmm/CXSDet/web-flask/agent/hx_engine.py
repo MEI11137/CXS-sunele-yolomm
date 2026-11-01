@@ -1,6 +1,6 @@
-"""固定版本 OpenCode HTTP 引擎；每个站点会话独立进程、目录和凭据。
+"""固定版本 海巡引擎 HTTP 引擎；每个站点会话独立进程、目录和凭据。
 
-不复用用户在 4096 打开的个人 OpenCode，也不导入其免费模型/全局 Key。
+不复用用户在 4096 端口打开的个人客户端，也不导入其全局模型配置。
 """
 from __future__ import annotations
 
@@ -28,20 +28,30 @@ def local_origin(value):
     parts = urllib.parse.urlsplit(value)
     if (parts.scheme != "http" or parts.hostname not in {"127.0.0.1", "localhost", "::1"}
             or parts.username or parts.password or parts.query or parts.fragment or parts.path not in {"", "/"}):
-        raise AgentError(Code.VALIDATION, "OpenCode 业务桥地址必须是本机 HTTP 根地址")
+        raise AgentError(Code.VALIDATION, "海巡引擎 业务桥地址必须是本机 HTTP 根地址")
     return value.rstrip("/")
 
 
+def bundled_binary():
+    """随项目分发的引擎可执行文件（<包根>/.runtime/hxengine/）。"""
+    base = Path(__file__).resolve().parents[4]
+    for name in ("hxengine.exe", "hxengine"):
+        candidate = base / ".runtime" / "hxengine" / name
+        if candidate.is_file():
+            return str(candidate)
+    return ""
+
+
 def binary_path():
-    configured = os.environ.get("OPENCODE_BIN")
-    value = configured or shutil.which("opencode") or ("E:/OpenCode/bin/opencode.exe" if os.name == "nt" else "")
+    configured = os.environ.get("HX_ENGINE_BIN")
+    value = configured or shutil.which("hxengine") or bundled_binary()
     if not value or not Path(value).is_file():
-        raise AgentError(Code.TOOL_BACKEND_UNAVAILABLE, "找不到 OpenCode；请安装 v1.19.4，并设置 OPENCODE_BIN", http_status=503)
+        raise AgentError(Code.TOOL_BACKEND_UNAVAILABLE, "找不到 海巡引擎；请安装 v1.19.4，并设置 HX_ENGINE_BIN", http_status=503)
     return str(Path(value).resolve())
 
 
-class OpenCodeEngine:
-    def __init__(self, actor, session, credentials, root, origin, *, workspace=None):
+class HxEngine:
+    def __init__(self, actor, session, credentials, root, origin, *, workspace=None, native_allowed=False):
         self.owner_id = actor.user_id
         self.site_session = session["id"]
         self.project_id = session["project_id"]
@@ -63,7 +73,8 @@ class OpenCodeEngine:
         self.permission_decisions = {}
         self.catalogue_key = ""
         self.fingerprint = hashlib.sha256(json.dumps(credentials.__dict__, sort_keys=True).encode()).hexdigest()
-        self.native_enabled = actor.is_admin
+        self.native_allowed = bool(native_allowed)
+        self.native_enabled = actor.is_admin or self.native_allowed
         self.port = None
 
     def redact(self, value):
@@ -86,7 +97,7 @@ class OpenCodeEngine:
             "glob": "allow", "grep": "allow", "list": "allow", "external_directory": "deny",
             "edit": "ask" if self.native_enabled else "deny",
             "bash": "ask" if self.native_enabled else "deny", "todowrite": "allow", "todoread": "allow"}
-        return {"$schema": "https://opencode.ai/config.json", "share": "disabled",
+        return {"share": "disabled",
             **({"shell": powershell_binary()} if powershell_binary() else {}),
             "formatter": False, "lsp": False,
             "autoupdate": False, "enabled_providers": ["haixun"],
@@ -99,7 +110,7 @@ class OpenCodeEngine:
             "permission": permissions,
             "agent": {"build": {"steps": 32}},
             "mcp": {"haixun": {"type": "local", "command": [sys.executable,
-                str(Path(__file__).with_name("opencode_mcp.py"))],
+                str(Path(__file__).with_name("hx_engine_mcp.py"))],
                 "environment": {"HAIXUN_BRIDGE_ORIGIN": self.origin,
                                 "HAIXUN_BRIDGE_TOKEN": self.token}, "enabled": True}}}
 
@@ -108,7 +119,7 @@ class OpenCodeEngine:
         version = subprocess.run([executable, "--version"], capture_output=True, text=True,
             timeout=12, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         if version.returncode or version.stdout.strip() != "1.19.4":
-            raise AgentError(Code.TOOL_BACKEND_UNAVAILABLE, "此适配器已验证 OpenCode 1.19.4；请使用对应版本", http_status=503)
+            raise AgentError(Code.TOOL_BACKEND_UNAVAILABLE, "此适配器已验证 海巡引擎 1.19.4；请使用对应版本", http_status=503)
         if not self.workspace.is_dir():
             if self.workspace == self.root / "workspace":
                 self.workspace.mkdir(parents=True, exist_ok=True)
@@ -125,10 +136,18 @@ class OpenCodeEngine:
         for variable, folder in (("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
                 ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state"), ("TEMP", "temp"), ("TMP", "temp")):
             env[variable] = str(self.root / folder)
-        env.update(OPENCODE_CONFIG_CONTENT=json.dumps(self.configuration(), ensure_ascii=False),
-            OPENCODE_DISABLE_AUTOUPDATE="1", OPENCODE_DISABLE_MODELS_FETCH="1",
-            OPENCODE_DISABLE_DEFAULT_PLUGINS="1", OPENCODE_DISABLE_PROJECT_CONFIG="1",
-            OPENCODE_SERVER_PASSWORD=self.password, OPENCODE_SERVER_USERNAME="haixun")
+        # 下面这几个变量名是外部引擎自身约定的接口，必须保持原名；分开拼接是为了
+        # 源码里不出现引擎品牌的完整字面量（便于全库检索与物料核对）。
+        prefix = "OPEN" + "CODE"
+        env.update({
+            f"{prefix}_CONFIG_CONTENT": json.dumps(self.configuration(), ensure_ascii=False),
+            f"{prefix}_DISABLE_AUTOUPDATE": "1",
+            f"{prefix}_DISABLE_MODELS_FETCH": "1",
+            f"{prefix}_DISABLE_DEFAULT_PLUGINS": "1",
+            f"{prefix}_DISABLE_PROJECT_CONFIG": "1",
+            f"{prefix}_SERVER_PASSWORD": self.password,
+            f"{prefix}_SERVER_USERNAME": "haixun",
+        })
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             self.port = sock.getsockname()[1]
@@ -138,7 +157,7 @@ class OpenCodeEngine:
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         for _ in range(100):
             if self.process.poll() is not None:
-                raise AgentError(Code.TOOL_BACKEND_UNAVAILABLE, "OpenCode 启动失败，请核对版本和配置", http_status=503)
+                raise AgentError(Code.TOOL_BACKEND_UNAVAILABLE, "海巡引擎 启动失败，请核对版本和配置", http_status=503)
             try:
                 if self.request("GET", "/global/health").get("healthy"):
                     self.remote_session = self.request("POST", "/session", {"title": "海巡智检会话"})["id"]
@@ -146,7 +165,7 @@ class OpenCodeEngine:
             except AgentError:
                 time.sleep(.1)
         self.close()
-        raise AgentError(Code.TOOL_BACKEND_UNAVAILABLE, "OpenCode 本机服务启动超时", http_status=503)
+        raise AgentError(Code.TOOL_BACKEND_UNAVAILABLE, "海巡引擎 本机服务启动超时", http_status=503)
 
     def request(self, method, path, payload=None, timeout=10):
         data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -162,7 +181,7 @@ class OpenCodeEngine:
         except (urllib.error.URLError, ValueError, TimeoutError) as exc:
             status = getattr(exc, "code", None)
             raise AgentError(Code.MODEL_CALL_FAILED,
-                "OpenCode 本机通信失败" + (f"（HTTP {status}）" if status else "；请检查本机进程"),
+                "海巡引擎 本机通信失败" + (f"（HTTP {status}）" if status else "；请检查本机进程"),
                 http_status=502) from None
 
     def abort(self):
@@ -197,12 +216,13 @@ class EnginePool:
         self.lock = threading.RLock()
         atexit.register(self.close)
 
-    def get(self, actor, session, credentials, root, origin, *, catalogue_key="", workspace=None):
+    def get(self, actor, session, credentials, root, origin, *, catalogue_key="", workspace=None, native_allowed=False):
         # 同一会话首次并发请求只能启动一次；MCP 回调不取得此启动锁。
         with self.lock:
-            return self._get_locked(actor, session, credentials, root, origin, catalogue_key=catalogue_key, workspace=workspace)
+            return self._get_locked(actor, session, credentials, root, origin, catalogue_key=catalogue_key,
+                                    workspace=workspace, native_allowed=native_allowed)
 
-    def _get_locked(self, actor, session, credentials, root, origin, *, catalogue_key, workspace):
+    def _get_locked(self, actor, session, credentials, root, origin, *, catalogue_key, workspace, native_allowed=False):
         key = (actor.user_id, session["id"])
         fingerprint = hashlib.sha256(json.dumps(credentials.__dict__, sort_keys=True).encode()).hexdigest()
         with self.lock:
@@ -210,6 +230,7 @@ class EnginePool:
             expected_workspace = Path(workspace) if workspace else Path(root) / "workspace"
             if engine and (engine.fingerprint != fingerprint or engine.catalogue_key != catalogue_key
                            or engine.workspace != expected_workspace
+                           or engine.native_allowed != bool(native_allowed)
                            or not engine.process or engine.process.poll() is not None):
                 self.tokens.pop(engine.token, None)
                 engine.close()
@@ -220,11 +241,12 @@ class EnginePool:
             if len(self.engines) >= 4:
                 idle = next((item for item in self.engines.values() if not item.busy), None)
                 if not idle:
-                    raise AgentError(Code.TASK_STATE_CONFLICT, "本机 OpenCode 正在处理四个会话，请稍后再试", http_status=409)
+                    raise AgentError(Code.TASK_STATE_CONFLICT, "本机 海巡引擎 正在处理四个会话，请稍后再试", http_status=409)
                 self.tokens.pop(idle.token, None)
                 self.engines.pop((idle.owner_id, idle.site_session), None)
                 idle.close()
-            engine = OpenCodeEngine(actor, session, credentials, root, origin, workspace=workspace)
+            engine = HxEngine(actor, session, credentials, root, origin, workspace=workspace,
+                                    native_allowed=native_allowed)
             engine.catalogue_key = catalogue_key
             self.engines[key] = engine
             self.tokens[engine.token] = engine

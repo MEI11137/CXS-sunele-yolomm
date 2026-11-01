@@ -1,4 +1,4 @@
-"""核对网站内部 OpenCode 实际注册的业务工具，不调用模型或真实用户数据。"""
+"""核对网站内部 海巡引擎 实际注册的业务工具，不调用模型或真实用户数据。"""
 import pytest
 
 from agent.errors import AgentError
@@ -7,10 +7,10 @@ from tests.test_inspection_loop import setup, start
 from tests.test_review_agent_tools import card, execute
 
 
-def test_internal_opencode_catalogue_covers_project_business_pages(setup):
-    from agent.opencode_runtime import OpenCodeRuntime
+def test_internal_hxengine_catalogue_covers_project_business_pages(setup):
+    from agent.hx_engine_runtime import HxEngineRuntime
     f = setup
-    runtime = OpenCodeRuntime(f.app)
+    runtime = HxEngineRuntime(f.app)
     names = {spec.name for spec in runtime.registry.specs(f.actor, f.project['id'])}
     required = {
         'workspace_open_page', 'workspace_list_resources', 'workspace_query_resources',

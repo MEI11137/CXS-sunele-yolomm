@@ -51,8 +51,8 @@ def inspect_command(command):
     if not binary or not isinstance(command, str) or len(command) > 32000:
         return {'valid': False, 'commands': []}
     try:
-        result = subprocess.run([binary, '-NoLogo', '-NoProfile', '-NonInteractive', '-File',
-            str(Path(__file__).with_name('inspect_powershell.ps1'))], input=command.encode('utf-8'),
+        result = subprocess.run([binary, '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            '-File', str(Path(__file__).with_name('inspect_powershell.ps1'))], input=command.encode('utf-8'),
             capture_output=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW)
         return json.loads(result.stdout.decode('utf-8-sig')) if result.returncode == 0 else {'valid': False, 'commands': []}
     except (OSError, ValueError, subprocess.TimeoutExpired):
@@ -134,6 +134,8 @@ def command_decision(command, workspace, mode):
             index += 1
         if name in READ_COMMANDS | WRITE_COMMANDS and name != 'get-childitem' and not path_count:
             return decision
+    if name == 'get-childitem' and not decision['targets']:
+        decision['targets'].append(str(Path(workspace).resolve()))
     decision.update(kind='write' if writes else 'read',
         auto=not writes or mode == 'full', reason='已核对项目内的明确常规操作' if writes else '已核对项目内的只读命令')
     if writes and any((Path(workspace) / target).is_file() for target in decision['targets']):
@@ -143,6 +145,22 @@ def command_decision(command, workspace, mode):
 
 def decide(permission, workspace, mode):
     metadata = permission.get('metadata') or {}
+    if permission.get('permission') in {'list', 'read', 'glob', 'grep'}:
+        base = Path(workspace).resolve()
+        targets = []
+        for raw in permission.get('patterns') or []:
+            if not isinstance(raw, str) or not raw:
+                continue
+            head = raw
+            for index, ch in enumerate(raw):
+                if ch in '*?[':
+                    head = raw[:index]
+                    break
+            head = head.rstrip('\\/') or '.'
+            candidate = Path(head)
+            targets.append(str(candidate if candidate.is_absolute() else base / candidate))
+        return {'auto': False, 'kind': 'read', 'targets': targets,
+                'reason': '读取演示文件夹内的内容' if targets else '读取范围无法确定'}
     if permission.get('permission') in {'bash', 'shell'}:
         return command_decision(metadata.get('command'), workspace, mode)
     files = metadata.get('files') or []

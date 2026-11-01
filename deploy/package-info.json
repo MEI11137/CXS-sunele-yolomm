@@ -1,0 +1,15 @@
+{
+  "package": "海巡智检v1.1完整源码迁移包",
+  "date": "2026-10-31",
+  "version": "1.1.0",
+  "base_branch": "feature/agent-engine",
+  "base_commit": "b2c96e1aabd4897eae9f5ee464b91ff4d5224ca0",
+  "includes_working_tree_changes": true,
+  "includes_frontend_dist": true,
+  "source_files_copied": 1785,
+  "bridge_patch_already_applied": true,
+  "requires_github_clone": false,
+  "includes_database_or_api_keys": false,
+  "includes_python_node_engine_or_node_modules": false,
+  "public_url_configured": false
+}

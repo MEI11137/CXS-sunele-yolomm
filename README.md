@@ -2,13 +2,14 @@
 
 基于 Vue 3、Flask 和 YOLO 的巡检系统，支持图片、视频和实时检测，以及视觉大模型辅助核查。
 
-## 海巡智检 v1.1 源码版
+## 海巡智检 v1.2 源码版
 
-当前整体版本为 `1.1.0`，在 `feature/opencode-agent` 分支协作审查。网站内部使用 OpenCode 1.19.4，保留原人工操作入口。源码不包含个人API配置、数据库、测试记录、模型权重、原始数据或本机依赖；新安装从空业务数据开始。真实模型能力和GPU训练效果需要按各人的连接、数据与硬件验收。
+当前整体版本为 `1.2.0`，在 `release/haixun-v1.2.0` 分支协作审查。网站内部使用 海巡引擎 1.19.4，保留原人工操作入口。源码不包含个人API配置、数据库、测试记录、模型权重、原始数据或本机依赖；新安装从空业务数据开始。真实模型能力和GPU训练效果需要按各人的连接、数据与硬件验收。
 
-- [v1.1 版本说明](docs/releases/haixun-v1.1.md)
+- [v1.2 版本说明](docs/releases/haixun-v1.2.md)
 - [Agent功能覆盖与边界](docs/integration/Agent功能覆盖复核_2026-10-29.md)
 - [版本日志](CHANGELOG.md)
+- [Windows训练电脑远程演示部署](docs/deployment/Windows训练电脑远程演示部署.md)：可选的独立演示模式，复用现有YOLO环境，提供受控HTTPS入口；不会随本机启动器自动开放公网。
 
 历史 v1.0 整合分支及 `haixun-v1.0` 标签保持原样：
 
@@ -37,11 +38,11 @@ CXSDet-YOLOmm/CXSDet/
 
 ## 启动
 
-先准备适配硬件的Python/Torch环境、Node.js，以及OpenCode 1.19.4的Windows可执行程序。Python依赖原有锁定环境涉及Python 3.12/CUDA 12.1，实际运行环境须与本机设备匹配；不要直接复制队友的虚拟环境。
+先准备适配硬件的Python/Torch环境、Node.js，以及海巡引擎 1.19.4的Windows可执行程序。Python依赖原有锁定环境涉及Python 3.12/CUDA 12.1，实际运行环境须与本机设备匹配；不要直接复制队友的虚拟环境。
 
 1. 在 `CXSDet-YOLOmm/CXSDet/web-flask` 安装 `requirements.txt` 和 `requirements-agent.txt`。
 2. 在 `CXSDet-YOLOmm/CXSDet/web-haixun` 运行 `npm ci`；使用这套前端的 `package-lock.json`。
-3. 在PowerShell设置 `HAIXUN_PYTHON` 为所用python.exe绝对路径，`OPENCODE_BIN` 为opencode.exe绝对路径；Node在PATH中，或通过 `HAIXUN_NODE` 指定node.exe。也可将Node和OpenCode分别放入仓库 `.runtime/node/node.exe`、`.runtime/opencode/opencode.exe`。
+3. 在PowerShell设置 `HAIXUN_PYTHON` 为所用python.exe绝对路径，`HX_ENGINE_BIN` 为hxengine.exe绝对路径；Node在PATH中，或通过 `HAIXUN_NODE` 指定node.exe。也可将Node和海巡引擎分别放入仓库 `.runtime/node/node.exe`、`.runtime/hxengine/hxengine.exe`。
 4. 在仓库根目录运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1 -Check` 检查依赖，然后双击 **启动海巡智检.cmd** 启动前后端。**停止服务.cmd** 只停止同路径的本版本服务；运行中的训练/任务请先处理完毕。
 5. 打开 `http://127.0.0.1:5173/`，后端默认端口5020。首次初始化的管理员为 `admin / 123456`，正式使用时修改密码。
 6. 在“设置 → 大模型连接”配置自己的Key、地址和模型。创建项目并选择本机文件夹，再导入数据集/权重；聊天与网页AI功能使用相同个人连接。
@@ -60,6 +61,8 @@ CXSDet-YOLOmm/CXSDet/
 
 保留原项目作者及第三方代码中的版权和使用声明；使用范围以原有授权和相关组件许可为准。
 
-## OpenCode 接入开发分支
+## 海巡引擎 接入开发分支
 
-当前 Agent 默认由本机 OpenCode **1.19.4** 执行，复用网站的业务工具、权限和人工确认。独立体验版与网站会话分开，网站只使用本人设置的模型连接。启动要求、原生文件/命令边界与回滚见 [接入说明](docs/integration/OpenCode接入与参赛说明.md)，开源许可见 [第三方声明](THIRD_PARTY_NOTICES.md)。此前 `haixun-v1.0` 标签保持不变。
+当前 Agent 默认由本机 海巡引擎 **1.19.4** 执行，复用网站的业务工具、权限和人工确认。独立体验版与网站会话分开，网站只使用本人设置的模型连接。启动要求、原生文件/命令边界与回滚见 [接入说明](docs/integration/海巡引擎接入与参赛说明.md)，开源许可见 [第三方声明](开源组件声明.md)。此前 `haixun-v1.0` 标签保持不变。
+
+海巡引擎的执行层为 OpenCode 1.19.4，官方程序可从 https://github.com/anomalyco/opencode/releases/tag/v1.19.4 获取；解压后可将 opencode.exe 复制命名为 hxengine.exe，按上述 HX_ENGINE_BIN 配置。原始来源和许可保留在 THIRD_PARTY_NOTICES.md。

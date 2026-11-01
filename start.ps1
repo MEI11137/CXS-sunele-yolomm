@@ -36,7 +36,7 @@ if ($Stop) {
     }
     StopOwned $FrontendPort $viteFile
     StopOwned $BackendPort $appFile
-    Write-Host 'HaiXun v1.1 services stopped. Files and data are preserved.'
+    Write-Host 'HaiXun v1.2 services stopped. Files and data are preserved.'
     exit 0
 }
 
@@ -57,7 +57,7 @@ try {
     $localPackage = Split-Path $root -Parent
     $python = ResolveRuntime $env:HAIXUN_PYTHON @((Join-Path $root '.venv\Scripts\python.exe'),(Join-Path $env:USERPROFILE '.workbuddy\binaries\python\envs\pvdetect\Scripts\python.exe')) 'python.exe'
     $node = ResolveRuntime $env:HAIXUN_NODE @((Join-Path $root '.runtime\node\node.exe'),(Join-Path $localPackage '.runtime\node\node.exe')) 'node.exe'
-    $openCode = ResolveRuntime $env:OPENCODE_BIN @((Join-Path $root '.runtime\opencode\opencode.exe'),(Join-Path $localPackage '.runtime\opencode\opencode.exe')) 'opencode.exe'
+    $engineExe = ResolveRuntime $env:HX_ENGINE_BIN @((Join-Path $root '.runtime\hxengine\hxengine.exe'),(Join-Path $localPackage '.runtime\hxengine\hxengine.exe')) 'hxengine.exe'
     foreach ($file in @($appFile,$viteFile)) {
         if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "Required file missing: $file. See README.md; install Python dependencies and run npm ci in web-haixun." }
     }
@@ -65,9 +65,9 @@ try {
     & $python -c "import importlib.util,sys; names=('flask','torch','PIL','cryptography','ultralytics'); missing=[x for x in names if importlib.util.find_spec(x) is None]; print('Missing modules: '+str(missing)) if missing else None; sys.exit(bool(missing))"
     if ($LASTEXITCODE -ne 0) { throw 'Python dependency check failed.' }
     & $node --version
-    & $openCode --version
-    if ($LASTEXITCODE -ne 0) { throw 'OpenCode check failed.' }
-    if ($Check) { Write-Host "CHECK_OK: HaiXun v1.1; Python=$python; frontend=web-haixun"; exit 0 }
+    & $engineExe --version
+    if ($LASTEXITCODE -ne 0) { throw '海巡引擎 check failed.' }
+    if ($Check) { Write-Host "CHECK_OK: HaiXun v1.2; Python=$python; frontend=web-haixun"; exit 0 }
     $targets = @()
     if ($Service -ne 'Frontend') { $targets += [pscustomobject]@{ Port=$BackendPort; Entry=$appFile } }
     if ($Service -ne 'Backend') { $targets += [pscustomobject]@{ Port=$FrontendPort; Entry=$viteFile } }
@@ -84,9 +84,9 @@ try {
     $env:FLASK_TEMP_DIR = Join-Path $backDir 'temp'
     $env:FILE_PUBLIC_URL = "http://127.0.0.1:$BackendPort/api/file"
     $env:FRONTEND_ORIGINS = "http://127.0.0.1:$FrontendPort,http://localhost:$FrontendPort"
-    $env:OPENCODE_BIN = $openCode
-    $env:AGENT_ENGINE = 'opencode'
-    $env:OPENCODE_BRIDGE_ORIGIN = "http://127.0.0.1:$BackendPort"
+    $env:HX_ENGINE_BIN = $engineExe
+    $env:AGENT_ENGINE = 'hxengine'
+    $env:HX_ENGINE_BRIDGE_ORIGIN = "http://127.0.0.1:$BackendPort"
     $env:YOLO_CONFIG_DIR = Join-Path $runDir 'ultralytics'
     $env:PATH = (Split-Path $node) + ';' + $env:PATH
     $env:VITE_BACKEND_ORIGIN = "http://127.0.0.1:$BackendPort"
@@ -117,7 +117,7 @@ try {
         foreach ($item in $started) { try { StopOwned $item.Port $item.Entry } catch {} }
         throw
     }
-    Write-Host "READY: http://127.0.0.1:$FrontendPort/ (v1.1). Logs: $runDir"
+    Write-Host "READY: http://127.0.0.1:$FrontendPort/ (v1.2). Logs: $runDir"
     if (!$NoBrowser -and $Service -ne 'Backend') { Start-Process "http://127.0.0.1:$FrontendPort/" }
 } catch {
     Write-Host ("START_FAILED: " + $_.Exception.Message) -ForegroundColor Red

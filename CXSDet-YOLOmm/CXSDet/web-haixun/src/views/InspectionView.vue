@@ -457,8 +457,8 @@ function reset() {
           <p class="dropzone-text">拖拽或粘贴 JPG / PNG / WEBP 影像到此处，或</p>
           <button class="btn" @click="fileInput?.click()">选择文件</button>
           <button v-if="isMock" class="btn btn-ghost" @click="addSamples">使用示例影像</button>
-          <input ref="fileInput" type="file" multiple hidden accept=".jpg,.jpeg,.png,.webp,.bmp,.gif" @change="onFileSelect" />
-          <input ref="xInput" type="file" hidden accept=".jpg,.jpeg,.png,.webp,.bmp,.gif" @change="onXFileSelect" />
+          <input ref="fileInput" type="file" multiple hidden accept=".jpg,.jpeg,.png,.webp" @change="onFileSelect" />
+          <input ref="xInput" type="file" hidden accept=".jpg,.jpeg,.png,.webp" @change="onXFileSelect" />
           <p class="dropzone-hint">
             单文件上限 100 MB · 选择后立即上传到本机项目（受保护存储），执行时按文件引用取图
           </p>

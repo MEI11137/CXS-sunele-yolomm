@@ -174,6 +174,7 @@ export interface ApiAdapter {
   getConnection(): Promise<PersonalConnection>
   setSessionPermissionMode(sessionId: string, mode: 'request' | 'assist' | 'full'): Promise<Session>
   listConnectionModels(): Promise<{ models: string[]; current: string; discovery_error: string }>
+  switchConnectionModel(model: string): Promise<PersonalConnection>
   saveConnection(input: {
     provider: string
     apiUrl: string

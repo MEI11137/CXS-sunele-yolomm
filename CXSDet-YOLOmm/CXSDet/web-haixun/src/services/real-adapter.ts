@@ -185,6 +185,12 @@ export class RealAdapter extends BaseAdapter {
     return http.get('/api/agent/connection/models')
   }
 
+  async switchConnectionModel(model: string): Promise<PersonalConnection> {
+    // 演示环境专用：服务端只接受预置清单内的模型，Key 与地址沿用已存的
+    const data = await http.post<unknown>('/api/agent/connection/model', { model })
+    return raw(data) as unknown as PersonalConnection
+  }
+
   async saveConnection(input: {
     provider: string
     apiUrl: string

@@ -9,7 +9,7 @@ import pytest
 
 from agent import actions, identity, manuals, permissions, recycle, sessions, tasks
 from agent.errors import AgentError
-from agent.opencode_runtime import OpenCodeRuntime
+from agent.hx_engine_runtime import HxEngineRuntime
 from agent.workspace_tools import WorkspaceTools
 from tests.test_inspection_loop import setup, start
 from tests.test_business_approval_modes import invoke
@@ -58,7 +58,7 @@ def test_project_and_session_management_are_owned_and_actual(setup):
 
 @pytest.mark.parametrize('kind',['project','session'])
 def test_confirming_self_delete_stops_runtime_and_preserves_history_and_files(setup,kind,monkeypatch):
-    f=setup;runtime=OpenCodeRuntime(f.app)
+    f=setup;runtime=HxEngineRuntime(f.app)
     f.task=tasks.get_task(f.actor,f.task['id'])
     tasks.set_status(f.task['id'],tasks.STATUS_RUNNING)
     result=invoke(f,runtime,f.task,'workspace_manage_'+kind,{'operation':'delete'})
@@ -79,7 +79,7 @@ def test_confirming_self_delete_stops_runtime_and_preserves_history_and_files(se
 
 
 def test_runtime_can_restore_deleted_project_and_card_names_actual_target(setup,monkeypatch):
-    f=setup;runtime=OpenCodeRuntime(f.app)
+    f=setup;runtime=HxEngineRuntime(f.app)
     project=permissions.create_project(f.actor,'待恢复')
     recycle.change(f.actor,'project',project['id'])
     out=invoke(f,runtime,f.task,'workspace_manage_project',{'operation':'restore','target_project_id':project['id']})
@@ -141,7 +141,7 @@ def test_csv_exports_only_current_project_page_with_safe_values_into_workspace(s
 
 
 def test_export_automatic_and_management_still_have_specific_confirmation(setup):
-    f=setup;runtime=OpenCodeRuntime(f.app);sessions.set_permission_mode(f.actor,f.chat['id'],'full')
+    f=setup;runtime=HxEngineRuntime(f.app);sessions.set_permission_mode(f.actor,f.chat['id'],'full')
     assert invoke(f,runtime,f.task,'workspace_export_records_csv',{}) is None
     assert not actions.list_actions(f.task['id'],[actions.STATUS_PENDING])
     out=invoke(f,runtime,f.task,'workspace_manage_session',{'operation':'create','title':'需确认'})
@@ -191,7 +191,7 @@ def test_ui_is_fixed_commands_scoped_to_current_conversation(setup):
 
 
 def test_restore_does_not_revive_pending_actions_from_deleted_context(setup):
-    f=setup;runtime=OpenCodeRuntime(f.app)
+    f=setup;runtime=HxEngineRuntime(f.app)
     invoke(f,runtime,f.task,'workspace_manage_manual',{'operation':'create','name':'未同意的手册','content_md':'保留确认'})
     pending=actions.list_actions(f.task['id'],[actions.STATUS_PENDING])[0]
     recycle.change(f.actor,'session',f.chat['id'])

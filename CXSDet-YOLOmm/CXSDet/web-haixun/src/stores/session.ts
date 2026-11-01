@@ -257,7 +257,7 @@ export const useSessionStore = defineStore('session', () => {
       return assistantMsg
     } finally {
       if (token === epoch) sending.value[s.id] = false
-      // 用服务端消息 ID 校准；OpenCode 的后续输出由任务轮询读取，不能拼入旧占位消息。
+      // 用服务端消息 ID 校准；海巡引擎 的后续输出由任务轮询读取，不能拼入旧占位消息。
       if (received && token === epoch) {
         try { await loadMessages(s.id) } catch { /* 保留当前回复，下一次轮询继续校准 */ }
       }

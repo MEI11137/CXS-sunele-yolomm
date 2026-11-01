@@ -204,7 +204,7 @@ function eventTitle(name: string) {
   const names: Record<string,string> = { workspace_open_page: '打开项目页面', workspace_attach_file: '上传项目文件', workspace_list_resources: '查看项目资源', read: '读取文件', write: '写入文件', edit: '修改文件', bash: '执行命令', glob: '查找文件', grep: '搜索内容', dataset_import: '校验并导入数据集', detection_run: '图片巡检', review_ai: 'AI 核查', wait_for_human: '等待人工处理' }
   return names[raw] || raw.replace(/_/g,' ')
 }
-function displayBrand(value: string) { return value.startsWith('将指定记录批量加入') ? '批量加入反馈池' : value.startsWith('按用户指定范围单条或批量删除') ? '删除所选识别记录' : value.startsWith('删除或恢复当前项目的数据集') ? '项目资源删除 / 恢复' : value.startsWith('按用户指示编辑复核草稿') ? '复核记录操作' : value.replace(/OpenCode/g, '海巡助手') }
+function displayBrand(value: string) { return value.startsWith('将指定记录批量加入') ? '批量加入反馈池' : value.startsWith('按用户指定范围单条或批量删除') ? '删除所选识别记录' : value.startsWith('删除或恢复当前项目的数据集') ? '项目资源删除 / 恢复' : value.startsWith('按用户指示编辑复核草稿') ? '复核记录操作' : value.replace(/海巡引擎/g, '海巡助手') }
 function cardPreview(preview: Record<string, unknown>) {
   return { ...preview, ...(typeof preview.tool_title === 'string' ? { tool_title: displayBrand(preview.tool_title) } : {}) }
 }
@@ -219,14 +219,14 @@ function actionSummary(action: Confirmation) {
   if (action.tool_name === 'workspace_delete_records') return `仅删除所选 ${action.preview.count} 条记录。${action.preview.impact || ''}`
   if (action.tool_name === 'workspace_manage_resource') return `${approvalLabel(action)} · ${action.preview.name} · 资源版本 ${action.preview.revision}。${action.preview.impact || ''}`
   if (action.tool_name === 'workspace_review_record') return `${approvalLabel(action)} · 记录 ${action.preview.title || action.preview.record_id} · 当前版本 ${action.preview.current_version}。${action.preview.impact || ''}`
-  return displayBrand(String(action.tool_name === 'opencode_permission' ? action.preview.impact || action.parameters_summary : action.parameters_summary))
+  return displayBrand(String(action.tool_name === 'engine_permission' ? action.preview.impact || action.parameters_summary : action.parameters_summary))
 }
 function approvalLabel(action: Confirmation) {
   if (action.tool_name === 'workspace_add_feedback') return `确认加入这 ${action.preview.count} 条反馈`
   if (action.tool_name === 'workspace_delete_records') return `确认删除这 ${action.preview.count} 条记录`
   if (action.tool_name === 'workspace_manage_resource') return action.preview.operation === 'restore' ? '确认恢复此资源' : '确认移入回收站'
   if (action.tool_name === 'workspace_review_record') return ({ draft: '应用到页面草稿', confirmed: '确认并提交标注', no_defect: '我确认无缺陷', rejected: '确认驳回', delete: '确认删除此记录', restore: '恢复此记录' } as Record<string, string>)[String(action.preview.operation)] || '确认执行'
-  if (action.tool_name !== 'opencode_permission') return '确认执行'
+  if (action.tool_name !== 'engine_permission') return '确认执行'
   return action.preview.operation_kind === 'delete' ? '批准本次批量删除' : '批准本次操作'
 }
 function waitingLabel(kind: string) { return ({ human: '请在页面完成复核', business: '等待后台处理结果', input: '请补充必要信息' } as Record<string, string>)[kind] || '等待下一步处理' }

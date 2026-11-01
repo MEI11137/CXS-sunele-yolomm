@@ -8,9 +8,35 @@ from flask import current_app
 from agent.errors import AgentError, Code
 
 
-def require_local_admin(actor):
-    if not actor.is_admin:
-        raise AgentError(Code.FORBIDDEN, "本机文件夹功能仅限管理员使用", http_status=403)
+def demo_root():
+    """公网演示工作区的根目录；未配置时返回 None。"""
+    value = current_app.config.get("DEMO_WORKSPACE_ROOT")
+    if not value:
+        return None
+    try:
+        return Path(str(value)).resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
+def _inside_demo_root(path):
+    root = demo_root()
+    if root is None:
+        return False
+    try:
+        real = Path(path).resolve()
+    except (OSError, RuntimeError):
+        return False
+    return real == root or real.is_relative_to(root)
+
+
+def require_local_admin(actor, path=None):
+    if actor.is_admin:
+        return
+    # 公网演示只放行预先配置的那一个工作区，其余本机目录仍仅限管理员。
+    if path is not None and _inside_demo_root(path):
+        return
+    raise AgentError(Code.FORBIDDEN, "本机文件夹功能仅限管理员使用", http_status=403)
 
 
 def directory(value):
@@ -35,7 +61,7 @@ def _protected(path, *, include_ancestors=False):
     for key in ("WINDIR", "ProgramFiles", "ProgramFiles(x86)", "APPDATA", "LOCALAPPDATA"):
         if os.environ.get(key):
             blocked.append(Path(os.environ[key]))
-    for key in ("DATABASE", "TEMP_DIR", "FILE_STORE_PATH", "OPENCODE_STATE_DIR"):
+    for key in ("DATABASE", "TEMP_DIR", "FILE_STORE_PATH", "HX_ENGINE_STATE_DIR"):
         value = current_app.config.get(key)
         if value:
             blocked.append(Path(value))
@@ -45,8 +71,8 @@ def _protected(path, *, include_ancestors=False):
 
 
 def validate_root(actor, value, conn=None, project_id=None):
-    require_local_admin(actor)
     path = directory(value)
+    require_local_admin(actor, path)
     if path == Path(path.anchor) or path == Path.home().resolve() or _protected(path, include_ancestors=True):
         raise AgentError(Code.VALIDATION, "请选择独立的项目文件夹，不能使用磁盘根目录、用户根目录或受保护目录")
     backend = Path(__file__).resolve().parents[1]

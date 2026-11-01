@@ -16,7 +16,7 @@ from agent.routes import agent_bp
 
 class ProjectFoldersTest(unittest.TestCase):
     def setUp(self):
-        staging = Path(os.environ.get("OPENCODE_TEST_TMP") or Path(__file__).resolve().parents[4] / ".integration-checks")
+        staging = Path(os.environ.get("HX_ENGINE_TEST_TMP") or Path(__file__).resolve().parents[4] / ".integration-checks")
         staging.mkdir(parents=True, exist_ok=True)
         self.tmp = tempfile.TemporaryDirectory(prefix="haixun-folders-", dir=staging)
         self.addCleanup(self.tmp.cleanup)

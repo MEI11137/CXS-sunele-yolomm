@@ -65,9 +65,9 @@ def register_agent(app) -> Dict[str, Any]:
 
     if "agent_bp" not in app.blueprints:
         app.register_blueprint(agent_bp)
-    from agent.opencode_runtime import opencode_bp
-    if "opencode_bridge" not in app.blueprints:
-        app.register_blueprint(opencode_bp)
+    from agent.hx_engine_runtime import hxengine_bp
+    if "engine_bridge" not in app.blueprints:
+        app.register_blueprint(hxengine_bp)
     from agent.dev_bridge import dev_bp
     if 'agent_dev_bridge' not in app.blueprints:
         app.register_blueprint(dev_bp)

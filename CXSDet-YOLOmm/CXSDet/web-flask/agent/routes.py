@@ -18,7 +18,7 @@ import time
 from functools import wraps
 from typing import Any, Callable, Dict, List, Optional
 
-from flask import Blueprint, Response, g, request, stream_with_context
+from flask import Blueprint, Response, current_app, g, request, stream_with_context
 
 from agent import __version__
 from agent import actions as action_store
@@ -138,6 +138,14 @@ def _ok(data: Any = None, msg: str = "操作成功") -> Response:
     return success(data, msg)
 
 
+def _allowed_models() -> List[str]:
+    """部署预置的可切换模型清单；为空表示不限制（本机自用场景）。"""
+    raw = current_app.config.get("DEMO_ALLOWED_MODELS") or []
+    if isinstance(raw, str):
+        raw = [item.strip() for item in raw.split(",") if item.strip()]
+    return [str(item) for item in raw if str(item).strip()]
+
+
 def _failure(exc: AgentError) -> Response:
     payload = {"code": exc.http_status, "msg": exc.message, "data": exc.to_dict()}
     return Response(
@@ -234,7 +242,7 @@ def _recycle(kind, key, restore=False):
     result = recycle.change(actor, kind, key, restore=restore)
     if not restore:
         from flask import current_app
-        runtime = current_app.extensions.get("haixun_opencode")
+        runtime = current_app.extensions.get("haixun_engine")
         if runtime:
             runtime.pool.discard(actor.user_id, project_id=key if kind == "project" else None,
                                  session_id=key if kind == "session" else None)
@@ -397,6 +405,10 @@ def list_connection_models() -> Response:
     actor = _current()
     gateway = connections.model_client(actor)
     current = gateway.credentials.model
+    allowed = _allowed_models()
+    if allowed:
+        # 演示环境只暴露白名单，界面不铺开服务商的整份模型目录。
+        return _ok({"models": allowed, "current": current, "discovery_error": ""})
     try:
         models = gateway.list_models()
         return _ok({"models": sorted(set(models + [current])), "current": current,
@@ -404,6 +416,28 @@ def list_connection_models() -> Response:
     except AgentError as exc:
         return _ok({"models": [current], "current": current,
                     "discovery_error": exc.message})
+
+
+@agent_bp.post("/connection/model")
+@auth_required
+def switch_connection_model() -> Response:
+    """演示环境：在预置清单内切换模型，复用已保存的 Key 与接口地址。"""
+    actor = _current()
+    body = _body()
+    name = _str_field(body, "model", max_chars=160)
+    allowed = _allowed_models()
+    if allowed and name not in allowed:
+        raise AgentError(Code.VALIDATION, "该模型不在本部署允许的清单内", http_status=400)
+    view = connections.get_connection_view(actor)
+    if not view:
+        raise AgentError(Code.VALIDATION, "当前账号还没有已保存的模型连接", http_status=400)
+    updated = connections.save_connection(
+        actor,
+        provider=view["provider"],
+        api_url=view["api_url"],
+        model=name,
+    )
+    return _ok(updated, "模型已切换，下一次对话生效")
 
 
 @agent_bp.delete("/connection")

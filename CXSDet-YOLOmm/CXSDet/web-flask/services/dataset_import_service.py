@@ -53,6 +53,13 @@ from services.dataset_contract import (
 # service does not depend on the file client or Flask configuration.
 STATUS_APPROVED = 1
 MAX_ISSUES = 200
+# Budget for one uploaded archive. The public demo accepts ZIP files from
+# visitors, so an archive that unpacks into gigabytes must be refused before
+# anything is read out of it.
+MAX_ARCHIVE_ENTRIES = 5000
+MAX_ARCHIVE_BYTES = 2 * 1024 ** 3
+MAX_MEMBER_BYTES = 512 * 1024 ** 2
+MAX_COMPRESSION_RATIO = 200
 
 
 class DatasetImportError(ValueError):
@@ -196,6 +203,28 @@ def _finish(issues: _IssueLog, **values: Any) -> DatasetImportPreview:
     )
 
 
+def _archive_budget_issues(archive: zipfile.ZipFile, issues: _IssueLog) -> None:
+    """Refuse archives whose unpacked size or member count is out of budget."""
+    entries = [info for info in archive.infolist() if not info.is_dir()]
+    if len(entries) > MAX_ARCHIVE_ENTRIES:
+        issues.add("ARCHIVE_TOO_MANY_ENTRIES",
+                   f"ZIP 包含 {len(entries)} 个文件，超过 {MAX_ARCHIVE_ENTRIES} 个上限")
+        return
+    total = 0
+    for info in entries:
+        if info.file_size > MAX_MEMBER_BYTES:
+            issues.add("ARCHIVE_MEMBER_TOO_LARGE", "ZIP 内单个文件过大", path=info.filename)
+            return
+        if info.compress_size > 0 and info.file_size > 10 * 1024 ** 2:
+            if info.file_size / info.compress_size > MAX_COMPRESSION_RATIO:
+                issues.add("ARCHIVE_SUSPICIOUS_RATIO", "ZIP 成员压缩比异常", path=info.filename)
+                return
+        total += info.file_size
+    if total > MAX_ARCHIVE_BYTES:
+        issues.add("ARCHIVE_TOO_LARGE",
+                   f"ZIP 解压后约 {total // 1024 ** 2} MB，超过 {MAX_ARCHIVE_BYTES // 1024 ** 2} MB 上限")
+
+
 def _unsafe_members(archive: zipfile.ZipFile, issues: _IssueLog) -> list[str]:
     """Return normalised member names after recording unsafe entries."""
     members: list[str] = []
@@ -308,6 +337,7 @@ def inspect_dataset_archive(
         return _finish(issues, dataset_mode=requested)
 
     with archive:
+        _archive_budget_issues(archive, issues)
         members = _unsafe_members(archive, issues)
         if issues.blocking_total:
             return _finish(issues, dataset_mode=requested)

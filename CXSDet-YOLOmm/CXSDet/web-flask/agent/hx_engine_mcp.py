@@ -1,4 +1,4 @@
-"""OpenCode 的私有 stdio MCP：具体业务工具 → 站点权限/确认层。
+"""海巡引擎 的私有 stdio MCP：具体业务工具 → 站点权限/确认层。
 
 仅继承一次启动的服务端凭据；stdout 只输出 MCP 协议，不导入 Flask app。
 """
@@ -18,7 +18,7 @@ def relay(method, path, payload=None):
     origin = os.environ["HAIXUN_BRIDGE_ORIGIN"].rstrip("/")
     token = os.environ["HAIXUN_BRIDGE_TOKEN"]
     data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(origin + "/api/agent/opencode/bridge" + path,
+    request = urllib.request.Request(origin + "/api/agent/engine/bridge" + path,
         data=data, method=method, headers={"Authorization": "Bearer " + token,
                                           "Content-Type": "application/json"})
     with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=90) as response:

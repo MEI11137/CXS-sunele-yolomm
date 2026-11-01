@@ -1,4 +1,4 @@
-"""OpenCode 拥有模型/工具执行循环；站点保留业务权限、人工确认和事实记录。"""
+"""海巡引擎 拥有模型/工具执行循环；站点保留业务权限、人工确认和事实记录。"""
 from __future__ import annotations
 
 import hashlib
@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import sys
 import threading
 import time
 
@@ -15,16 +16,16 @@ from agent import actions, connections, context, memory, permissions, sessions, 
 from agent.errors import AgentError, Code, ExecutionState
 from agent.identity import load_actor
 from agent.llm.provider import ToolCall
-from agent.opencode_engine import EnginePool
+from agent.hx_engine import EnginePool
 from agent.runtime import AgentRuntime, LoopState, classify_intent, INTENT_STOP, INTENT_CHANGE
 from agent.store import connect, dumps, now
 
-opencode_bp = Blueprint("opencode_bridge", __name__, url_prefix="/api/agent/opencode")
-NATIVE_TOOL = "opencode_permission"
+hxengine_bp = Blueprint("engine_bridge", __name__, url_prefix="/api/agent/engine")
+NATIVE_TOOL = "engine_permission"
 _INIT_LOCK = threading.RLock()
 
 
-@opencode_bp.errorhandler(AgentError)
+@hxengine_bp.errorhandler(AgentError)
 def bridge_error(exc):
     return jsonify({"error": exc.to_dict()}), exc.http_status
 
@@ -32,10 +33,10 @@ def bridge_error(exc):
 def app_runtime():
     app = current_app._get_current_object()
     with _INIT_LOCK:
-        runtime = app.extensions.get("haixun_opencode")
+        runtime = app.extensions.get("haixun_engine")
         if runtime is None:
-            runtime = OpenCodeRuntime(app)
-            app.extensions["haixun_opencode"] = runtime
+            runtime = HxEngineRuntime(app)
+            app.extensions["haixun_engine"] = runtime
         return runtime
 
 
@@ -45,13 +46,13 @@ def _bridge_engine():
     engine = next((item for token, item in list(runtime.pool.tokens.items())
                    if supplied and hmac.compare_digest(token, supplied)), None)
     if request.remote_addr not in {"127.0.0.1", "::1"} or engine is None:
-        raise AgentError(Code.UNAUTHENTICATED, "OpenCode 私有工具连接无效", http_status=401)
-    actor = load_actor(engine.owner_id, source="opencode-mcp")
+        raise AgentError(Code.UNAUTHENTICATED, "海巡引擎 私有工具连接无效", http_status=401)
+    actor = load_actor(engine.owner_id, source="hxengine-mcp")
     sessions.get_session(actor, engine.site_session)
     return runtime, engine, actor
 
 
-@opencode_bp.get("/bridge/tools")
+@hxengine_bp.get("/bridge/tools")
 def bridge_tools():
     runtime, engine, actor = _bridge_engine()
     return jsonify({"tools": [{"name": spec.name, "description": spec.description,
@@ -59,7 +60,7 @@ def bridge_tools():
         for spec in runtime.registry.specs(actor, engine.project_id)]})
 
 
-@opencode_bp.post("/bridge/call")
+@hxengine_bp.post("/bridge/call")
 def bridge_call():
     runtime, engine, actor = _bridge_engine()
     body = request.get_json(silent=True) or {}
@@ -74,9 +75,9 @@ def bridge_call():
         if task["status"] in tasks.TERMINAL_STATUSES:
             raise AgentError(Code.TASK_STATE_CONFLICT, "任务已停止或结束", http_status=409)
         name = str(body.get("name") or "")
-        if name.startswith("workspace_") and body.get("arguments", {}).get("project_id") != engine.project_id:
-            raise AgentError(Code.FORBIDDEN, "项目界面和附件工具不能切换到其他项目", http_status=403)
         spec, _, _ = runtime.registry.resolve(name, actor)
+        if name.startswith("workspace_") and 'project_id' in spec.parameters.get('properties', {}) and body.get("arguments", {}).get("project_id") != engine.project_id:
+            raise AgentError(Code.FORBIDDEN, "项目界面和附件工具不能切换到其他项目", http_status=403)
         # 一项写入等待确认/人工/业务完成时，不允许再创建另一项依赖写入；聊天和只读不受阻。
         pending = actions.list_actions(task["id"], [actions.STATUS_PENDING])
         if (pending or task["status"] in {tasks.STATUS_AWAITING_PLAN, tasks.STATUS_AWAITING_HUMAN,
@@ -98,7 +99,7 @@ def bridge_call():
             return jsonify(engine.redact({"error": exc.to_dict()}))
 
 
-class OpenCodeRuntime(AgentRuntime):
+class HxEngineRuntime(AgentRuntime):
     def __init__(self, app, *, pool=None, registry=None):
         super().__init__(registry=registry)
         self.app = app
@@ -155,18 +156,21 @@ class OpenCodeRuntime(AgentRuntime):
         project = permissions.get_project(actor, session["project_id"])
         workspace = checked_project_root(actor, project)
         credentials = connections.provider_credentials(actor)
-        root = self.app.config.get("OPENCODE_STATE_DIR") or os.environ.get("OPENCODE_STATE_DIR")
+        root = self.app.config.get("HX_ENGINE_STATE_DIR") or os.environ.get("HX_ENGINE_STATE_DIR")
         if not root:
-            root = str(Path(self.app.config.get("TEMP_DIR") or Path(__file__).resolve().parents[1] / "temp") / "opencode")
+            root = str(Path(self.app.config.get("TEMP_DIR") or Path(__file__).resolve().parents[1] / "temp") / "hxengine")
         db_key = hashlib.sha256(str(self.app.config["DATABASE"]).encode()).hexdigest()[:12]
         session_key = hashlib.sha256(session["id"].encode()).hexdigest()[:24]
         root = Path(root) / db_key / str(actor.user_id) / session_key
-        origin = self.app.config.get("OPENCODE_BRIDGE_ORIGIN") or os.environ.get(
-            "OPENCODE_BRIDGE_ORIGIN", "http://127.0.0.1:5020")
+        origin = self.app.config.get("HX_ENGINE_BRIDGE_ORIGIN") or os.environ.get(
+            "HX_ENGINE_BRIDGE_ORIGIN", "http://127.0.0.1:5020")
         catalogue_key = hashlib.sha256(dumps([spec.to_dict() for spec in
             self.registry.specs(actor, session["project_id"])]).encode()).hexdigest()
+        demo_root = self.app.config.get("DEMO_WORKSPACE_ROOT")
+        native_allowed = bool(demo_root) and workspace is not None and \
+            Path(demo_root).resolve() == Path(workspace).resolve()
         return self.pool.get(actor, session, credentials, root, origin,
-                             catalogue_key=catalogue_key, workspace=workspace)
+                             catalogue_key=catalogue_key, workspace=workspace, native_allowed=native_allowed)
 
     def handle_message(self, actor, session_id, text, *, resource_refs=None):
         session = sessions.get_session(actor, session_id)
@@ -225,7 +229,7 @@ class OpenCodeRuntime(AgentRuntime):
         pending = actions.list_actions(task_id, [actions.STATUS_PENDING])
         return {"session_id": task["session_id"], "task": tasks.snapshot(task), "status": task["status"],
                 "reply": reply, "action": pending[0] if pending else None, "plan": task.get("plan"),
-                "engine": "opencode", "engine_version": "1.19.4"}
+                "engine": "hxengine", "engine_version": "1.19.4"}
 
     def _run_loop(self, actor, session, project, task, *, resources=None, resume_reason=""):
         resumed = self._resume_automatic_actions(actor, session, project, task)
@@ -249,7 +253,7 @@ class OpenCodeRuntime(AgentRuntime):
             system = system.replace("执行任意代码、Shell、SQL；", "绕过网站业务接口直接修改数据库；")
             system = system.replace('写入、训练、发布、反馈回流、定稿等关键动作由程序生成确认卡片，由用户点击确认；',
                 '训练、发布、反馈回流、定稿等业务动作由程序生成确认卡片；项目文件与命令按当前会话权限模式由程序判定；')
-            system += ("\n你运行于 OpenCode。可以回答普通问题，不能因为旧任务待确认而拒绝聊天。"
+            system += ("\n你运行于 海巡引擎。可以回答普通问题，不能因为旧任务待确认而拒绝聊天。"
                 "使用 haixun MCP 调用网站业务，工具名称前缀由客户端添加。业务写入返回确认卡时尚未执行，"
                 "停止依赖步骤，向用户说明；可继续回答无关问题。用户确认后会收到真实业务结果。"
                 "不要用文件或 Shell 工具修改网站数据库、权重注册或人工确认状态。"
@@ -332,9 +336,9 @@ class OpenCodeRuntime(AgentRuntime):
                 engine.busy = False
                 raise
             tasks.append_event(session["id"], task["id"], tasks.EVENT_PROGRESS,
-                {"engine": "opencode", "version": "1.19.4", "message": "OpenCode 已接收本轮输入"})
+                {"engine": "hxengine", "version": "1.19.4", "message": "海巡引擎 已接收本轮输入"})
             engine.worker = threading.Thread(target=self._watch, args=(engine, actor, generation, before), daemon=True,
-                                             name="haixun-opencode")
+                                             name="haixun-engine")
             engine.worker.start()
             return self._snapshot(task["id"])
 
@@ -362,14 +366,25 @@ class OpenCodeRuntime(AgentRuntime):
         for item in pending:
             if item.get("sessionID") != engine.remote_session:
                 continue
-            if not actor.is_admin:
-                engine.request("POST", f"/permission/{item['id']}/reply", {"reply": "reject"})
-                continue
             decision_key = (mode, hashlib.sha256(dumps(item).encode()).hexdigest())
             decision = engine.permission_decisions.get(decision_key)
             if decision is None:
                 decision = decide(item, engine.workspace, mode)
                 engine.permission_decisions[decision_key] = decision
+            if os.environ.get("HX_DEBUG_PERMISSIONS"):
+                print("PERM", json.dumps({"item": {k: item.get(k) for k in ("permission", "tool", "patterns", "metadata")},
+                                          "decision": decision, "root": str(root), "ws": str(engine.workspace)},
+                                         ensure_ascii=False, default=str)[:1500], flush=True, file=sys.stderr)
+            if not actor.is_admin:
+                # 演示账号：只在演示文件夹范围内自动批准一次，其他目标一律拒绝。
+                confined = (root is not None and root == engine.workspace and bool(decision['targets'])
+                            and all(inside(engine.workspace, path) for path in decision['targets']))
+                engine.request("POST", f"/permission/{item['id']}/reply", {"reply": "once" if confined else "reject"})
+                tasks.append_event(engine.site_session, task_id,
+                                   'permission.demo_approved' if confined else 'permission.demo_rejected',
+                                   {'kind': decision['kind'], 'mode': mode,
+                                    'reason': '演示文件夹内的操作自动批准' if confined else '操作目标不在演示文件夹内'})
+                continue
             automatic = (decision['auto'] and (root is None or root == engine.workspace)
                          and all(inside(engine.workspace, path) for path in decision['targets']))
             existing = engine.native_actions.get(item['id'])
@@ -406,7 +421,7 @@ class OpenCodeRuntime(AgentRuntime):
         with self.app.app_context():
             try:
                 while generation == engine.generation:
-                    actor = load_actor(actor.user_id, source="opencode-worker")
+                    actor = load_actor(actor.user_id, source="hxengine-worker")
                     task = tasks.get_task(actor, task_id)
                     if task["status"] in tasks.TERMINAL_STATUSES:
                         return
@@ -436,7 +451,7 @@ class OpenCodeRuntime(AgentRuntime):
                             return
                         if errors:
                             raise AgentError(Code.MODEL_CALL_FAILED,
-                                "OpenCode 模型调用失败，请核对个人模型连接：" + str(errors[-1])[:250])
+                                "海巡引擎 模型调用失败，请核对个人模型连接：" + str(errors[-1])[:250])
                         current = tasks.get_task(actor, task_id)
                         pending = actions.list_actions(task_id, [actions.STATUS_PENDING])
                         status = (tasks.STATUS_AWAITING_ACTION if pending else current["status"]
@@ -446,19 +461,19 @@ class OpenCodeRuntime(AgentRuntime):
                         memory.refresh(task_id)
                         return
                     # 等待用户权限确认不计入模型执行超时；总确认有效期仍由动作表控制。
-                    if time.monotonic() - started > int(os.environ.get("OPENCODE_TURN_TIMEOUT", "240")):
+                    if time.monotonic() - started > int(os.environ.get("HX_ENGINE_TURN_TIMEOUT", "240")):
                         if actions.list_actions(task_id, [actions.STATUS_PENDING]):
                             started = time.monotonic()
                         else:
                             engine.abort()
                             self._finish_with_summary(actor, sessions.get_session(actor, engine.site_session), task,
-                                "OpenCode 本轮超时，已停止后续调用；已执行的业务请按真实状态核对，不会自动重试。",
+                                "海巡引擎 本轮超时，已停止后续调用；已执行的业务请按真实状态核对，不会自动重试。",
                                 status=tasks.STATUS_INTERRUPTED)
                             return
                     time.sleep(.3)
             except Exception as exc:
                 if generation == engine.generation:
-                    message = exc.message if isinstance(exc, AgentError) else "OpenCode 执行异常，请核对本机服务与连接"
+                    message = exc.message if isinstance(exc, AgentError) else "海巡引擎 执行异常，请核对本机服务与连接"
                     engine.abort()
                     self._finish_with_summary(actor, sessions.get_session(actor, engine.site_session),
                         tasks.get_task(actor, task_id), engine.redact(message), status=tasks.STATUS_FAILED)
@@ -476,7 +491,7 @@ class OpenCodeRuntime(AgentRuntime):
             if identity in engine.seen_parts:
                 continue
             engine.seen_parts.add(identity)
-            payload = engine.redact({"engine": "opencode", "tool": part.get("tool"), "status": status,
+            payload = engine.redact({"engine": "hxengine", "tool": part.get("tool"), "status": status,
                 "tool_part_id": part["id"], "call_id": part.get("callID"),
                 "arguments": state.get("input"), "metadata": state.get("metadata"),
                 "summary": str(state.get("output") or state.get("error") or "")[:1800]})
@@ -514,7 +529,7 @@ class OpenCodeRuntime(AgentRuntime):
         live_credentials = connections.provider_credentials(actor)
         fingerprint = hashlib.sha256(json.dumps(live_credentials.__dict__, sort_keys=True).encode()).hexdigest()
         if not engine or action["tool_version"] != engine.fingerprint[:16] or fingerprint != engine.fingerprint:
-            raise AgentError(Code.ACTION_STALE, "OpenCode 已重启或连接已更改，旧确认不可重放", http_status=409)
+            raise AgentError(Code.ACTION_STALE, "海巡引擎 已重启或连接已更改，旧确认不可重放", http_status=409)
         from agent.project_folders import checked_project_root
         project = permissions.get_project(actor, engine.project_id)
         workspace = checked_project_root(actor, project)

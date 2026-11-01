@@ -1,4 +1,4 @@
-"""仅扩展 OpenCode 的网站工具：打开项目页面、查资源、登记项目内本地文件。"""
+"""仅扩展 海巡引擎 的网站工具：打开项目页面、查资源、登记项目内本地文件。"""
 import hashlib
 from pathlib import Path
 from urllib.parse import quote, urlencode

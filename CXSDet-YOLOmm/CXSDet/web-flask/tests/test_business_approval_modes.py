@@ -1,4 +1,4 @@
-"""Website OpenCode policy with real business services and isolated model doubles."""
+"""Website 海巡引擎 policy with real business services and isolated model doubles."""
 from dataclasses import replace
 
 import pytest
@@ -6,7 +6,7 @@ import pytest
 from agent import actions, sessions, tasks
 from agent.business_approval import automatic_mode
 from agent.llm.provider import ToolCall
-from agent.opencode_runtime import OpenCodeRuntime
+from agent.hx_engine_runtime import HxEngineRuntime
 from agent.runtime import LoopState
 from agent.tools.contract import SOURCE_MCP, ToolSpec, RISK_WRITE
 from tests.test_inspection_loop import setup, start
@@ -21,7 +21,7 @@ def invoke(f, runtime, task, name, arguments):
 def test_three_detections_and_one_batch_ai_do_not_require_clicks(setup,mode):
     f=setup;run=start(f)
     sessions.set_permission_mode(f.actor,f.chat['id'],mode)
-    runtime=OpenCodeRuntime(f.app)
+    runtime=HxEngineRuntime(f.app)
     task=tasks.create_task(f.actor,f.chat['id'],f.project['id'],'检测这3张图片并批量AI核查')
     before={row['id'] for row in f.db.query('SELECT id FROM detection_records')}
     for i in range(3):
@@ -46,7 +46,7 @@ def test_three_detections_and_one_batch_ai_do_not_require_clicks(setup,mode):
 
 
 def test_request_mode_retains_card_and_model_cannot_claim_full_mode(setup):
-    f=setup;run=start(f);runtime=OpenCodeRuntime(f.app)
+    f=setup;run=start(f);runtime=HxEngineRuntime(f.app)
     task=tasks.create_task(f.actor,f.chat['id'],f.project['id'],'核查一条')
     record=run['state']['items'][0]['record_id']
     result=invoke(f,runtime,task,'business_review_ai',{'record_ids':[record]})
@@ -59,7 +59,7 @@ def test_request_mode_retains_card_and_model_cannot_claim_full_mode(setup):
 
 
 def test_full_keeps_delete_and_final_human_decision_cards(setup):
-    f=setup;run=start(f);sessions.set_permission_mode(f.actor,f.chat['id'],'full');runtime=OpenCodeRuntime(f.app)
+    f=setup;run=start(f);sessions.set_permission_mode(f.actor,f.chat['id'],'full');runtime=HxEngineRuntime(f.app)
     record=run['state']['items'][0]['record_id']
     for name,params in [
         ('workspace_delete_records',{'project_id':f.project['id'],'records':[{'record_id':record,'expected_version':0}]}),
@@ -73,7 +73,7 @@ def test_full_keeps_delete_and_final_human_decision_cards(setup):
 
 
 def test_old_pending_ai_card_resumes_by_fresh_policy_without_click(setup):
-    f=setup;run=start(f);runtime=OpenCodeRuntime(f.app)
+    f=setup;run=start(f);runtime=HxEngineRuntime(f.app)
     task=tasks.create_task(f.actor,f.chat['id'],f.project['id'],'继续当前核查')
     invoke(f,runtime,task,'business_review_ai',{'record_ids':[run['state']['items'][0]['record_id']]})
     pending=actions.list_actions(task['id'],[actions.STATUS_PENDING])[0]
@@ -88,7 +88,7 @@ def test_old_pending_ai_card_resumes_by_fresh_policy_without_click(setup):
 
 
 def test_feedback_transfer_is_automatic_but_unconfirmed_samples_stay_blocked(setup):
-    f=setup;run=start(f);sessions.set_permission_mode(f.actor,f.chat['id'],'assist');runtime=OpenCodeRuntime(f.app)
+    f=setup;run=start(f);sessions.set_permission_mode(f.actor,f.chat['id'],'assist');runtime=HxEngineRuntime(f.app)
     record=run['state']['items'][0]['record_id']
     params={'project_id':f.project['id'],'records':[{'record_id':record,'expected_version':0}]}
     task=tasks.create_task(f.actor,f.chat['id'],f.project['id'],'加入反馈')
@@ -102,7 +102,7 @@ def test_feedback_transfer_is_automatic_but_unconfirmed_samples_stay_blocked(set
 
 
 def test_automatic_business_refusal_does_not_leave_action_executing(setup,monkeypatch):
-    f=setup;run=start(f);sessions.set_permission_mode(f.actor,f.chat['id'],'full');runtime=OpenCodeRuntime(f.app)
+    f=setup;run=start(f);sessions.set_permission_mode(f.actor,f.chat['id'],'full');runtime=HxEngineRuntime(f.app)
     task=tasks.create_task(f.actor,f.chat['id'],f.project['id'],'核查明确记录')
     handler=f.backend._handlers()['review.ai']
     monkeypatch.setattr(handler,'execute',lambda *args,**kwargs: (_ for _ in ()).throw(ValueError('业务状态变化，拒绝执行')))

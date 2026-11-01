@@ -55,6 +55,7 @@ pnpm-debug.log*
 # Runtime databases, logs, temporary files, and backups
 .runtime/
 .run/
+.demo-state/
 *.db
 *.db-journal
 *.db-wal
@@ -112,3 +113,6 @@ CXSDet-YOLOmm/4测试包/
 
 .integration-deps/
 .integration-checks/
+*.key
+/文件校验清单.json
+/迁移包信息.json

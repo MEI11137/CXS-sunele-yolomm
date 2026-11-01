@@ -62,3 +62,11 @@ class NativePolicyTest(unittest.TestCase):
         deletion = command_decision("Remove-Item -LiteralPath 'a.png','b.png' -Force -ErrorAction Stop", self.root, 'full')
         self.assertEqual(deletion['targets'], ['a.png', 'b.png'])
         self.assertFalse(deletion['auto'])
+
+    def test_relative_read_targets_use_workspace_not_parent(self):
+        from agent.native_policy import decide, inside
+        decision = decide({'permission': 'read', 'patterns': ['images/a.jpg']}, self.root, 'full')
+        self.assertEqual(decision['targets'], [str(self.root.resolve() / 'images/a.jpg')])
+        self.assertTrue(inside(self.root, decision['targets'][0]))
+        outside = decide({'permission': 'read', 'patterns': ['../private.txt']}, self.root, 'full')
+        self.assertFalse(inside(self.root, outside['targets'][0]))
