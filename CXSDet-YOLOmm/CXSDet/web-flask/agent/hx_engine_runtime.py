@@ -327,6 +327,8 @@ class HxEngineRuntime(AgentRuntime):
                 "界面主题、侧栏、滚动、复制本会话消息和打开设置用workspace_ui；这不是任意脚本执行，也不能点授权或改Key。")
             if resume_reason:
                 prompt += "\n本次续接原因：" + resume_reason
+            engine.turn_notes = []
+            engine.turn_saved = False
             try:
                 before = {item["info"]["id"] for item in engine.request("GET", f"/session/{engine.remote_session}/message")}
                 engine.request("POST", f"/session/{engine.remote_session}/prompt_async", {
@@ -354,6 +356,35 @@ class HxEngineRuntime(AgentRuntime):
             conn.commit()
         finally:
             conn.close()
+        engine.turn_saved = True
+
+    @staticmethod
+    def _rejection_note(item, decision):
+        detail = item.get("patterns") or (item.get("metadata") or {}).get("command") or item.get("tool") or ""
+        if isinstance(detail, list):
+            detail = " ".join(str(part) for part in detail[:3])
+        detail = " ".join(str(detail).split())[:160]
+        reason = decision.get("reason") or "命令不在演示环境允许的只读范围内"
+        if detail:
+            return f"`{item.get('permission')}` 调用：{detail} —— {reason}"
+        return f"`{item.get('permission')}` 调用 —— {reason}"
+
+    def _fallback_reply(self, engine, actor, session, task, notes, errors):
+        """引擎被拒绝或异常收尾且没留下文字时，补一条可以据以继续的说明。"""
+        if notes:
+            text = ("本轮有操作被权限策略拒绝，引擎收到拒绝后提前结束了这一轮，所以没有留下答复。"
+                "被拒绝的调用没有执行，工作区内容没有被改动。\n\n"
+                + "\n".join(f"- {note}" for note in notes[:5])
+                + "\n\n建议改成纯读取的简单命令，例如 "
+                  "`Get-ChildItem -LiteralPath \"<项目目录>\" -Recurse -Filter *.jpg`；"
+                  "需要新建、修改或删除文件时，请说明目标，我会走确认流程。")
+        elif errors:
+            text = "本轮模型调用结束，但没有返回文字答复。引擎报告：" + str(errors[-1])[:300]
+        else:
+            text = ("本轮引擎结束了但没有返回文字答复。可以再说明一次要做什么，我会继续；"
+                "上一轮的工具结果仍在当前上下文里。")
+        self._save_message(engine, task["id"], f"turn-fallback-{int(time.time() * 1000)}", text)
+        tasks.append_event(session["id"], task["id"], tasks.EVENT_ASSISTANT_MESSAGE, {"content": text})
 
     def _permissions(self, engine, actor, task_id):
         from agent.native_policy import decide, inside, MODES
@@ -384,6 +415,11 @@ class HxEngineRuntime(AgentRuntime):
                                    'permission.demo_approved' if confined else 'permission.demo_rejected',
                                    {'kind': decision['kind'], 'mode': mode,
                                     'reason': '演示文件夹内的操作自动批准' if confined else '操作目标不在演示文件夹内'})
+                if not confined:
+                    # 引擎拿到拒绝后会直接结束本轮且不再产出文字，先记下来以便补一条说明。
+                    if not hasattr(engine, "turn_notes"):
+                        engine.turn_notes = []
+                    engine.turn_notes.append(self._rejection_note(item, decision))
                 continue
             automatic = (decision['auto'] and (root is None or root == engine.workspace)
                          and all(inside(engine.workspace, path) for path in decision['targets']))
@@ -418,6 +454,7 @@ class HxEngineRuntime(AgentRuntime):
     def _watch(self, engine, actor, generation, before):
         task_id = engine.task_id
         started = time.monotonic()
+        idle_hits = 0
         with self.app.app_context():
             try:
                 while generation == engine.generation:
@@ -447,19 +484,29 @@ class HxEngineRuntime(AgentRuntime):
                     completed = any(row['info'].get('role') == 'assistant' and
                         (row['info'].get('error') or (row['info'].get('time') or {}).get('completed')) for row in fresh)
                     if completed and not active:
-                        if generation != engine.generation:
+                        # 引擎可能先落工具消息、稍后才写最终文字：连续两次空闲再收尾。
+                        idle_hits += 1
+                        if idle_hits < 2:
+                            pass
+                        else:
+                            if generation != engine.generation:
+                                return
+                            if errors:
+                                raise AgentError(Code.MODEL_CALL_FAILED,
+                                    "海巡引擎 模型调用失败，请核对个人模型连接：" + str(errors[-1])[:250])
+                            if not getattr(engine, "turn_saved", False):
+                                self._fallback_reply(engine, actor, sessions.get_session(actor, engine.site_session),
+                                    tasks.get_task(actor, task_id), getattr(engine, "turn_notes", []), errors)
+                            current = tasks.get_task(actor, task_id)
+                            pending = actions.list_actions(task_id, [actions.STATUS_PENDING])
+                            status = (tasks.STATUS_AWAITING_ACTION if pending else current["status"]
+                                if current["status"] in {tasks.STATUS_UNKNOWN, tasks.STATUS_INTERRUPTED}
+                                else self._decide_final_status(current))
+                            tasks.set_status(task_id, status)
+                            memory.refresh(task_id)
                             return
-                        if errors:
-                            raise AgentError(Code.MODEL_CALL_FAILED,
-                                "海巡引擎 模型调用失败，请核对个人模型连接：" + str(errors[-1])[:250])
-                        current = tasks.get_task(actor, task_id)
-                        pending = actions.list_actions(task_id, [actions.STATUS_PENDING])
-                        status = (tasks.STATUS_AWAITING_ACTION if pending else current["status"]
-                            if current["status"] in {tasks.STATUS_UNKNOWN, tasks.STATUS_INTERRUPTED}
-                            else self._decide_final_status(current))
-                        tasks.set_status(task_id, status)
-                        memory.refresh(task_id)
-                        return
+                    else:
+                        idle_hits = 0
                     # 等待用户权限确认不计入模型执行超时；总确认有效期仍由动作表控制。
                     if time.monotonic() - started > int(os.environ.get("HX_ENGINE_TURN_TIMEOUT", "240")):
                         if actions.list_actions(task_id, [actions.STATUS_PENDING]):

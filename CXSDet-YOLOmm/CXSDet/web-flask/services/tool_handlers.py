@@ -1510,7 +1510,9 @@ def _launch_training(adapter, child, parent_model_id: str) -> None:
     from services.training_runner import run_training_job, set_lock_holder
 
     process = multiprocessing.Process(target=run_training_job, kwargs=payload)
-    process.daemon = True
+    # 不能设为 daemon：Windows 下 ultralytics 的 DataLoader worker 是子进程，
+    # daemonic 进程不允许再创建子进程，会直接报 "daemonic processes are not allowed to have children"。
+    process.daemon = False
     process.start()
     set_lock_holder(adapter.database_path, child.model_id, process.pid)
 
@@ -1895,3 +1897,733 @@ class McpExecute(BaseHandler):
             "effect": result.get("effect") or "unknown",
         }, [{"type": "mcp_connection", "id": arguments["connection_id"],
              "version": "1", "project_id": resource.project_id}]
+
+
+# --------------------------------------------------------------------- 补齐页面能力
+# 2026-11-02：视频检测与实时摄像头刻意不做；其余页面能力全部工具化——
+# 文件登记、记录改名/恢复、图像增强/缺陷分析/改进建议、数据集改名/删除/导出、
+# 模型新建/改名/删除、训练取消。
+
+_LOCAL_FILE_KINDS = {
+    "image": {
+        "bucket": "project_uploads",
+        "suffixes": {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"},
+        "kind": "project_file",
+    },
+    "dataset_archive": {
+        "bucket": "project_uploads",
+        "suffixes": {".zip"},
+        "kind": "dataset_archive",
+    },
+    "model_weight": {
+        "bucket": "project_uploads",
+        "suffixes": {".pt"},
+        "kind": "model_weight",
+    },
+    "document": {
+        "bucket": "project_uploads",
+        "suffixes": {".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".pdf", ".docx"},
+        "kind": "document",
+    },
+}
+_LOCAL_FILE_LIMIT = 256 * 1024 * 1024
+_MIME_TYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".webp": "image/webp", ".bmp": "image/bmp", ".tif": "image/tiff",
+    ".tiff": "image/tiff", ".zip": "application/zip", ".pt": "application/octet-stream",
+    ".pdf": "application/pdf", ".md": "text/markdown", ".txt": "text/plain",
+    ".json": "application/json", ".yaml": "application/yaml", ".yml": "application/yaml",
+    ".csv": "text/csv",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _now_iso() -> str:
+    from datetime import datetime
+
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _resource_revision(adapter, kind: str, resource_id: str) -> int:
+    conn = adapter.connect()
+    try:
+        row = conn.execute(
+            "SELECT revision FROM agent_resource WHERE kind=? AND source_id=? "
+            "AND deleted_at IS NULL ORDER BY revision DESC LIMIT 1",
+            (kind, resource_id),
+        ).fetchone()
+    finally:
+        conn.close()
+    return int(row["revision"]) if row is not None else 0
+
+
+def _project_root(adapter, project_id: str) -> Path | None:
+    conn = adapter.connect()
+    try:
+        row = conn.execute("SELECT root_directory FROM agent_project WHERE id=?",
+                           (project_id,)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    root = row["root_directory"] if not isinstance(row, tuple) else row[0]
+    return Path(root).resolve() if root else None
+
+
+def _register_local_asset(adapter, principal: int, project_id: str, path: Path, kind: str) -> dict:
+    from services.file_access import FileAccess
+
+    policy = _LOCAL_FILE_KINDS[kind]
+    saved = adapter.storage_client.upload(policy["bucket"], str(path))
+    size = path.stat().st_size
+    access = FileAccess(adapter.database_path)
+    asset_id = access.register_upload(
+        principal, saved["bucket"], saved["objectKey"], policy["kind"],
+        _MIME_TYPES.get(path.suffix.lower(), "application/octet-stream"), size, None,
+        original_name=path.name, sha256=_sha256_file(path), status="uploaded",
+    )
+    conn = adapter.connect()
+    try:
+        conn.execute("UPDATE file_assets SET project_id=? WHERE id=?", (project_id, asset_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "asset_id": asset_id,
+        "bucket": saved["bucket"],
+        "object_key": saved["objectKey"],
+        "kind": policy["kind"],
+        "size": size,
+        "url": saved.get("url"),
+    }
+
+
+def _record_image_bytes(adapter, row: dict) -> bytes:
+    bucket, key = row.get("original_image_bucket"), row.get("original_image_object_key")
+    if not bucket or not key:
+        raise ToolRefused("IMAGE_MISSING", "这条记录没有原图")
+    path = Path(adapter.file_assets.materialize(bucket, key))
+    return path.read_bytes()
+
+
+def _record_class_names(adapter, row: dict) -> list:
+    model_id = row.get("model_id")
+    if not model_id:
+        return []
+    try:
+        model = adapter._model_row(model_id)
+        dataset = adapter._dataset_row(model.get("dataset_id") or "")
+    except (FileNotFoundError, ValueError):
+        return []
+    return _class_names(dataset.get("structure_info")) or []
+
+
+def _review_client(adapter):
+    if callable(adapter.review_client_factory):
+        return adapter.review_client_factory()
+    if callable(adapter.model_client_factory):
+        client = adapter.model_client_factory()
+        if hasattr(client, "review_detection_structured"):
+            return client
+        from services.personal_review_client import PersonalReviewClient
+
+        return PersonalReviewClient(client)
+    raise ToolRefused("MODEL_NOT_CONFIGURED", "当前用户还没有可用的视觉大模型连接")
+
+
+@handler("file.register_local")
+class FileRegisterLocal(BaseHandler):
+    def prepare(self, adapter, principal, arguments):
+        spec = _spec("file.register_local")
+        resource = adapter._project_resource(principal, arguments["project_id"], spec)
+        kind = arguments["kind"]
+        policy = _LOCAL_FILE_KINDS[kind]
+        raw = str(arguments["path"]).strip()
+        root = _project_root(adapter, resource.id)
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute() and root is not None:
+            candidate = root / candidate
+        blockers = []
+        size = 0
+        try:
+            path = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            path = None
+            blockers.append({"code": "PATH_NOT_FOUND", "message": "这个路径不存在或无法访问"})
+        if path is not None:
+            if not path.is_file():
+                blockers.append({"code": "NOT_A_FILE", "message": "只支持单个文件，不支持目录"})
+            else:
+                size = path.stat().st_size
+                if size > _LOCAL_FILE_LIMIT:
+                    blockers.append({"code": "FILE_TOO_LARGE", "message": "文件超过 256 MB 上限"})
+            suffix = path.suffix.lower()
+            if suffix not in policy["suffixes"]:
+                blockers.append({
+                    "code": "SUFFIX_NOT_ALLOWED",
+                    "message": f"{kind} 不接受 {suffix or '无后缀'} 文件；视频不支持，"
+                               f"只收图片 / 数据集 zip / .pt 权重 / 文档",
+                })
+            if root is None:
+                blockers.append({"code": "NO_WORKSPACE", "message": "项目还没有设置工作区目录"})
+            elif root not in path.parents:
+                blockers.append({
+                    "code": "OUTSIDE_WORKSPACE",
+                    "message": f"文件必须放在项目工作区 {root} 里面",
+                })
+        preview = {
+            "effect": "write",
+            "kind": kind,
+            "path": str(path or candidate),
+            "original_name": Path(raw).name,
+            "size": size,
+            "bucket": policy["bucket"],
+            "blocked": bool(blockers),
+            "blocked_reasons": blockers,
+            "impact": "只把文件复制一份到文件服务并登记，原文件不被修改或删除",
+        }
+        return resource, preview
+
+    def execute(self, adapter, principal, arguments, preview, resource):
+        if preview.get("blocked"):
+            raise ToolRefused("FILE_NOT_ACCEPTED", "这个文件不能登记", preview.get("blocked_reasons"))
+        if adapter.storage_client is None:
+            raise ValueError("A protected storage adapter is required")
+        outputs = _register_local_asset(adapter, principal, resource.id,
+                                        Path(preview["path"]), preview["kind"])
+        outputs["project_id"] = resource.id
+        return outputs, [{"type": "file", "id": outputs["asset_id"], "version": "1",
+                          "project_id": resource.id}]
+
+
+@handler("record.update")
+class RecordUpdate(BaseHandler):
+    def prepare(self, adapter, principal, arguments):
+        resource = adapter._resource(principal, arguments["record_id"], _spec("record.update"))
+        row = adapter._read_record(resource.id)
+        if row.get("user_id") != principal:
+            raise ToolRefused("RECORD_NOT_YOURS", "只能修改自己创建的识别记录")
+        return resource, {
+            "effect": "write",
+            "record_id": resource.id,
+            "current_title": row.get("title"),
+            "title": str(arguments["title"]).strip(),
+            "description": str(arguments.get("description") or "").strip(),
+            "impact": "只改标题和说明，检测结果、图片和审计记录都不动",
+        }
+
+    def execute(self, adapter, principal, arguments, preview, resource):
+        row = adapter._read_record(resource.id)
+        version = int(row.get("review_version") or 0) + 1
+        conn = adapter.connect()
+        try:
+            conn.execute(
+                "UPDATE detection_records SET title=?, description=?, review_version=? "
+                "WHERE id=? AND user_id=?",
+                (preview["title"], preview["description"], version, resource.id, principal),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return {"record_id": resource.id, "title": preview["title"], "review_version": version}, [
+            {"type": "record", "id": resource.id, "version": str(version),
+             "project_id": resource.project_id},
+        ]
+
+
+@handler("record.restore")
+class RecordRestore(BaseHandler):
+    def prepare(self, adapter, principal, arguments):
+        resource = adapter._resource(principal, arguments["record_id"], _spec("record.restore"))
+        row = adapter._read_record(resource.id)
+        if row.get("user_id") != principal:
+            raise ToolRefused("RECORD_NOT_YOURS", "只能恢复自己创建的识别记录")
+        if row.get("record_status") != "deleted":
+            raise ToolRefused("RECORD_NOT_DELETED", "这条记录不在回收站里")
+        return resource, {
+            "effect": "write",
+            "record_id": resource.id,
+            "title": row.get("title"),
+            "expected_version": arguments.get("expected_version"),
+            "impact": "记录从回收站回到列表，原图与审计记录不变",
+        }
+
+    def execute(self, adapter, principal, arguments, preview, resource):
+        from services.record_lifecycle import set_deleted
+
+        result = set_deleted(adapter.database(), resource.id, principal,
+                             preview.get("expected_version"), deleted=False)
+        return result, [{"type": "record", "id": resource.id,
+                         "version": str(result["review_version"]),
+                         "project_id": resource.project_id}]
+
+
+@handler("detection.enhance_image")
+class DetectionEnhanceImage(BaseHandler):
+    def prepare(self, adapter, principal, arguments):
+        resource = adapter._resource(principal, arguments["record_id"],
+                                     _spec("detection.enhance_image"))
+        row = adapter._read_record(resource.id)
+        if not row.get("original_image_bucket") or not row.get("original_image_object_key"):
+            raise ToolRefused("IMAGE_MISSING", "这条记录没有原图，无法增强")
+        return resource, {
+            "effect": "write",
+            "record_id": resource.id,
+            "source": {"bucket": row["original_image_bucket"],
+                       "object_key": row["original_image_object_key"]},
+            "impact": "生成一张新的增强图并挂到记录上，原图保持不变",
+        }
+
+    def execute(self, adapter, principal, arguments, preview, resource):
+        import cv2
+
+        from services.file_access import FileAccess
+
+        row = adapter._read_record(resource.id)
+        path = Path(adapter.file_assets.materialize(row["original_image_bucket"],
+                                                    row["original_image_object_key"]))
+        image = cv2.imread(str(path))
+        if image is None:
+            raise ToolRefused("IMAGE_UNREADABLE", "图片无法读取")
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab)
+        l_channel = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(l_channel)
+        merged = cv2.cvtColor(cv2.merge((l_channel, a_channel, b_channel)), cv2.COLOR_LAB2BGR)
+        enhanced = cv2.convertScaleAbs(merged, alpha=1.2, beta=10)
+        target = _work_dir(adapter, "enhance") / f"enhanced-{resource.id}.jpg"
+        cv2.imwrite(str(target), enhanced)
+        saved = adapter.storage_client.upload("detection_enhanced", str(target))
+        access = FileAccess(adapter.database_path)
+        asset_id = access.register_upload(
+            principal, saved["bucket"], saved["objectKey"], "enhanced_image",
+            "image/jpeg", target.stat().st_size, resource.project_id,
+        )
+        conn = adapter.connect()
+        try:
+            conn.execute(
+                "UPDATE detection_records SET enhanced_image_bucket=?, "
+                "enhanced_image_object_key=? WHERE id=?",
+                (saved["bucket"], saved["objectKey"], resource.id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return {
+            "record_id": resource.id,
+            "asset_id": asset_id,
+            "bucket": saved["bucket"],
+            "object_key": saved["objectKey"],
+        }, [{"type": "record", "id": resource.id, "version": "0",
+             "project_id": resource.project_id}]
+
+
+@handler("detection.analyze_defects")
+class DetectionAnalyzeDefects(BaseHandler):
+    def prepare(self, adapter, principal, arguments):
+        resource = adapter._resource(principal, arguments["record_id"],
+                                     _spec("detection.analyze_defects"))
+        adapter._read_record(resource.id)
+        return resource, {
+            "effect": "read",
+            "record_id": resource.id,
+            "impact": "调用一次当前用户配置的视觉大模型",
+        }
+
+    def execute(self, adapter, principal, arguments, preview, resource):
+        client = _review_client(adapter)
+        row = adapter._read_record(resource.id)
+        detections = _json_list(row.get("detection_result"))
+        result = client.review_detection_structured(
+            _record_image_bytes(adapter, row), detections,
+            class_names=_record_class_names(adapter, row) or None,
+        )
+        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        conn = adapter.connect()
+        try:
+            conn.execute("UPDATE detection_records SET analysis_result=? WHERE id=?",
+                         (text, resource.id))
+            conn.commit()
+        finally:
+            conn.close()
+        return {"record_id": resource.id, "analysis": result}, [
+            {"type": "record", "id": resource.id, "version": "0",
+             "project_id": resource.project_id},
+        ]
+
+
+@handler("detection.suggest")
+class DetectionSuggest(BaseHandler):
+    def prepare(self, adapter, principal, arguments):
+        resource = adapter._resource(principal, arguments["record_id"],
+                                     _spec("detection.suggest"))
+        adapter._read_record(resource.id)
+        return resource, {
+            "effect": "read",
+            "record_id": resource.id,
+            "impact": "基于一次缺陷分析生成改进建议",
+        }
+
+    def execute(self, adapter, principal, arguments, preview, resource):
+        row = adapter._read_record(resource.id)
+        analysis = _json_obj(row.get("analysis_result"))
+        if not analysis:
+            client = _review_client(adapter)
+            detections = _json_list(row.get("detection_result"))
+            analysis = client.review_detection_structured(
+                _record_image_bytes(adapter, row), detections,
+                class_names=_record_class_names(adapter, row) or None,
+            )
+        suggestions = None
+        try:
+            from algo.llm.llm_vl_client import LLMVLClient
+
+            suggestions = LLMVLClient().generate_improvement_suggestions(
+                analysis if isinstance(analysis, dict) else {"raw": analysis}
+            )
+        except Exception:  # noqa: BLE001 - 全局大模型未配置时退化为结构化摘要
+            suggestions = {
+                "summary": "按当前缺陷分析整理出的人工复核要点",
+                "analysis": analysis,
+            }
+        text = json.dumps(suggestions, ensure_ascii=False)
+        conn = adapter.connect()
+        try:
+            conn.execute("UPDATE detection_records SET suggestions=? WHERE id=?",
+                         (text, resource.id))
+            conn.commit()
+        finally:
+            conn.close()
+        return {"record_id": resource.id, "suggestions": suggestions}, [
+            {"type": "record", "id": resource.id, "version": "0",
+             "project_id": resource.project_id},
+        ]
+
+
+@handler("dataset.update")
+class DatasetUpdate(BaseHandler):
+    def prepare(self, adapter, principal, arguments):
+        resource = adapter._resource(principal, arguments["dataset_id"], _spec("dataset.update"))
+        row = adapter._read_dataset(resource.id)
+        name = str(arguments.get("name") or row["name"]).strip()
+        if not name:
+            raise ToolRefused("NAME_REQUIRED", "数据集名称不能为空")
+        conn = adapter.connect()
+        try:
+            clash = conn.execute(
+                "SELECT id FROM datasets WHERE name=? AND id<>?", (name, resource.id),
+            ).fetchone()
+        finally:
+            conn.close()
+        if clash:
+            raise ToolRefused("NAME_CONFLICT", "已存在同名数据集")
+        return resource, {
+            "effect": "write",
+            "dataset_id": resource.id,
+            "name": name,
+            "description": str(arguments.get("description") or "").strip(),
+            "previous_name": row["name"],
+            "impact": "只改名称和说明，样本与拆分不变",
+        }
+
+    def execute(self, adapter, principal, arguments, preview, resource):
+        conn = adapter.connect()
+        try:
+            conn.execute("UPDATE datasets SET name=?, description=? WHERE id=?",
+                         (preview["name"], preview["description"], resource.id))
+            conn.commit()
+        finally:
+            conn.close()
+        return {"dataset_id": resource.id, "name": preview["name"]}, [
+            {"type": "dataset", "id": resource.id, "version": "1",
+             "project_id": resource.project_id},
+        ]
+
+
+@handler("dataset.delete")
+class DatasetDelete(BaseHandler):
+    def prepare(self, adapter, principal, arguments):
+        resource = adapter._resource(principal, arguments["dataset_id"], _spec("dataset.delete"))
+        row = adapter._read_dataset(resource.id)
+        expected = arguments.get("expected_revision")
+        return resource, {
+            "effect": "write",
+            "dataset_id": resource.id,
+            "name": row["name"],
+            "expected_revision": _resource_revision(adapter, "dataset", resource.id)
+            if expected is None else expected,
+            "impact": "数据集进入回收站，压缩包保留在磁盘上，可恢复",
+        }
+
+    def execute(self, adapter, principal, arguments, preview, resource):
+        from agent.identity import load_actor
+        from agent.store import new_id
+        from services.resource_lifecycle import change
+
+        result = change(
+            load_actor(principal), resource.project_id, "dataset", resource.id, "delete",
+            preview["expected_revision"], request_key=new_id("manual_resource"),
+        )
+        return result, [{"type": "dataset", "id": resource.id,
+                         "version": str(result.get("revision", "")),
+                         "project_id": resource.project_id}]
+
+
+@handler("dataset.export_zip")
+class DatasetExportZip(BaseHandler):
+    def prepare(self, adapter, principal, arguments):
+        resource = adapter._resource(principal, arguments["dataset_id"],
+                                     _spec("dataset.export_zip"))
+        row = adapter._dataset_row(resource.id)
+        if not row.get("zip_bucket") or not row.get("zip_object_key"):
+            raise ToolRefused("ARCHIVE_MISSING", "这个数据集没有上传包，无法导出")
+        return resource, {
+            "effect": "read",
+            "dataset_id": resource.id,
+            "name": row["name"],
+            "size": row.get("file_size"),
+        }
+
+    def execute(self, adapter, principal, arguments, preview, resource):
+        # FileClient.get() 返回的是字节流，导出要的是落盘文件：直接用 download 写到工作目录。
+        row = adapter._dataset_row(resource.id)
+        target = _work_dir(adapter, "export") / f"{row['name']}.zip"
+        adapter.storage_client.download(row["zip_bucket"], row["zip_object_key"], str(target))
+        return {"dataset_id": resource.id, "path": str(target),
+                "size": target.stat().st_size}, []
+
+
+@handler("model.create")
+class ModelCreate(BaseHandler):
+    def prepare(self, adapter, principal, arguments):
+        spec = _spec("model.create")
+        resource = adapter._resource(principal, arguments["dataset_id"], spec)
+        dataset = adapter._read_dataset(resource.id)
+        if int(dataset.get("status") or 0) != 1:
+            raise ToolRefused("DATASET_NOT_READY", "数据集还没完成拆分，不能训练")
+        name = str(arguments["name"]).strip()
+        if not name:
+            raise ToolRefused("NAME_REQUIRED", "模型名称不能为空")
+        conn = adapter.connect()
+        try:
+            clash = conn.execute("SELECT id FROM models WHERE name=?", (name,)).fetchone()
+        finally:
+            conn.close()
+        if clash:
+            raise ToolRefused("NAME_CONFLICT", "已存在同名模型")
+        return resource, {
+            "effect": "write",
+            "dataset_id": resource.id,
+            "dataset_name": dataset.get("name"),
+            "name": name,
+            "base_model": str(arguments.get("base_model") or "yolo11n.pt"),
+            "epochs": int(arguments.get("epochs") or 100),
+            "batch_size": int(arguments.get("batch_size") or 8),
+            "dataset_mode": dataset.get("dataset_mode"),
+            "impact": "占用本机唯一训练槽位，跑到结束或手动停止为止",
+        }
+
+    def execute(self, adapter, principal, arguments, preview, resource):
+        import multiprocessing
+
+        from config import TEMP_DIR
+        from services.project_storage import current_scope
+        from services.training_runner import (acquire_training_lock, run_training_job,
+                                              set_lock_holder)
+        from services.training_service import MULTIMODAL_BASELINE_YAML
+
+        dataset = adapter._read_dataset(resource.id)
+        multimodal = dataset.get("dataset_mode") == "multimodal"
+        model_id = str(uuid.uuid4())
+        epochs = int(preview["epochs"])
+        batch_size = int(preview["batch_size"])
+        base_model = str(preview["base_model"])
+        now = _now_iso()
+        conn = adapter.connect()
+        try:
+            conn.execute(
+                "INSERT INTO models (id, name, description, dataset_id, base_model, epochs, "
+                "batch_size, status, model_mode, primary_modality, secondary_modality, "
+                "model_yaml, version, create_time, start_time) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (model_id, preview["name"].strip(), "", resource.id, base_model,
+                 epochs, batch_size, 0, "multimodal" if multimodal else "single",
+                 dataset.get("primary_modality"), dataset.get("secondary_modality"),
+                 str(MULTIMODAL_BASELINE_YAML) if multimodal else "", 1, now, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        acquire_training_lock(adapter.database_path, model_id)
+        storage_path = getattr(adapter.storage_client, "base_path", None)
+        scope = current_scope()
+        payload = {
+            "model_id": model_id,
+            "dataset_id": resource.id,
+            "base_model": base_model,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "parent_model_id": None,
+            "database_path": adapter.database_path,
+            "file_store_path": str(storage_path) if storage_path else None,
+            "temp_root": str(adapter.work_dir or TEMP_DIR),
+            "project_id": scope[1] if scope else resource.project_id,
+        }
+        if callable(adapter.training_launcher):
+            adapter.training_launcher(**payload)
+        else:
+            process = multiprocessing.Process(target=run_training_job, kwargs=payload)
+            process.daemon = False
+            process.start()
+            set_lock_holder(adapter.database_path, model_id, process.pid)
+
+        from agent import resources
+
+        try:
+            resources.ensure("models", model_id, project_id=resource.project_id)
+        except Exception:  # noqa: BLE001 - 登记失败不影响训练，下次启动会补
+            pass
+        return {
+            "model_id": model_id,
+            "name": preview["name"],
+            "status": "training",
+        }, [{"type": "model", "id": model_id, "version": "1",
+             "project_id": resource.project_id}]
+
+
+@handler("model.update")
+class ModelUpdate(BaseHandler):
+    def prepare(self, adapter, principal, arguments):
+        resource = adapter._resource(principal, arguments["model_id"], _spec("model.update"))
+        row = adapter._model_row(resource.id)
+        name = str(arguments.get("name") or row["name"]).strip()
+        if not name:
+            raise ToolRefused("NAME_REQUIRED", "模型名称不能为空")
+        conn = adapter.connect()
+        try:
+            clash = conn.execute("SELECT id FROM models WHERE name=? AND id<>?",
+                                 (name, resource.id)).fetchone()
+        finally:
+            conn.close()
+        if clash:
+            raise ToolRefused("NAME_CONFLICT", "已存在同名模型")
+        return resource, {
+            "effect": "write",
+            "model_id": resource.id,
+            "name": name,
+            "description": str(arguments.get("description") or "").strip(),
+            "previous_name": row["name"],
+            "impact": "只改名称和说明，权重与指标不变",
+        }
+
+    def execute(self, adapter, principal, arguments, preview, resource):
+        conn = adapter.connect()
+        try:
+            conn.execute("UPDATE models SET name=?, description=? WHERE id=?",
+                         (preview["name"], preview["description"], resource.id))
+            conn.commit()
+        finally:
+            conn.close()
+        return {"model_id": resource.id, "name": preview["name"]}, [
+            {"type": "model", "id": resource.id, "version": str(resource.version),
+             "project_id": resource.project_id},
+        ]
+
+
+@handler("model.delete")
+class ModelDelete(BaseHandler):
+    def prepare(self, adapter, principal, arguments):
+        resource = adapter._resource(principal, arguments["model_id"], _spec("model.delete"))
+        row = adapter._model_row(resource.id)
+        if int(row.get("status") or 0) == 0:
+            raise ToolRefused("MODEL_TRAINING", "模型还在训练，请先取消训练再删除")
+        expected = arguments.get("expected_revision")
+        return resource, {
+            "effect": "write",
+            "model_id": resource.id,
+            "name": row["name"],
+            "expected_revision": _resource_revision(adapter, "model", resource.id)
+            if expected is None else expected,
+            "impact": "模型进入回收站，权重文件保留，可恢复",
+        }
+
+    def execute(self, adapter, principal, arguments, preview, resource):
+        from agent.identity import load_actor
+        from agent.store import new_id
+        from services.resource_lifecycle import change
+
+        result = change(
+            load_actor(principal), resource.project_id, "model", resource.id, "delete",
+            preview["expected_revision"], request_key=new_id("manual_resource"),
+        )
+        return result, [{"type": "model", "id": resource.id,
+                         "version": str(result.get("revision", "")),
+                         "project_id": resource.project_id}]
+
+
+@handler("training.cancel")
+class TrainingCancel(BaseHandler):
+    def prepare(self, adapter, principal, arguments):
+        resource = adapter._resource(principal, arguments["model_id"],
+                                     _spec("training.cancel"))
+        row = adapter._model_row(resource.id)
+        if int(row.get("status") or 0) != 0:
+            raise ToolRefused("TRAINING_NOT_RUNNING", "这个模型当前没有在训练")
+        return resource, {
+            "effect": "write",
+            "model_id": resource.id,
+            "name": row["name"],
+            "reason": str(arguments.get("reason") or "用户取消").strip(),
+            "impact": "结束训练进程并把模型标记为已终止；已产出的中间文件保留",
+        }
+
+    def execute(self, adapter, principal, arguments, preview, resource):
+        import signal
+
+        from services.training_runner import (read_lock, release_training_lock,
+                                              _process_alive)
+
+        lock = read_lock(adapter.database_path)
+        killed = False
+        if lock and str(lock.get("owner")) == resource.id:
+            pid = int(lock.get("holder_pid") or 0)
+            if pid and _process_alive(pid, lock.get("holder_started")):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    killed = True
+                except OSError:
+                    killed = False
+        result = {
+            "canceled_by_user": True,
+            "reason": preview["reason"],
+            "canceled_at": _now_iso(),
+        }
+        conn = adapter.connect()
+        try:
+            conn.execute(
+                "UPDATE models SET status=4, train_result=?, complete_time=? "
+                "WHERE id=? AND status=0",
+                (json.dumps(result, ensure_ascii=False), _now_iso(), resource.id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        release_training_lock(adapter.database_path, resource.id)
+        return {
+            "model_id": resource.id,
+            "canceled": True,
+            "process_terminated": killed,
+            "train_result": result,
+            "status": "cancelled",
+        }, [{"type": "model", "id": resource.id, "version": str(resource.version),
+             "project_id": resource.project_id}]

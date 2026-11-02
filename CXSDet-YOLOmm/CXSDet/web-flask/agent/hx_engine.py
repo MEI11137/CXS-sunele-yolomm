@@ -50,9 +50,40 @@ def binary_path():
     return str(Path(value).resolve())
 
 
+_MCP_PYTHON = []
+
+
+def mcp_python():
+    """业务工具桥需要带 mcp 包的解释器。
+
+    演示网关常由系统 Python 启动（sys.executable 可能是没有 mcp 的环境），
+    此时 MCP 子进程一启动就因 ModuleNotFoundError 退出，模型便只剩 shell 工具。
+    这里按“环境变量 → 当前解释器 → 项目 .venv”的顺序探测，取第一个真能 import mcp 的。
+    """
+    if _MCP_PYTHON:
+        return _MCP_PYTHON[0]
+    base = Path(__file__).resolve().parents[4]
+    candidates = [os.environ.get("HAIXUN_MCP_PYTHON", ""), sys.executable,
+                  str(base / ".venv" / "Scripts" / "python.exe"), str(base / ".venv" / "bin" / "python")]
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    for candidate in candidates:
+        if not candidate or not Path(candidate).is_file():
+            continue
+        try:
+            probe = subprocess.run([candidate, "-c", "import mcp"], capture_output=True, timeout=30, creationflags=flags)
+        except Exception:
+            continue
+        if probe.returncode == 0:
+            _MCP_PYTHON.append(candidate)
+            return candidate
+    _MCP_PYTHON.append(sys.executable)
+    return sys.executable
+
+
 class HxEngine:
     def __init__(self, actor, session, credentials, root, origin, *, workspace=None, native_allowed=False):
         self.owner_id = actor.user_id
+        self.actor = actor
         self.site_session = session["id"]
         self.project_id = session["project_id"]
         self.credentials = credentials
@@ -90,8 +121,22 @@ class HxEngine:
         from agent.guard import redact
         return redact(value)
 
+    def vision_supported(self):
+        """个人连接实测支持视觉时才向引擎声明图片输入，避免给纯文本模型发图。"""
+        try:
+            from agent import connections
+            entry = (connections.capabilities(self.actor) or {}).get("vision") or {}
+            return entry.get("status") == "ok"
+        except Exception:
+            return False
+
     def configuration(self):
         from agent.native_policy import powershell_binary
+        model_entry = {"name": self.credentials.model,
+            "limit": {"context": 64000, "output": 8192}}
+        if self.vision_supported():
+            model_entry["attachment"] = True
+            model_entry["modalities"] = {"input": ["text", "image"], "output": ["text"]}
         # 命令拥有操作系统账号权限：仅本机管理员可以逐次确认，普通用户不能启用。
         permissions = {"*": "deny", "haixun_*": "allow", "read": "allow",
             "glob": "allow", "grep": "allow", "list": "allow", "external_directory": "deny",
@@ -105,11 +150,10 @@ class HxEngine:
             "small_model": "haixun/" + self.credentials.model,
             "provider": {"haixun": {"npm": "@ai-sdk/openai-compatible", "name": "本人模型连接",
                 "options": {"baseURL": self.credentials.api_url.rstrip("/"), "apiKey": self.credentials.api_key},
-                "models": {self.credentials.model: {"name": self.credentials.model,
-                    "limit": {"context": 64000, "output": 8192}}}}},
+                "models": {self.credentials.model: model_entry}}},
             "permission": permissions,
             "agent": {"build": {"steps": 32}},
-            "mcp": {"haixun": {"type": "local", "command": [sys.executable,
+            "mcp": {"haixun": {"type": "local", "command": [mcp_python(),
                 str(Path(__file__).with_name("hx_engine_mcp.py"))],
                 "environment": {"HAIXUN_BRIDGE_ORIGIN": self.origin,
                                 "HAIXUN_BRIDGE_TOKEN": self.token}, "enabled": True}}}

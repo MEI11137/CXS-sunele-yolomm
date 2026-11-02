@@ -169,7 +169,8 @@ def run_training_job(
     try:
         with resource_scope(database_path, 'models', model_id, project_id):
             return _run_training_job(model_id, dataset_id, base_model, epochs, batch_size,
-                                     parent_model_id, database_path, file_store_path, temp_root)
+                                     parent_model_id, database_path, file_store_path, temp_root,
+                                     project_id)
     except (OSError, ValueError) as exc:
         from utils.db import Database
         Database(database_path).execute('UPDATE models SET status=?,complete_time=?,train_result=? WHERE id=?',
@@ -181,7 +182,7 @@ def run_training_job(
 
 def _run_training_job(
     model_id, dataset_id, base_model, epochs, batch_size, parent_model_id,
-    database_path, file_store_path, temp_root,
+    database_path, file_store_path, temp_root, project_id=None,
 ) -> dict:
     """Execute one run for an already registered model row.
 
@@ -279,6 +280,14 @@ def _run_training_job(
         )
         outcome["status"] = "completed"
         outcome["metrics"] = training_result.metrics
+        # 训练产出的子模型必须登记到“发起训练的这个项目”。不登记的话，只有下次
+        # 启动时的历史资源迁移会把它塞进管理员的历史项目，Agent 的 model.get_state /
+        # training.get_state 就查不到（表现为“资源不存在或未登记授权”）。
+        try:
+            from agent import resources
+            resources.ensure("models", model_id, project_id=project_id)
+        except Exception:
+            pass
         if current_scope():
             (Path(output_dir) / 'metrics.json').write_text(json.dumps(training_result.metrics, ensure_ascii=False, indent=2), encoding='utf-8')
     except Exception as exc:

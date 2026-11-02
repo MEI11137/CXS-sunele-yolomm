@@ -870,6 +870,271 @@ _SPECS: list[ToolSpec] = [
         resource_actions=("mcp:execute",),
         deps=(("mcp_store", "requires the MCP connection store"),),
     ),
+    # ------------------------------------------------------- 文件与记录（补齐页面能力）
+    _tool(
+        "file.register_local",
+        "Register one file that already sits inside the project workspace, so that "
+        "dataset import, weight import or detection can use it. Videos are refused; "
+        "images, dataset zips, .pt weights and documents are accepted.",
+        _object(
+            {
+                "project_id": {"type": "string", "minLength": 1},
+                "path": {"type": "string", "minLength": 1, "maxLength": 500},
+                "kind": {
+                    "type": "string",
+                    "enum": ["image", "dataset_archive", "model_weight", "document"],
+                },
+                "name": {"type": "string", "maxLength": 200},
+            },
+            ["project_id", "path", "kind"],
+        ),
+        {
+            "asset_id": {"type": "string"},
+            "bucket": {"type": "string"},
+            "object_key": {"type": "string"},
+            "kind": {"type": "string"},
+            "size": {"type": "integer"},
+        },
+        kind="project",
+        id_field="project_id",
+        resource_actions=("file:create",),
+        deps=_FILE_DEPS,
+    ),
+    _tool(
+        "record.update",
+        "Rename one detection record or change its description.",
+        _object(
+            {
+                "record_id": {"type": "string", "minLength": 1},
+                "title": {"type": "string", "minLength": 1, "maxLength": 200},
+                "description": {"type": "string", "maxLength": 2000},
+            },
+            ["record_id", "title"],
+        ),
+        {
+            "record_id": {"type": "string"},
+            "title": {"type": "string"},
+            "review_version": {"type": "integer"},
+        },
+        kind="record",
+        id_field="record_id",
+        resource_actions=("detection:review",),
+    ),
+    _tool(
+        "record.restore",
+        "Bring one detection record back from the recycle bin.",
+        _object(
+            {
+                "record_id": {"type": "string", "minLength": 1},
+                "expected_version": {"type": "integer", "minimum": 0},
+            },
+            ["record_id"],
+        ),
+        {
+            "record_id": {"type": "string"},
+            "record_status": {"type": "string"},
+            "review_version": {"type": "integer"},
+        },
+        kind="record",
+        id_field="record_id",
+        resource_actions=("detection:review",),
+    ),
+    _tool(
+        "detection.enhance_image",
+        "Improve the contrast of one detection record's image (CLAHE + mild "
+        "sharpening) and keep the result as a new image asset. The original record "
+        "and its image are untouched.",
+        _object({"record_id": {"type": "string", "minLength": 1}}, ["record_id"]),
+        {
+            "record_id": {"type": "string"},
+            "asset_id": {"type": "string"},
+            "bucket": {"type": "string"},
+            "object_key": {"type": "string"},
+        },
+        preview=False,
+        cancel=False,
+        kind="record",
+        id_field="record_id",
+        resource_actions=("detection:review",),
+        deps=_FILE_DEPS,
+    ),
+    _tool(
+        "detection.analyze_defects",
+        "Ask the multimodal model to analyse one detection record's defects and "
+        "return a structured defect report.",
+        _object({"record_id": {"type": "string", "minLength": 1}}, ["record_id"]),
+        {
+            "record_id": {"type": "string"},
+            "analysis": {"type": "object"},
+        },
+        effect="read",
+        preview=False,
+        cancel=False,
+        status=False,
+        kind="record",
+        id_field="record_id",
+        resource_actions=("detection:review",),
+        deps=_MODEL_DEPS,
+    ),
+    _tool(
+        "detection.suggest",
+        "Produce improvement suggestions for one detection record based on a fresh "
+        "defect analysis.",
+        _object({"record_id": {"type": "string", "minLength": 1}}, ["record_id"]),
+        {
+            "record_id": {"type": "string"},
+            "suggestions": {"type": "object"},
+        },
+        effect="read",
+        preview=False,
+        cancel=False,
+        status=False,
+        kind="record",
+        id_field="record_id",
+        resource_actions=("detection:review",),
+        deps=_MODEL_DEPS,
+    ),
+    _tool(
+        "dataset.update",
+        "Rename one dataset or change its description.",
+        _object(
+            {
+                "dataset_id": {"type": "string", "minLength": 1},
+                "name": {"type": "string", "minLength": 1, "maxLength": 120},
+                "description": {"type": "string", "maxLength": 2000},
+            },
+            ["dataset_id"],
+        ),
+        {
+            "dataset_id": {"type": "string"},
+            "name": {"type": "string"},
+        },
+        kind="dataset",
+        id_field="dataset_id",
+        resource_actions=("dataset:update",),
+    ),
+    _tool(
+        "dataset.delete",
+        "Move one dataset to the recycle bin. Models already trained on it are kept, "
+        "and the archive itself is preserved on disk.",
+        _object(
+            {
+                "dataset_id": {"type": "string", "minLength": 1},
+                "expected_revision": {"type": "integer", "minimum": 0},
+            },
+            ["dataset_id"],
+        ),
+        {
+            "dataset_id": {"type": "string"},
+            "operation": {"type": "string"},
+        },
+        kind="dataset",
+        id_field="dataset_id",
+        resource_actions=("dataset:delete",),
+    ),
+    _tool(
+        "dataset.export_zip",
+        "Copy one dataset's uploaded archive out of the file store into the "
+        "workspace so it can be inspected or shipped elsewhere.",
+        _object({"dataset_id": {"type": "string", "minLength": 1}}, ["dataset_id"]),
+        {
+            "dataset_id": {"type": "string"},
+            "path": {"type": "string"},
+            "size": {"type": "integer"},
+        },
+        effect="read",
+        preview=False,
+        cancel=False,
+        status=False,
+        kind="dataset",
+        id_field="dataset_id",
+        resource_actions=("dataset:read",),
+        deps=_FILE_DEPS,
+    ),
+    _tool(
+        "model.create",
+        "Train a brand new model from a base checkpoint and one ready dataset "
+        "(the 新建模型 页的门禁、增量训练 之外的另一种训练入口).",
+        _object(
+            {
+                "dataset_id": {"type": "string", "minLength": 1},
+                "name": {"type": "string", "minLength": 1, "maxLength": 120},
+                "base_model": {"type": "string", "minLength": 1, "maxLength": 120},
+                "epochs": {"type": "integer", "minimum": 1, "maximum": 10000},
+                "batch_size": {"type": "integer", "minimum": 1, "maximum": 1024},
+            },
+            ["dataset_id", "name"],
+        ),
+        {
+            "model_id": {"type": "string"},
+            "name": {"type": "string"},
+            "status": {"type": "string"},
+        },
+        kind="dataset",
+        id_field="dataset_id",
+        resource_actions=("model:create", "dataset:read"),
+    ),
+    _tool(
+        "model.update",
+        "Rename one model or change its description.",
+        _object(
+            {
+                "model_id": {"type": "string", "minLength": 1},
+                "name": {"type": "string", "minLength": 1, "maxLength": 120},
+                "description": {"type": "string", "maxLength": 2000},
+            },
+            ["model_id"],
+        ),
+        {
+            "model_id": {"type": "string"},
+            "name": {"type": "string"},
+        },
+        kind="model",
+        id_field="model_id",
+        resource_actions=("model:update",),
+    ),
+    _tool(
+        "model.delete",
+        "Move one model to the recycle bin. A model that is still training is "
+        "refused; cancel the training first.",
+        _object(
+            {
+                "model_id": {"type": "string", "minLength": 1},
+                "expected_revision": {"type": "integer", "minimum": 0},
+            },
+            ["model_id"],
+        ),
+        {
+            "model_id": {"type": "string"},
+            "operation": {"type": "string"},
+        },
+        kind="model",
+        id_field="model_id",
+        resource_actions=("model:delete",),
+    ),
+    _tool(
+        "training.cancel",
+        "Stop a running training job and mark the model as terminated.",
+        _object(
+            {
+                "model_id": {"type": "string", "minLength": 1},
+                "reason": {"type": "string", "maxLength": 200},
+            },
+            ["model_id"],
+        ),
+        {
+            "model_id": {"type": "string"},
+            "canceled": {"type": "boolean"},
+            "train_result": {"type": "object"},
+            "status": {"type": "string"},
+        },
+        effect="write",
+        preview=False,
+        cancel=False,
+        kind="model",
+        id_field="model_id",
+        resource_actions=("training:create", "model:read"),
+    ),
 ]
 
 

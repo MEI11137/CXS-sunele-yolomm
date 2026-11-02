@@ -73,8 +73,8 @@ def run_training(
         "name": "train",
         "exist_ok": True,
     }
-    if run.model_mode == "multimodal":
-        train_args["x_modality"] = run.secondary_modality
+    # 多模态的 X 模态由 dataset 的 runtime yaml（modalities / modality_used）解析，
+    # 不能作为 ultralytics 的 train 参数传入（8.3.x 的 cfg 没有 x_modality 键）。
     result = detector.train(**train_args)
 
     best = Path(run.output_dir) / "train" / "weights" / "best.pt"

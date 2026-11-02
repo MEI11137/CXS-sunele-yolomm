@@ -183,7 +183,9 @@ def create_model():
                 args=(model_id, dataset_id, base_model, epochs, batch_size),
                 kwargs=_worker_paths(),
             )
-            training_process.daemon = True
+            # 不能设为 daemon：Windows 下 DataLoader 的 worker 是子进程，
+            # daemonic 进程不允许再创建子进程，会把训练直接打断。
+            training_process.daemon = False
             training_processes[model_id] = training_process
             try:
                 training_process.start()
@@ -427,7 +429,9 @@ def create_incremental_model(parent_model_id):
                 parent_model_id,
             ),
         )
-        process.daemon = True
+        # 不能设为 daemon：Windows 下 DataLoader 的 worker 是子进程，
+        # daemonic 进程不允许再创建子进程，会把训练直接打断。
+        process.daemon = False
         training_processes[child.model_id] = process
         try:
             process.start()

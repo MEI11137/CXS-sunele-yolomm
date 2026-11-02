@@ -63,6 +63,14 @@ def register_agent(app) -> Dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             report["business_error"] = f"{type(exc).__name__}: {exc}"[:400]
 
+        # 长任务完成回调：训练等业务任务进入终态后主动写回会话。
+        try:
+            from agent import business_watcher
+
+            report["business_watcher"] = business_watcher.start(str(db_path))
+        except Exception as exc:  # noqa: BLE001
+            report["business_watcher_error"] = f"{type(exc).__name__}: {exc}"[:200]
+
     if "agent_bp" not in app.blueprints:
         app.register_blueprint(agent_bp)
     from agent.hx_engine_runtime import hxengine_bp
