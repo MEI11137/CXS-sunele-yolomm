@@ -2,6 +2,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getAdapter } from '@/services'
+import { formatMetric, mapComparisonRows } from '@/services/mappers'
 import type { DatasetSummary, ModelSummary } from '@/types'
 import ResourceRecycle from '@/components/ResourceRecycle.vue'
 import { changeResource, useResourceRefresh } from '@/utils/resourceLifecycle'
@@ -35,6 +36,16 @@ async function train() {
 
 const published = computed(() => models.value.filter((m) => m.is_published))
 const changingResource = ref('')
+async function cancelTraining(m: ModelSummary) {
+  if (changingResource.value || !window.confirm(`取消「${m.name}」的当前训练？系统会核实进程已退出，再释放训练占用。已有权重不删除。`)) return
+  changingResource.value = m.id
+  try {
+    await request('/api/model/' + encodeURIComponent(m.id) + '/cancel', { method: 'POST' })
+    noticeType.value = 'success'; notice.value = '训练进程已退出，已释放训练占用。'
+    await load()
+  } catch (e) { noticeType.value = 'error'; notice.value = (e as Error).message }
+  finally { changingResource.value = '' }
+}
 async function deleteModel(m: ModelSummary) {
   if (changingResource.value) return
   changingResource.value = m.id
@@ -175,17 +186,7 @@ async function doCompare() {
 }
 
 function metricRows(): Array<{ label: string; parent: string; child: string; delta: string }> {
-  const data = (compareResult.value ?? {}) as Record<string, unknown>
-  const parent = (data.parent ?? data.metrics_a ?? {}) as Record<string, unknown>
-  const child = (data.child ?? data.metrics_b ?? {}) as Record<string, unknown>
-  const keys = ['mAP50', 'mAP5095', 'precision', 'recall']
-  return keys.map((k) => {
-    const a = Number(parent[k] ?? parent[k.toLowerCase()] ?? NaN)
-    const b = Number(child[k] ?? child[k.toLowerCase()] ?? NaN)
-    const fmt = (v: number) => (Number.isFinite(v) ? v.toFixed(3) : '—')
-    const delta = Number.isFinite(a) && Number.isFinite(b) ? (b - a).toFixed(3) : '—'
-    return { label: k, parent: fmt(a), child: fmt(b), delta }
-  })
+  return mapComparisonRows(compareResult.value)
 }
 
 // ---------------------------------------------------------------- 权重导入
@@ -295,10 +296,10 @@ function goInspect(modelId: string) {
             <span class="hint num">创建：{{ m.create_time?.slice(0, 10) || '—' }}</span>
           </div>
           <div v-if="m.metrics" class="metrics-grid">
-            <div class="metric-item"><span class="metric-label">mAP50</span><span class="metric-value num">{{ m.metrics.mAP50.toFixed(3) }}</span></div>
-            <div class="metric-item"><span class="metric-label">mAP50-95</span><span class="metric-value num">{{ m.metrics.mAP5095.toFixed(3) }}</span></div>
-            <div class="metric-item"><span class="metric-label">Precision</span><span class="metric-value num">{{ m.metrics.precision.toFixed(3) }}</span></div>
-            <div class="metric-item"><span class="metric-label">Recall</span><span class="metric-value num">{{ m.metrics.recall.toFixed(3) }}</span></div>
+            <div class="metric-item"><span class="metric-label">mAP50</span><span class="metric-value num">{{ formatMetric(m.metrics.mAP50) }}</span></div>
+            <div class="metric-item"><span class="metric-label">mAP50-95</span><span class="metric-value num">{{ formatMetric(m.metrics.mAP5095) }}</span></div>
+            <div class="metric-item"><span class="metric-label">Precision</span><span class="metric-value num">{{ formatMetric(m.metrics.precision) }}</span></div>
+            <div class="metric-item"><span class="metric-label">Recall</span><span class="metric-value num">{{ formatMetric(m.metrics.recall) }}</span></div>
           </div>
           <div v-else class="no-metrics">该模型没有记录训练指标</div>
           <div class="card-actions">
@@ -330,7 +331,8 @@ function goInspect(modelId: string) {
               {{ publishing === m.id ? '发布中…' : '发布' }}
             </button>
             <span v-if="!canPublish(m)" class="hint">只有「训练完成」的模型可以发布</span>
-            <button class="btn btn-sm" :disabled="!!changingResource" @click="deleteModel(m)">删除</button>
+            <button v-if="m.status === 0" class="btn btn-sm" :disabled="!!changingResource" @click="cancelTraining(m)">取消训练</button>
+            <button class="btn btn-sm" :disabled="!!changingResource || m.status === 0" @click="deleteModel(m)">删除</button>
           </div>
         </div>
       </div>
@@ -339,6 +341,7 @@ function goInspect(modelId: string) {
     <section class="section">
       <h2 class="section-title">父子模型对比</h2>
       <div class="panel compare-panel">
+        <p class="hint">数值来自各自训练记录；数据划分或验证条件不同，不能仅凭差值认定新模型更优。— 表示未记录。</p>
         <div class="compare-selects">
           <select v-model="compareParent" class="select">
             <option value="">选择父模型</option>

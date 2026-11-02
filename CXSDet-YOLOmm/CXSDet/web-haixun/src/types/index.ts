@@ -181,7 +181,7 @@ export interface DetectionModel {
   version: string
   type: 'personal' | 'system'
   status: 'available' | 'training' | 'unavailable'
-  metrics?: { mAP50: number; mAP5095: number; precision: number; recall: number }
+  metrics?: { mAP50: number | null; mAP5095: number | null; precision: number | null; recall: number | null }
 }
 
 export interface ChatMessage {
@@ -330,7 +330,7 @@ export interface ModelSummary {
   is_published: boolean
   is_personal: boolean
   create_time: string
-  metrics?: { mAP50: number; mAP5095: number; precision: number; recall: number }
+  metrics?: { mAP50: number | null; mAP5095: number | null; precision: number | null; recall: number | null }
 }
 
 export interface DetectionRecordSummary {

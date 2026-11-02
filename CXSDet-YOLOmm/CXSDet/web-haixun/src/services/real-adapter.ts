@@ -302,7 +302,7 @@ export class RealAdapter extends BaseAdapter {
   }
 
   async listMessages(sessionId: string): Promise<ChatMessage[]> {
-    const data = await http.get<unknown>(`/api/agent/sessions/${sessionId}/messages`)
+    const data = await http.get<unknown>(`/api/agent/sessions/${sessionId}/messages`, { timeoutMs: 15000 })
     return asArray(data).map(mapMessage).filter((m): m is ChatMessage => !!m)
   }
 
@@ -341,6 +341,7 @@ export class RealAdapter extends BaseAdapter {
     const data = raw(
       await http.get<unknown>(`/api/agent/sessions/${sessionId}/events`, {
         query: { after: afterSequence },
+        timeoutMs: 15000,
       }),
     )
     return asArray(data.events).map(mapEvent).filter((e): e is AgentEvent => !!e)
@@ -349,7 +350,7 @@ export class RealAdapter extends BaseAdapter {
   // ---------------------------------------------------------------- 任务
 
   private async snapshot(taskId: string): Promise<TaskSnapshot> {
-    const data = raw(await http.get<unknown>(`/api/agent/tasks/${taskId}`))
+    const data = raw(await http.get<unknown>(`/api/agent/tasks/${taskId}`, { timeoutMs: 15000 }))
     return {
       task: mapTask(data.task),
       actions: asArray(data.actions)
@@ -364,7 +365,7 @@ export class RealAdapter extends BaseAdapter {
   }
 
   async listTasks(projectId: string): Promise<AgentTask[]> {
-    return asArray(await http.get('/api/agent/tasks', { query: { project_id: projectId, limit: 200 } }))
+    return asArray(await http.get('/api/agent/tasks', { query: { project_id: projectId, limit: 200 }, timeoutMs: 15000 }))
       .map(mapTask).filter((t): t is AgentTask => !!t)
   }
   async createFeedbackDraft(datasetId: string): Promise<Raw> {

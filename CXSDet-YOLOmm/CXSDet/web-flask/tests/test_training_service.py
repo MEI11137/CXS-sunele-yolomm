@@ -82,7 +82,6 @@ def test_multimodal_training_uses_vendored_baseline_and_modality_contract(tmp_pa
             "project": str(output_dir),
             "name": "train",
             "exist_ok": True,
-            "x_modality": "edge",
         }
     ]
     assert result.best_weight_path == str(best)

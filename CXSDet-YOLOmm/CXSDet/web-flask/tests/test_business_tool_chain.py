@@ -376,7 +376,10 @@ def test_training_refuses_a_second_run_instead_of_queueing(fixture):
         adapter.execute_tool(7, prepared["operation_id"], "train-busy")
 
 
-def test_training_creates_a_new_version_and_reports_persisted_state(fixture):
+def test_training_creates_a_new_version_and_reports_persisted_state(fixture, monkeypatch):
+    # This adapter unit fixture has no Flask app/Agent index. Real registration
+    # is covered with an application DB in test_v13_verified_fixes.
+    monkeypatch.setattr('agent.resources.ensure', lambda *a, **kw: {'project_id':kw['project_id']})
     dataset_id = fixture.dataset()
     parent = fixture.model(dataset_id, status=1, version=3)
     fixture.sql("UPDATE models SET epochs=5, batch_size=2 WHERE id=?", (parent,))

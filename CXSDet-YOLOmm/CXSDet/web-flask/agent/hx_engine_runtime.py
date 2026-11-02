@@ -373,7 +373,7 @@ class HxEngineRuntime(AgentRuntime):
         """引擎被拒绝或异常收尾且没留下文字时，补一条可以据以继续的说明。"""
         if notes:
             text = ("本轮有操作被权限策略拒绝，引擎收到拒绝后提前结束了这一轮，所以没有留下答复。"
-                "被拒绝的调用没有执行，工作区内容没有被改动。\n\n"
+                "该调用未获批准；此前已执行操作及文件变化请以执行记录为准。\n\n"
                 + "\n".join(f"- {note}" for note in notes[:5])
                 + "\n\n建议改成纯读取的简单命令，例如 "
                   "`Get-ChildItem -LiteralPath \"<项目目录>\" -Recurse -Filter *.jpg`；"
@@ -481,12 +481,21 @@ class HxEngineRuntime(AgentRuntime):
                         self._save_tool_events(engine, actor, task_id, row.get("parts", []))
                     statuses = engine.request("GET", "/session/status") or {}
                     active = statuses.get(engine.remote_session, {}).get("type") not in {None, "idle"}
-                    completed = any(row['info'].get('role') == 'assistant' and
-                        (row['info'].get('error') or (row['info'].get('time') or {}).get('completed')) for row in fresh)
-                    if completed and not active:
+                    assistants = [row for row in fresh if row['info'].get('role') == 'assistant']
+                    latest = assistants[-1] if assistants else None
+                    latest_info = latest['info'] if latest else {}
+                    completed = bool(latest_info.get('error') or
+                        (latest_info.get('time') or {}).get('completed') and
+                        latest_info.get('finish') not in {'tool-calls', 'tool_calls'})
+                    # A denied tool may end without a model answer. Never use this
+                    # exception for a newer answer that is still being streamed.
+                    denied_end = bool(getattr(engine, 'turn_notes', []) and
+                        (latest_info.get('time') or {}).get('completed') and
+                        latest_info.get('finish') in {'tool-calls', 'tool_calls'})
+                    if (completed or denied_end) and not active:
                         # 引擎可能先落工具消息、稍后才写最终文字：连续两次空闲再收尾。
                         idle_hits += 1
-                        if idle_hits < 2:
+                        if denied_end and not completed and idle_hits < 2:
                             pass
                         else:
                             if generation != engine.generation:
@@ -494,7 +503,8 @@ class HxEngineRuntime(AgentRuntime):
                             if errors:
                                 raise AgentError(Code.MODEL_CALL_FAILED,
                                     "海巡引擎 模型调用失败，请核对个人模型连接：" + str(errors[-1])[:250])
-                            if not getattr(engine, "turn_saved", False):
+                            if not latest or not any(p.get('type') == 'text' and p.get('text', '').strip()
+                                                     and not p.get('synthetic') for p in latest.get('parts', [])):
                                 self._fallback_reply(engine, actor, sessions.get_session(actor, engine.site_session),
                                     tasks.get_task(actor, task_id), getattr(engine, "turn_notes", []), errors)
                             current = tasks.get_task(actor, task_id)
@@ -613,6 +623,9 @@ class HxEngineRuntime(AgentRuntime):
         actions.reject(actor, action_id, reason or "用户拒绝")
         if engine:
             engine.request("POST", f"/permission/{action['parameters']['request_id']}/reply", {"reply": "reject"})
+            if not hasattr(engine, 'turn_notes'):
+                engine.turn_notes = []
+            engine.turn_notes.append('你已拒绝本次操作；该调用未获批准，未继续执行。')
         return self._snapshot(action["task_id"], "已拒绝，该操作不会执行。")
 
     def confirm_plan(self, actor, task_id, *, expected_plan_version=None):

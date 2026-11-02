@@ -111,6 +111,8 @@ export interface RequestOptions {
   responseType?: 'json' | 'blob' | 'text'
   /** 是否附带登录 Token，默认 true。 */
   auth?: boolean
+  /** Only bounded background reads opt in; writes are never retried automatically. */
+  timeoutMs?: number
 }
 
 function buildUrl(path: string, query?: Record<string, QueryValue>): string {
@@ -153,6 +155,24 @@ function parseBusinessError(status: number, payload: unknown, fallback: string):
  * 真实模式下失败一律抛 ApiError，不返回看起来成功的空值。
  */
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  if (!options.timeoutMs) return requestOnce<T>(path, options)
+  const controller = new AbortController()
+  let expired = false
+  const relay = () => controller.abort()
+  options.signal?.addEventListener('abort', relay, { once: true })
+  if (options.signal?.aborted) controller.abort()
+  const timer = setTimeout(() => { expired = true; controller.abort() }, options.timeoutMs)
+  try { return await requestOnce<T>(path, { ...options, signal: controller.signal }) }
+  catch (e) {
+    if (expired) throw new ApiError('读取状态超时，将在下一次查询时重试；后台任务仍继续', { code: 'READ_TIMEOUT' })
+    throw e
+  } finally {
+    clearTimeout(timer)
+    options.signal?.removeEventListener('abort', relay)
+  }
+}
+
+async function requestOnce<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { method = 'GET', query, body, form, signal, responseType = 'json', auth = true } = options
 
   const headers: Record<string, string> = { Accept: 'application/json' }
@@ -173,6 +193,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
       signal,
       // 文件会话 cookie（cxs_file_session）需要同源携带
       credentials: 'include',
+      cache: method === 'GET' ? 'no-store' : 'default',
     })
   } catch (error) {
     if ((error as DOMException)?.name === 'AbortError') throw error

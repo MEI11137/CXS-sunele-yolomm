@@ -84,6 +84,15 @@ class PersonalReviewClient:
         )
         return str(getattr(turn, "text", "") or "")
 
+    def generate_improvement_suggestions(self, analysis) -> str:
+        turn = self.gateway.complete([{'role': 'user', 'content':
+            '根据下面的检测分析给出需人工核实的运维建议。不得宣称已修复缺陷、修改标注或训练完成。\n' +
+            json.dumps(analysis, ensure_ascii=False)}], temperature=0.1)
+        text = str(getattr(turn, 'text', '') or '').strip()
+        if not text:
+            raise ValueError('个人模型没有返回建议，未使用其他连接')
+        return text
+
     def health_check(self) -> dict[str, Any]:
         """认证 + 模型可见性；仅认证成功不代表能看图，能力另由 probe 负责。"""
         client = self.gateway._get_client()  # 与聊天共用同一个 SDK 客户端

@@ -499,7 +499,7 @@ function reset() {
           <div class="model-name">{{ m.name }} <span class="mono num">{{ m.version }}</span></div>
           <div class="model-type">
             <span class="tag" :class="m.type === 'system' ? 'tag-accent' : ''">{{ m.type === 'system' ? '系统基线 · 只读' : '个人模型' }}</span>
-            <span v-if="m.metrics" class="model-metric num">mAP50 {{ m.metrics.mAP50.toFixed(3) }}</span>
+            <span v-if="m.metrics" class="model-metric num">mAP50 {{ m.metrics.mAP50?.toFixed(3) ?? '—' }}</span>
           </div>
         </label>
         <div v-if="!availableModels.length" class="hint-text">

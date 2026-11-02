@@ -78,6 +78,19 @@ def start_incremental_training(
         dataset = _row(conn, "SELECT * FROM datasets WHERE id = ?", (feedback_dataset_id,))
         if dataset is None:
             raise ModelRegistryError("反馈数据集不存在")
+        if 'status' in dataset.keys() and dataset['status'] != 1:
+            raise ModelRegistryError('训练数据集必须已校验并完成定稿')
+        source = _row(conn, 'SELECT * FROM datasets WHERE id=?', (parent['dataset_id'],))
+        if source is not None and 'structure_info' in source.keys() and 'structure_info' in dataset.keys():
+            try:
+                source_info = json.loads(source['structure_info'] or '{}')
+                target_info = json.loads(dataset['structure_info'] or '{}')
+                before = source_info.get('class_names') or source_info.get('names')
+                after = target_info.get('class_names') or target_info.get('names')
+            except (ValueError, TypeError, AttributeError):
+                raise ModelRegistryError('类别元数据损坏，请先重新检查数据集') from None
+            if before and after and before != after:
+                raise ModelRegistryError('训练数据集类别及顺序与父模型来源不一致，请先完成明确的类别映射')
         if (dataset["dataset_mode"] or "single") != (parent["model_mode"] or "single"):
             raise ModelRegistryError("反馈数据集与父模型的单/多模态模式不一致")
         if (dataset["primary_modality"] or "rgb") != (parent["primary_modality"] or "rgb"):

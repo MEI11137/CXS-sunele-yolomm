@@ -67,7 +67,7 @@ def register_agent(app) -> Dict[str, Any]:
         try:
             from agent import business_watcher
 
-            report["business_watcher"] = business_watcher.start(str(db_path))
+            report["business_watcher"] = business_watcher.start(app)
         except Exception as exc:  # noqa: BLE001
             report["business_watcher_error"] = f"{type(exc).__name__}: {exc}"[:200]
 

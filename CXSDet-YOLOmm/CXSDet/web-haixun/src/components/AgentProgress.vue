@@ -22,6 +22,7 @@ const router = useRouter()
 const snapshot = ref<TaskSnapshot | null>(null)
 const events = ref<AgentEvent[]>([])
 const error = ref('')
+const messageError = ref('')
 const actionError = ref('')
 const busy = ref(false)
 const selectedActionId = ref('')
@@ -34,6 +35,7 @@ watch(pendingActions, actions => {
 })
 function switchAction(offset: number) { selectedActionId.value = pendingActions.value[selectedIndex.value + offset]?.action_id || selectedActionId.value }
 let timer: ReturnType<typeof setTimeout> | undefined
+let messageTimer: ReturnType<typeof setTimeout> | undefined
 let generation = 0
 let requestVersion = 0
 let activatedAt = Date.now() - 1000
@@ -100,11 +102,13 @@ watch(running, value => emit('running', value), { immediate: true })
 async function refresh(token = generation) {
   if (!session.currentId || !workspace.currentId) return
   const request = ++requestVersion
+  const sid = session.currentId
   try {
-    const sid = session.currentId
-    const tasks = await getAdapter().listTasks(workspace.currentId)
+    const [tasks, ev] = await Promise.all([
+      getAdapter().listTasks(workspace.currentId),
+      getAdapter().listEvents(sid, events.value[events.value.length - 1]?.sequence || 0),
+    ])
     const task = tasks.find(t => t.session_id === sid)
-    const ev = await getAdapter().listEvents(sid, events.value[events.value.length - 1]?.sequence || 0)
     if (token !== generation || request !== requestVersion) return
     events.value = [...new Map([...events.value, ...ev].map(e => [e.sequence, e])).values()]
     for (const event of ev.filter(item => item.sequence > workspaceSequence && workspaceEffect(item, workspace.currentId, sid, activatedAt))) {
@@ -139,10 +143,21 @@ async function refresh(token = generation) {
         ? await getAdapter().reconcileTask(task.id) : await getAdapter().getTaskSnapshot(task.id)
       if (token !== generation || request !== requestVersion) return
       snapshot.value = next
-      if (!session.streaming) await session.loadMessages(sid)
     } else snapshot.value = null
     error.value = ''
   } catch (e) { if (token === generation) error.value = (e as Error).message }
+}
+// Keep the conversation alive independently of slow task reconciliation or events.
+async function pollMessages(token: number) {
+  const sid = session.currentId
+  try {
+    await session.loadMessages(sid)
+    if (token === generation) messageError.value = ''
+  } catch (e) {
+    if (token === generation) messageError.value = (e as Error).message
+  } finally {
+    if (token === generation) messageTimer = setTimeout(() => pollMessages(token), 4000)
+  }
 }
 async function poll(token: number) {
   await refresh(token)
@@ -151,10 +166,12 @@ async function poll(token: number) {
 watch(() => [session.currentId, workspace.currentId], () => {
   generation++
   clearTimeout(timer)
+  clearTimeout(messageTimer)
   snapshot.value = null
   events.value = []
   selectedActionId.value = ''
   error.value = ''
+  messageError.value = ''
   actionError.value = ''
   busy.value = false
   activatedAt = Date.now() - 1000
@@ -163,9 +180,9 @@ watch(() => [session.currentId, workspace.currentId], () => {
   resourcesSequence = 0
   workspaceSequence = 0
   clearDownloads()
-  if (session.currentId && workspace.currentId) void poll(generation)
+  if (session.currentId && workspace.currentId) { void poll(generation); void pollMessages(generation) }
 }, { immediate: true })
-onBeforeUnmount(() => { generation++; clearTimeout(timer); clearDownloads() })
+onBeforeUnmount(() => { generation++; clearTimeout(timer); clearTimeout(messageTimer); clearDownloads() })
 
 async function act(kind: 'plan' | 'confirm' | 'reject' | 'stop', id = '', revision = 0) {
   const task = snapshot.value?.task
@@ -233,8 +250,8 @@ function waitingLabel(kind: string) { return ({ human: '请在页面完成复核
 </script>
 
 <template>
-  <section v-if="snapshot?.task || events.length || error || actionError" class="agent-progress" aria-label="助手执行过程">
-    <p v-if="error || actionError" class="progress-error" role="alert">{{ error || actionError }}</p>
+  <section v-if="snapshot?.task || events.length || error || messageError || actionError" class="agent-progress" aria-label="助手执行过程">
+    <p v-if="error || messageError || actionError" class="progress-error" role="alert">{{ error || messageError || actionError }}</p>
     <p v-for="file in downloads" :key="file.id">CSV 已在项目工作区生成：<a :href="file.url" :download="file.filename">下载 {{ file.filename }}</a></p>
     <details v-if="snapshot?.task || activity.length" open class="execution-details">
       <summary class="execution-summary"><span class="execution-mark" :class="{ spinning: running }" aria-hidden="true">{{ running ? '◌' : waitingApproval ? '·' : '✓' }}</span><strong>{{ statusLabel }}</strong><span v-if="activity.length" class="tool-count">{{ activity.length }} 项工具操作</span><span v-if="automaticApprovals" class="tool-count">已按权限批准 {{ automaticApprovals }} 项</span><span class="summary-chevron" aria-hidden="true">⌄</span></summary>

@@ -462,13 +462,31 @@ export function mapModel(value: unknown): ModelSummary {
     create_time: isoOrEmpty(obj.create_time),
     metrics: Object.keys(metrics).length
       ? {
-          mAP50: num(metrics.mAP50 ?? metrics.map50 ?? metrics['metrics/mAP50(B)']),
-          mAP5095: num(metrics.mAP50_95 ?? metrics.map5095 ?? metrics['metrics/mAP50-95(B)']),
-          precision: num(metrics.precision ?? metrics['metrics/precision(B)']),
-          recall: num(metrics.recall ?? metrics['metrics/recall(B)']),
+          mAP50: metricNumber(metrics.mAP50 ?? metrics.map50 ?? metrics['metrics/mAP50(B)']),
+          mAP5095: metricNumber(metrics['mAP50-95'] ?? metrics.mAP50_95 ?? metrics.map5095 ?? metrics['metrics/mAP50-95(B)']),
+          precision: metricNumber(metrics.precision ?? metrics['metrics/precision(B)']),
+          recall: metricNumber(metrics.recall ?? metrics['metrics/recall(B)']),
         }
       : undefined,
   }
+}
+
+function metricNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+export function formatMetric(value: unknown): string {
+  const n = metricNumber(value)
+  return n === null ? '—' : n.toFixed(3)
+}
+
+export function mapComparisonRows(value: unknown) {
+  const metrics = raw(raw(value).metrics)
+  return ['mAP50', 'mAP50-95', 'precision', 'recall', 'inference_ms'].map(label => {
+    const row = raw(metrics[label])
+    return { label, parent: formatMetric(row.parent), child: formatMetric(row.child),
+      delta: formatMetric(row.status === 'known' ? row.delta : null) }
+  })
 }
 
 export function mapDetectionBoxes(value: unknown): DetectionBox[] {

@@ -30,6 +30,9 @@ from services.training_runner import (
     release_training_lock,
     run_training_job,
     set_lock_holder,
+    transfer_training_lock,
+    launch_training_job,
+    TrainingLaunchUncertain,
 )
 from services.model_registry_service import (
     ModelRegistryError,
@@ -111,6 +114,8 @@ def _mark_training_taken_slot(lock_path, model_id, process):
 @token_required
 def create_model():
     """创建新模型并开始训练"""
+    model_id = None
+    lock_path = _lock_db_path()
     try:
         data = request.json
         name = data.get('name', '').strip()
@@ -119,6 +124,8 @@ def create_model():
         base_model = data.get('base_model', 'yolo11n.pt').strip()
         epochs = int(data.get('epochs', 50))
         batch_size = int(data.get('batch_size', 16))
+        if epochs < 1 or batch_size < 1:
+            return error('训练轮数和批量大小必须大于零', 400), 400
         
         if not name:
             return error("模型名称不能为空")
@@ -153,6 +160,10 @@ def create_model():
             
         # 创建模型记录
         model_id = str(uuid.uuid4())
+        try:
+            acquire_training_lock(lock_path, model_id, os.getpid())
+        except TrainingBusy as exc:
+            return error(str(exc), 409), 409
         
         affected_rows = db.execute('''
             INSERT INTO models (id, name, description, dataset_id, base_model,
@@ -167,35 +178,11 @@ def create_model():
         ))
         
         if affected_rows > 0:
-            lock_path = _lock_db_path()
-            # 单机单训练占用：忙时明确拒绝，不排队
-            try:
-                acquire_training_lock(lock_path, model_id, os.getpid())
-            except TrainingBusy as exc:
-                try:
-                    db.execute('DELETE FROM models WHERE id = ?', (model_id,))
-                except Exception:
-                    pass
-                return error(str(exc), 409), 409
-            # 创建并启动训练进程
-            training_process = multiprocessing.Process(
-                target=run_training_process,
-                args=(model_id, dataset_id, base_model, epochs, batch_size),
-                kwargs=_worker_paths(),
-            )
-            # 不能设为 daemon：Windows 下 DataLoader 的 worker 是子进程，
-            # daemonic 进程不允许再创建子进程，会把训练直接打断。
-            training_process.daemon = False
-            training_processes[model_id] = training_process
-            try:
-                training_process.start()
-            except Exception:
-                release_training_lock(lock_path, model_id)
-                db.execute('DELETE FROM models WHERE id = ?', (model_id,))
-                raise
-            _mark_training_taken_slot(lock_path, model_id, training_process)
-
+            # 先登记项目归属，再把运行权交给 worker，避免无归属输出。
             register_new('model', model_id, display_name=name)
+            training_process = launch_training_job(dict(_worker_paths(), model_id=model_id,
+                dataset_id=dataset_id, base_model=base_model, epochs=epochs, batch_size=batch_size))
+            training_processes[model_id] = training_process
 
             return success({
                 'id': model_id,
@@ -215,9 +202,15 @@ def create_model():
                 'create_time': datetime.now().isoformat()
             }, "模型创建成功，开始训练")
         else:
+            release_training_lock(lock_path, model_id)
             return error("创建模型失败")
-            
+    except TrainingLaunchUncertain as exc:
+        return error(str(exc), 503), 503
     except Exception as e:
+        if model_id:
+            db.execute('UPDATE models SET status=2,complete_time=?,train_result=? WHERE id=? AND status=0',
+                       (datetime.now().isoformat(), json.dumps({'error':'训练启动失败'}, ensure_ascii=False), model_id))
+            release_training_lock(lock_path, model_id)
         return error(f"创建模型失败: {str(e)}")
 
 
@@ -397,54 +390,58 @@ def publish_model(model_id):
 @resource_required('model', 'parent_model_id', 'read')
 def create_incremental_model(parent_model_id):
     """创建独立子模型记录，并从父权重启动反馈数据集训练。"""
+    lock_path = _lock_db_path()
+    reservation = 'pending:' + uuid.uuid4().hex
+    child = None
     try:
         payload = request.get_json(silent=True) or {}
         feedback_dataset_id = str(payload.get('feedback_dataset_id') or '').strip()
         if not feedback_dataset_id:
             return error("feedback_dataset_id 不能为空", 400), 400
+        from utils.resource_guard import check_resource
+        blocked = check_resource('dataset', feedback_dataset_id, 'read')
+        if blocked is not None:
+            return blocked
+        acquire_training_lock(lock_path, reservation, os.getpid())
         child = start_incremental_training(
             parent_model_id,
             feedback_dataset_id,
             payload,
             db,
         )
-        lock_path = _lock_db_path()
-        try:
-            acquire_training_lock(lock_path, child.model_id, os.getpid())
-        except TrainingBusy as exc:
-            try:
-                db.execute('DELETE FROM models WHERE id = ?', (child.model_id,))
-            except Exception:
-                pass
-            return error(str(exc), 409), 409
-        process = multiprocessing.Process(
-            target=run_training_process,
-            kwargs=_worker_paths(),
-            args=(
-                child.model_id,
-                child.dataset_id,
-                '',
-                child.epochs,
-                child.batch_size,
-                parent_model_id,
-            ),
-        )
-        # 不能设为 daemon：Windows 下 DataLoader 的 worker 是子进程，
-        # daemonic 进程不允许再创建子进程，会把训练直接打断。
-        process.daemon = False
+        transfer_training_lock(lock_path, reservation, child.model_id)
+        register_new('model', child.model_id)
+        process = launch_training_job(dict(_worker_paths(), model_id=child.model_id,
+            dataset_id=child.dataset_id, base_model='', epochs=child.epochs,
+            batch_size=child.batch_size, parent_model_id=parent_model_id))
         training_processes[child.model_id] = process
-        try:
-            process.start()
-        except Exception:
-            release_training_lock(lock_path, child.model_id)
-            db.execute('DELETE FROM models WHERE id = ?', (child.model_id,))
-            raise
-        _mark_training_taken_slot(lock_path, child.model_id, process)
         return success(child.to_dict(), "增量训练已启动")
+    except TrainingBusy as exc:
+        return error(str(exc), 409), 409
+    except TrainingLaunchUncertain as exc:
+        return error(str(exc), 503), 503
     except ModelRegistryError as exc:
+        release_training_lock(lock_path, reservation)
         return error(str(exc), 400), 400
     except Exception as exc:
+        release_training_lock(lock_path, reservation)
+        if child:
+            db.execute('UPDATE models SET status=2,complete_time=?,train_result=? WHERE id=? AND status=0',
+                       (datetime.now().isoformat(), json.dumps({'error':'训练启动失败'}, ensure_ascii=False), child.model_id))
+            release_training_lock(lock_path, child.model_id)
         return error(f"启动增量训练失败: {str(exc)}")
+
+
+@model_bp.route('/<model_id>/cancel', methods=['POST'])
+@resource_required('model', 'model_id', 'train')
+def cancel_model_training(model_id):
+    """Page and Agent use the same verified process cancellation."""
+    from services.training_runner import cancel_training_job, TrainingCancelError
+    try:
+        result = cancel_training_job(_lock_db_path(), model_id, '用户在模型管理页取消训练')
+        return success(result, '训练进程已核实退出')
+    except TrainingCancelError as exc:
+        return error(str(exc), 409), 409
 
 
 @model_bp.route('/<parent_model_id>/compare/<child_model_id>', methods=['GET'])

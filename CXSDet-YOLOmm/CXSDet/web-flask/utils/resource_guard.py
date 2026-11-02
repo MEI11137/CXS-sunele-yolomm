@@ -36,7 +36,7 @@ def validate_project_request(user_id):
         explicit = request.form.get('project_id') or payload.get('project_id')
         if explicit and str(explicit) != project_id:
             return error('操作目标与当前项目不一致',403), 403
-        checks = {'dataset_id':'dataset','model_id':'model','parent_model_id':'model','record_id':'detection_record','draft_id':'draft'}
+        checks = {'dataset_id':'dataset','feedback_dataset_id':'dataset','model_id':'model','parent_model_id':'model','record_id':'detection_record','draft_id':'draft'}
         references = [(kind, (request.view_args or {}).get(param) or request.form.get(param) or payload.get(param) or request.args.get(param)) for param,kind in checks.items()]
         batch = payload.get('record_ids', [])
         if isinstance(batch, list): references.extend(('detection_record', value) for value in batch)

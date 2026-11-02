@@ -28,33 +28,35 @@ _MAX_PER_SCAN = 20
 # 一轮引擎对话正常几十秒结束（引擎侧上限 240 秒）；十分钟还挂在 running 就是孤儿。
 _STALE_RUNNING_SECONDS = 600
 
-_started = False
+_started = set()
 _lock = threading.Lock()
-_db_path: Optional[str] = None
 
 
-def start(db_path: Optional[str] = None) -> bool:
+def start(app) -> bool:
     """启动后台回调线程；重复调用不会重复启动。"""
-    global _started, _db_path
+    if app.config.get('TESTING'):
+        return False
+    key = str(app.config['DATABASE'])
     with _lock:
-        if _started:
+        if key in _started:
             return False
-        _db_path = str(db_path) if db_path else None
-        _started = True
-    threading.Thread(target=_loop, name="haixun-business-watcher", daemon=True).start()
+        _started.add(key)
+    threading.Thread(target=_loop, args=(app,), name="haixun-business-watcher", daemon=True).start()
     return True
 
 
-def _loop() -> None:
+def _loop(app) -> None:
     while True:
-        try:
-            scan_once()
-        except Exception:  # noqa: BLE001 - 后台线程不能因为一次异常退出
-            LOGGER.exception("business watcher 扫描失败")
-        try:
-            _reap_stale_running()
-        except Exception:  # noqa: BLE001
-            LOGGER.exception("business watcher 清理孤儿任务失败")
+        # 所有 tasks/sessions/store 调用必须使用同一 app 的数据库。
+        with app.app_context():
+            try:
+                scan_once()
+            except Exception:  # noqa: BLE001 - 后台线程不能因为一次异常退出
+                LOGGER.exception("business watcher 扫描失败")
+            try:
+                _reap_stale_running()
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("business watcher 清理孤儿任务失败")
         time.sleep(_INTERVAL_SECONDS)
 
 
@@ -97,7 +99,7 @@ def _reap_stale_running() -> int:
 def _connect():
     from agent.store import connect
 
-    return connect(_db_path)
+    return connect()
 
 
 def _loads(raw: Any) -> Dict[str, Any]:
@@ -225,7 +227,7 @@ def scan_once() -> int:
         if not model_ids:
             continue
         rows = _model_rows(model_ids)
-        if any(_status_code((rows.get(model_id) or {}).get("status")) not in _MODEL_TERMINAL for model_id in model_ids):
+        if any(model_id in rows and _status_code(rows[model_id].get("status")) not in _MODEL_TERMINAL for model_id in model_ids):
             continue
         text, failed = _compose(model_ids, rows)
         if not text:

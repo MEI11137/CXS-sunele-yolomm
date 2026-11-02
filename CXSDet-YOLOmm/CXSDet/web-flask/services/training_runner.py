@@ -18,6 +18,7 @@ import shutil
 import sqlite3
 import uuid
 import psutil
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
@@ -58,6 +59,16 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
     )
     if 'holder_started' not in {r[1] for r in conn.execute('PRAGMA table_info(training_lock)')}:
         conn.execute('ALTER TABLE training_lock ADD COLUMN holder_started REAL')
+    if 'cancel_targets' not in {r[1] for r in conn.execute('PRAGMA table_info(training_lock)')}:
+        conn.execute('ALTER TABLE training_lock ADD COLUMN cancel_targets TEXT')
+
+
+def _lock_alive(row):
+    value = dict(row)
+    if _process_alive(value.get('holder_pid'), value.get('holder_started')):
+        return True
+    return any(_process_alive(item['pid'], item['started'])
+               for item in json.loads(value.get('cancel_targets') or '[]'))
 
 
 def _process_alive(pid: int | None, started: float | None = None) -> bool:
@@ -80,44 +91,46 @@ def _process_started(pid):
 
 
 def read_lock(database_path: str | Path = DB_PATH) -> dict | None:
-    with _connect(database_path) as conn:
+    with closing(_connect(database_path)) as conn, conn:
         _ensure_table(conn)
         row = conn.execute("SELECT * FROM training_lock WHERE lock_id=1").fetchone()
-    return dict(row) if row and _process_alive(row['holder_pid'], row['holder_started']) else None
+    return dict(row) if row and _lock_alive(row) else None
 
 
 def acquire_training_lock(
     database_path: str | Path, owner: str, holder_pid: int | None = None,
 ) -> None:
     """Take the machine-wide training slot or refuse with the current holder."""
-    with _connect(database_path) as conn:
+    with closing(_connect(database_path)) as conn, conn:
         _ensure_table(conn)
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT * FROM training_lock WHERE lock_id=1").fetchone()
-        if row is not None and _process_alive(row["holder_pid"], row['holder_started']):
+        if row is not None and _lock_alive(row):
             raise TrainingBusy(dict(row))
         conn.execute(
             "INSERT INTO training_lock (lock_id, owner, holder_pid, acquired_at, holder_started) "
             "VALUES (1, ?, ?, ?, ?) ON CONFLICT(lock_id) DO UPDATE SET "
             "owner=excluded.owner, holder_pid=excluded.holder_pid, "
-            "acquired_at=excluded.acquired_at, holder_started=excluded.holder_started",
+            "acquired_at=excluded.acquired_at, holder_started=excluded.holder_started, cancel_targets=NULL",
             (str(owner), holder_pid, datetime.now().isoformat(), _process_started(holder_pid)),
         )
 
 
 def set_lock_holder(database_path: str | Path, owner: str, pid: int) -> None:
     """Point the lock at the worker process so a dead worker can be reclaimed."""
-    with _connect(database_path) as conn:
+    with closing(_connect(database_path)) as conn, conn:
         _ensure_table(conn)
-        conn.execute(
+        changed = conn.execute(
             "UPDATE training_lock SET holder_pid=?,holder_started=? WHERE lock_id=1 AND owner=?",
             (int(pid), _process_started(pid), str(owner)),
-        )
+        ).rowcount
+        if not changed:
+            raise RuntimeError('训练占用在进程移交前已改变')
 
 
 def transfer_training_lock(database_path: str | Path, from_owner: str, to_owner: str) -> None:
     """Hand the slot from a reservation to the model row the worker will release."""
-    with _connect(database_path) as conn:
+    with closing(_connect(database_path)) as conn, conn:
         _ensure_table(conn)
         conn.execute(
             "UPDATE training_lock SET owner=? WHERE lock_id=1 AND owner=?",
@@ -127,21 +140,117 @@ def transfer_training_lock(database_path: str | Path, from_owner: str, to_owner:
 
 def release_training_lock(database_path: str | Path, owner: str) -> None:
     """Release only if this owner still holds the slot."""
-    with _connect(database_path) as conn:
+    with closing(_connect(database_path)) as conn, conn:
         _ensure_table(conn)
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT * FROM training_lock WHERE lock_id=1 AND owner=?', (str(owner),)).fetchone()
+        if row and row['cancel_targets'] and _lock_alive(row):
+            return  # A cancelled worker must not release a slot with live children.
         conn.execute("DELETE FROM training_lock WHERE lock_id=1 AND owner=?", (str(owner),))
+
+
+class TrainingCancelError(RuntimeError):
+    """Cancellation could not be verified; keep the slot reserved."""
+
+
+class TrainingLaunchUncertain(RuntimeError):
+    """A spawned process could not be stopped; callers must retain its slot."""
+
+
+def _run_after_handoff(ready, payload):
+    # No GPU work or DataLoader children before the parent has recorded this PID.
+    if ready.wait(30):
+        run_training_job(**payload)
+
+
+def launch_training_job(payload):
+    """Shared by page and Agent; record ownership before allowing real training."""
+    import multiprocessing
+    ready = multiprocessing.Event()
+    process = multiprocessing.Process(target=_run_after_handoff, args=(ready, payload))
+    process.daemon = False
+    try:
+        process.start()
+        set_lock_holder(payload['database_path'], payload['model_id'], process.pid)
+        ready.set()
+    except Exception:
+        if process.pid:
+            try:
+                if process.is_alive():
+                    process.terminate()
+                process.join(timeout=8)
+                if process.is_alive():
+                    raise TrainingLaunchUncertain('训练进程移交失败且未确认退出，保留训练占用，请核实')
+            except (OSError, psutil.Error) as exc:
+                raise TrainingLaunchUncertain('无法核实新建进程是否退出，保留训练占用，请核实') from exc
+        raise
+    return process
+
+
+def cancel_training_job(database_path, model_id, reason, *, timeout=8):
+    with closing(_connect(database_path)) as conn, conn:
+        _ensure_table(conn)
+        row = conn.execute('SELECT * FROM training_lock WHERE lock_id=1').fetchone()
+        model = conn.execute('SELECT status FROM models WHERE id=?', (model_id,)).fetchone()
+        if not model or model['status'] != 0:
+            raise TrainingCancelError('模型已不处于训练状态，请刷新真实结果')
+        if not row or row['owner'] != model_id or not row['holder_pid'] or row['holder_started'] is None:
+            raise TrainingCancelError('无法核实本模型的训练进程，未标记取消或释放训练槽')
+        lock = dict(row)
+    if lock['holder_pid'] == os.getpid():
+        raise TrainingCancelError('训练进程尚未完成移交，不能终止网站服务，请稍后核实')
+    targets = json.loads(lock.get('cancel_targets') or '[]')
+    try:
+        if _process_alive(lock['holder_pid'], lock['holder_started']):
+            parent = psutil.Process(lock['holder_pid'])
+            if abs(parent.create_time() - lock['holder_started']) >= .01:
+                raise TrainingCancelError('进程身份已变化，未发送终止信号')
+            targets += [{'pid': p.pid, 'started': p.create_time()}
+                        for p in [parent, *parent.children(recursive=True)]]
+        targets = list({(item['pid'], item['started']): item for item in targets}.values())
+        if any(item['pid'] == os.getpid() for item in targets):
+            raise TrainingCancelError('目标包含网站服务进程，拒绝取消')
+        with closing(_connect(database_path)) as conn, conn:
+            conn.execute('UPDATE training_lock SET cancel_targets=? WHERE lock_id=1 AND owner=?',
+                         (json.dumps(targets), model_id))
+        processes = []
+        for item in targets:
+            if _process_alive(item['pid'], item['started']):
+                process = psutil.Process(item['pid'])
+                if abs(process.create_time() - item['started']) >= .01:
+                    raise TrainingCancelError('目标进程身份已变化')
+                processes.append(process)
+        for process in processes:
+            try:
+                process.terminate()
+            except psutil.NoSuchProcess:
+                pass
+        _, alive = psutil.wait_procs(processes, timeout=timeout)
+        if alive or any(_process_alive(item['pid'], item['started']) for item in targets):
+            raise TrainingCancelError('训练进程尚未全部退出，未标记取消，训练槽继续保留')
+    except (psutil.Error, OSError) as exc:
+        raise TrainingCancelError('终止训练进程失败，未标记取消，训练槽继续保留') from exc
+    result = {'canceled_by_user': True, 'reason': str(reason), 'canceled_at': datetime.now().isoformat()}
+    with closing(_connect(database_path)) as conn, conn:
+        changed = conn.execute('UPDATE models SET status=4,train_result=?,complete_time=? WHERE id=? AND status IN (0,2)',
+                               (json.dumps(result, ensure_ascii=False), datetime.now().isoformat(), model_id)).rowcount
+    release_training_lock(database_path, model_id)
+    if not changed:
+        raise TrainingCancelError('进程已退出，但模型已完成或状态改变，请刷新；未覆盖已有结果')
+    return {'model_id': model_id, 'canceled': True, 'process_terminated': True,
+            'train_result': result, 'status': 'cancelled'}
 
 
 def reconcile_training_jobs(database_path):
     """A dead worker means interrupted; never restart training automatically."""
     changed = 0
-    with _connect(database_path) as conn:
+    with closing(_connect(database_path)) as conn, conn:
         _ensure_table(conn)
         columns = {r[1] for r in conn.execute('PRAGMA table_info(models)')}
         if not {'id','status','train_result','complete_time'} <= columns:
             return 0
         lock = conn.execute('SELECT * FROM training_lock WHERE lock_id=1').fetchone()
-        alive = lock and _process_alive(lock['holder_pid'], lock['holder_started'])
+        alive = lock and _lock_alive(lock)
         for row in conn.execute('SELECT id FROM models WHERE status=0').fetchall():
             if alive and lock['owner'] == row['id']:
                 continue

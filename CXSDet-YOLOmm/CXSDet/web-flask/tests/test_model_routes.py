@@ -92,18 +92,13 @@ def test_create_model_persists_dataset_modality_and_version(monkeypatch, tmp_pat
             captured["params"] = params
             return 1
 
-    class FakeProcess:
-        def __init__(self, target, args, **options):
-            captured["target"] = target
-            captured["args"] = args
-            captured['worker_paths'] = options.get('kwargs')
-            self.daemon = False
-
-        def start(self):
-            captured["started"] = True
+    def fake_launch(payload):
+        captured['worker_paths'] = payload
+        captured['started'] = True
+        return object()
 
     monkeypatch.setattr(model_route, "db", FakeDb())
-    monkeypatch.setattr(model_route.multiprocessing, "Process", FakeProcess)
+    monkeypatch.setattr(model_route, "launch_training_job", fake_launch)
     monkeypatch.setattr(security_utils, "is_admin", lambda: True)
 
     app = Flask(__name__)
