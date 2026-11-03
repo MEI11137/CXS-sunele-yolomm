@@ -382,7 +382,12 @@ class InspectionLoopTools(ToolProvider):
         published = []
         for resource in resources:
             if resource.get('source_table') == 'models' and resource.get('source_id'):
-                row = backend._model_row(resource['source_id'])
+                # A legacy index can survive deletion of its business row.
+                # It must not block inspection with another live model.
+                try:
+                    row = backend._model_row(resource['source_id'])
+                except FileNotFoundError:
+                    continue
                 if row.get('status') == 3 and (row.get('model_mode') or 'single') == ('multimodal' if secondary else 'single') and (row.get('secondary_modality') or None) == secondary:
                     published.append({'id': row['id'], 'name': row['name']})
         if reuse and reuse['status'] == 3:

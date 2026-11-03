@@ -29,7 +29,6 @@ const selectedActionId = ref('')
 const pendingActions = computed(() => snapshot.value?.actions.filter(action => action.status === 'pending') || [])
 const selectedAction = computed(() => pendingActions.value.find(action => action.action_id === selectedActionId.value) || pendingActions.value[0])
 const selectedIndex = computed(() => pendingActions.value.findIndex(action => action.action_id === selectedAction.value?.action_id))
-const awaitingPlan = computed(() => snapshot.value?.task?.status === 'awaiting_plan')
 watch(pendingActions, actions => {
   if (!actions.some(action => action.action_id === selectedActionId.value)) selectedActionId.value = actions[0]?.action_id || ''
 })
@@ -184,7 +183,7 @@ watch(() => [session.currentId, workspace.currentId], () => {
 }, { immediate: true })
 onBeforeUnmount(() => { generation++; clearTimeout(timer); clearTimeout(messageTimer); clearDownloads() })
 
-async function act(kind: 'plan' | 'confirm' | 'reject' | 'stop', id = '', revision = 0) {
+async function act(kind: 'confirm' | 'reject' | 'stop', id = '', revision = 0) {
   const task = snapshot.value?.task
   if (!task || busy.value) return
   const token = generation
@@ -196,7 +195,6 @@ async function act(kind: 'plan' | 'confirm' | 'reject' | 'stop', id = '', revisi
     const page = reviewPage.value
     if (kind === 'confirm' && action?.tool_name === 'workspace_review_record' && page && page.record_id === action.preview.record_id && action.preview.editor_revision != null && page.draft_revision !== action.preview.editor_revision)
       throw new Error('当前标注草稿已变化，请重新告诉助手要修改的内容，旧卡片不能覆盖新草稿。')
-    if (kind === 'plan') await api.confirmPlan(task.id, task.planVersion)
     if (kind === 'confirm') {
       const confirmed = await api.confirmAction(id, revision)
       const closed = closedContext(confirmed)
@@ -253,11 +251,10 @@ function waitingLabel(kind: string) { return ({ human: '请在页面完成复核
   <section v-if="snapshot?.task || events.length || error || messageError || actionError" class="agent-progress" aria-label="助手执行过程">
     <p v-if="error || messageError || actionError" class="progress-error" role="alert">{{ error || messageError || actionError }}</p>
     <p v-for="file in downloads" :key="file.id">CSV 已在项目工作区生成：<a :href="file.url" :download="file.filename">下载 {{ file.filename }}</a></p>
-    <details v-if="snapshot?.task || activity.length" open class="execution-details">
+    <details v-if="snapshot?.task || activity.length" :key="snapshot?.task?.id || session.currentId" class="execution-details">
       <summary class="execution-summary"><span class="execution-mark" :class="{ spinning: running }" aria-hidden="true">{{ running ? '◌' : waitingApproval ? '·' : '✓' }}</span><strong>{{ statusLabel }}</strong><span v-if="activity.length" class="tool-count">{{ activity.length }} 项工具操作</span><span v-if="automaticApprovals" class="tool-count">已按权限批准 {{ automaticApprovals }} 项</span><span class="summary-chevron" aria-hidden="true">⌄</span></summary>
       <div class="execution-content">
         <p v-for="event in batchProgress" :key="event.event_id">{{ event.payload.message }}</p>
-        <ol v-if="snapshot?.task?.steps.length" class="plan-steps"><li v-for="step in snapshot.task.steps" :key="step.id">{{ step.name }}<span>{{ labels[step.status] || toolStatuses[step.status] || step.status }}</span></li></ol>
         <div v-for="tool in activity" :key="tool.id" class="tool-step"><span class="tool-state" :class="{ failed: ['failed','error'].includes(tool.status) }" aria-hidden="true">{{ ['completed','succeeded'].includes(tool.status) ? '✓' : ['failed','error'].includes(tool.status) ? '!' : '·' }}</span><div class="tool-info"><div class="tool-heading"><strong>{{ eventTitle(tool.name) }}</strong><span>{{ toolStatuses[tool.status] || tool.status }}</span></div><details class="raw-details"><summary>输入与执行结果</summary><pre>{{ JSON.stringify(tool.events.map(event => event.payload), null, 2) }}</pre></details></div></div>
         <div v-for="event in eventErrors" :key="event.event_id" class="progress-error">{{ event.payload.message || '工具执行出现错误，请展开详情核实。' }}</div>
         <template v-if="snapshot?.task">
@@ -266,14 +263,10 @@ function waitingLabel(kind: string) { return ({ human: '请在页面完成复核
       </div>
     </details>
     <!-- 复用同一轮询和确认入口；待批准项移至输入框上方，执行历史留在消息列表。 -->
-    <Teleport v-if="snapshot?.task && (awaitingPlan || selectedAction)" :to="approvalTarget || 'body'" :disabled="!approvalTarget">
+    <Teleport v-if="snapshot?.task && selectedAction" :to="approvalTarget || 'body'" :disabled="!approvalTarget">
       <section class="approval-dock" aria-label="待批准操作">
-        <div class="approval-heading"><strong>{{ awaitingPlan ? '请确认本轮计划' : '需要你的批准' }}</strong><div v-if="!awaitingPlan && pendingActions.length > 1" class="approval-pagination"><button class="btn btn-sm" aria-label="上一项待批准操作" :disabled="busy || selectedIndex <= 0" @click="switchAction(-1)">‹</button><span>{{ selectedIndex + 1 }} / {{ pendingActions.length }}</span><button class="btn btn-sm" aria-label="下一项待批准操作" :disabled="busy || selectedIndex >= pendingActions.length - 1" @click="switchAction(1)">›</button></div></div>
-        <div v-if="awaitingPlan" class="confirmation-card">
-          <div class="confirmation-body"><strong>{{ snapshot.task.goal }}</strong><p>实际目标项目：{{ targetName(snapshot.task.project_id) }}</p><ol class="plan-steps"><li v-for="step in snapshot.task.steps" :key="step.id">{{ step.name }}</li></ol><p v-if="actionError || error" class="progress-error" role="alert">{{ actionError || error }}</p></div>
-          <div class="confirmation-buttons"><button class="btn btn-sm btn-primary" :disabled="busy" @click="act('plan')">{{ busy ? '处理中…' : `确认计划 v${snapshot.task.planVersion}` }}</button><button class="btn btn-sm" :disabled="busy" @click="act('stop')">停止本轮任务</button></div>
-        </div>
-        <div v-else-if="selectedAction" :key="selectedAction.action_id" class="confirmation-card">
+        <div class="approval-heading"><strong>需要你的批准</strong><div v-if="pendingActions.length > 1" class="approval-pagination"><button class="btn btn-sm" aria-label="上一项待批准操作" :disabled="busy || selectedIndex <= 0" @click="switchAction(-1)">‹</button><span>{{ selectedIndex + 1 }} / {{ pendingActions.length }}</span><button class="btn btn-sm" aria-label="下一项待批准操作" :disabled="busy || selectedIndex >= pendingActions.length - 1" @click="switchAction(1)">›</button></div></div>
+        <div :key="selectedAction.action_id" class="confirmation-card">
           <div class="confirmation-body"><strong>{{ displayBrand(selectedAction.tool_title) }}</strong><p>实际目标项目：{{ selectedAction.actual_target_projects.map(targetName).join('、') || targetName(snapshot.task.project_id) }}</p><p>{{ actionSummary(selectedAction) }}</p><details><summary>查看操作预览</summary><pre>{{ JSON.stringify(cardPreview(selectedAction.preview), null, 2) }}</pre></details><p v-if="actionError || error" class="progress-error" role="alert">{{ actionError || error }}</p></div>
           <div class="confirmation-buttons"><button class="btn btn-sm btn-primary" :disabled="busy" @click="act('confirm', selectedAction.action_id, selectedAction.revision)">{{ busy ? '处理中…' : approvalLabel(selectedAction) }}</button><button class="btn btn-sm" :disabled="busy" @click="act('reject', selectedAction.action_id)">拒绝</button></div>
         </div>

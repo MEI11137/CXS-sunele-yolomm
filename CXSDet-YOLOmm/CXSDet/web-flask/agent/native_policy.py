@@ -159,7 +159,7 @@ def decide(permission, workspace, mode):
             head = head.rstrip('\\/') or '.'
             candidate = Path(head)
             targets.append(str(candidate if candidate.is_absolute() else base / candidate))
-        return {'auto': False, 'kind': 'read', 'targets': targets,
+        return {'auto': bool(targets) and all(inside(base, target) for target in targets), 'kind': 'read', 'targets': targets,
                 'reason': '读取演示文件夹内的内容' if targets else '读取范围无法确定'}
     if permission.get('permission') in {'bash', 'shell'}:
         return command_decision(metadata.get('command'), workspace, mode)
@@ -180,3 +180,17 @@ def decide(permission, workspace, mode):
             'reason': '删除或仅移除内容需人工确认；本次批量操作一次批准' if deletion else
                       '修改或覆盖已有文件需要一次人工批准' if modifies_existing else
                       '按会话权限处理项目内文件修改' if auto else '请核对文件、差异和影响后批准'}
+
+
+def confined_permission(permission, decision, workspace):
+    """Remote users cannot approve commands whose complete scope is unknown."""
+    if decision['kind'] == 'unknown' or not decision['targets'] or not all(inside(workspace, path) for path in decision['targets']):
+        return False
+    if decision['kind'] == 'delete' and permission.get('permission') in {'bash', 'shell'}:
+        parsed = inspect_command((permission.get('metadata') or {}).get('command'))
+        commands = parsed.get('commands') or []
+        # Mixed commands must use explicit business tools or separate requests;
+        # paths collected from Remove-Item don't cover a second arbitrary call.
+        return bool(parsed.get('valid') and commands and all(
+            str(item.get('name') or '').lower() in DELETE_COMMANDS for item in commands))
+    return True

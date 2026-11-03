@@ -193,6 +193,7 @@ export interface ChatMessage {
   cards?: CardPayload[]
   created_at: number
   streaming?: boolean
+  intermediate?: boolean
 }
 
 export interface Attachment {

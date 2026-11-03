@@ -320,6 +320,7 @@ export function mapMessage(value: unknown): ChatMessage | null {
     session_id: str(obj.session_id),
     role,
     content: str(obj.content) || str(obj.text),
+    intermediate: Array.isArray(obj.refs) && obj.refs.some(ref => raw(ref).type === 'execution_note'),
     created_at: toMillis(obj.created_at, Date.now()),
     cards: undefined,
   }

@@ -70,8 +70,19 @@ def test_private_routes_and_mutable_credentials_are_not_public(gateway):
     for name in ['admin','other']:
         assert client.post('/api/user/login',json={'username':name,'password':'any'},base_url='https://judge.example.ts.net').status_code==403
     assert client.post('/api/user/login',json={'username':'judge','password':'any'},base_url='https://judge.example.ts.net').status_code==200
-    for path in ['/api/agent/connection','/api/agent/sessions/s/permission-mode','/api/user/register']:
+    for path in ['/api/agent/connection','/api/user/register']:
         assert client.post(path,json={},base_url='https://judge.example.ts.net').status_code==403
+
+
+def test_permission_mode_reaches_owner_checked_api_for_public_account(gateway):
+    app,client,_=gateway
+    @app.put('/api/agent/sessions/s/permission-mode')
+    def mode(): return jsonify(mode=request.json['mode'])
+    enter(client)
+    path='/api/agent/sessions/s/permission-mode'
+    assert client.put(path,json={'mode':'assist'},base_url='https://judge.example.ts.net').status_code==401
+    response=client.put(path,json={'mode':'assist'},base_url='https://judge.example.ts.net',headers={'Authorization':'Bearer judge-token'})
+    assert response.status_code==200 and response.json=={'mode':'assist'}
 
 
 def test_private_bridge_accepts_only_internal_path_and_real_loopback(gateway):

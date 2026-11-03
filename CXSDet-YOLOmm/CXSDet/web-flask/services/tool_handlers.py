@@ -70,6 +70,15 @@ def _asset(adapter, principal: int, asset_id: str, kinds: set[str]) -> dict:
     required = ("id", "bucket", "object_key", "project_id", "kind", "status")
     if any(key not in asset for key in required) or asset["id"] != str(asset_id).strip():
         raise ValueError("File asset resolver returned an invalid asset")
+    if asset['kind'] == 'project_file' and 'image' in kinds:
+        # v1.4 registered local images with the wrong kind. Validate bytes via
+        # the protected gateway, rather than accepting arbitrary project files.
+        local = Path(gateway.materialize(asset['bucket'], asset['object_key']))
+        try:
+            _verify_local_image(local)
+        finally:
+            local.unlink(missing_ok=True)
+        asset = {**asset, 'kind': 'image'}
     if asset["kind"] not in kinds:
         raise ToolRefused(
             "FILE_KIND_MISMATCH",
@@ -1907,7 +1916,7 @@ _LOCAL_FILE_KINDS = {
     "image": {
         "bucket": "project_uploads",
         "suffixes": {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"},
-        "kind": "project_file",
+        "kind": "image",
     },
     "dataset_archive": {
         "bucket": "project_uploads",
@@ -1981,6 +1990,8 @@ def _project_root(adapter, project_id: str) -> Path | None:
 
 def _register_local_asset(adapter, principal: int, project_id: str, path: Path, kind: str) -> dict:
     policy = _LOCAL_FILE_KINDS[kind]
+    if kind == 'image':
+        _verify_local_image(path)
     access = _project_file_access(adapter)
     saved = adapter.storage_client.upload(policy["bucket"], str(path))
     size = path.stat().st_size
@@ -2000,6 +2011,15 @@ def _register_local_asset(adapter, principal: int, project_id: str, path: Path, 
         "size": size,
         "url": saved.get("url"),
     }
+
+
+def _verify_local_image(path):
+    from PIL import Image, UnidentifiedImageError
+    try:
+        with Image.open(path) as image:
+            image.verify()
+    except (OSError, ValueError, UnidentifiedImageError) as exc:
+        raise ToolRefused('INVALID_IMAGE', '文件不是可读取的真实图片，不能送入检测') from exc
 
 
 def _project_file_access(adapter):

@@ -78,12 +78,13 @@ defineExpose({ jumpToLatest, jumpToTop })
         </div>
         <template v-for="msg in messages" :key="msg.id">
           <article class="chat-message" :class="`chat-${msg.role}`" :aria-label="msg.role === 'user' ? '我的消息' : '海巡助手回复'">
-            <div v-if="msg.role === 'assistant'" class="message-author"><span class="assistant-symbol" aria-hidden="true">✳</span>海巡助手</div>
+            <div v-if="msg.role === 'assistant' && !msg.intermediate" class="message-author"><span class="assistant-symbol" aria-hidden="true">✳</span>海巡助手</div>
             <div class="message-body">
               <div v-if="msg.attachments?.length" class="message-attachments"><span v-for="file in msg.attachments" :key="file.id" class="message-file">▧ {{ file.name }}</span></div>
-              <div class="message-text">{{ msg.content }}<span v-if="msg.streaming" class="stream-cursor" aria-hidden="true">▍</span></div>
+              <details v-if="msg.intermediate" class="execution-note"><summary>查看执行说明</summary><div class="message-text">{{ msg.content }}</div></details>
+              <div v-else class="message-text">{{ msg.content }}<span v-if="msg.streaming" class="stream-cursor" aria-hidden="true">▍</span></div>
             </div>
-            <div v-if="msg.content && !msg.streaming" class="message-actions"><button :aria-label="msg.role === 'user' ? '复制我的消息' : '复制助手回复'" @click="copy(msg)"><svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="7" y="7" width="10" height="10" rx="2"/><path d="M12 7V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h2"/></svg><span>{{ copied === msg.id ? '已复制' : '复制' }}</span></button></div>
+            <div v-if="msg.content && !msg.streaming && !msg.intermediate" class="message-actions"><button :aria-label="msg.role === 'user' ? '复制我的消息' : '复制助手回复'" @click="copy(msg)"><svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="7" y="7" width="10" height="10" rx="2"/><path d="M12 7V5a2 2 0 0 0-2-2H5a2 2 0 0 0 2 2v5a2 2 0 0 0 2 2h2"/></svg><span>{{ copied === msg.id ? '已复制' : '复制' }}</span></button></div>
           </article>
           <slot v-if="msg.id === lastUserId" name="progress"></slot>
         </template>
@@ -109,6 +110,7 @@ defineExpose({ jumpToLatest, jumpToTop })
 .message-body { max-width: 100%; min-width: 0; }
 .chat-user .message-body { max-width: 88%; padding: 12px 18px; border-radius: 18px; background: var(--panel-secondary); }
 .message-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.85; font-size: 14px; color: var(--text); }
+.execution-note summary { cursor: pointer; color: var(--text-secondary); font-size: 12px; }
 .message-author { font-size: 12px; font-weight: 600; display: flex; align-items: center; gap: 8px; margin: 0 0 12px; color: var(--text-secondary); }
 .assistant-symbol { font-size: 20px; color: var(--text); }
 .chat-assistant { padding: 4px 0; }

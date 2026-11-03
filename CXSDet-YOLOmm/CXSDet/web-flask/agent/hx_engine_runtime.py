@@ -72,7 +72,7 @@ def bridge_tools():
     runtime, engine, actor = _bridge_engine()
     return jsonify({"tools": [{"name": spec.name, "description": spec.description,
         "parameters": spec.parameters, "readonly": spec.readonly}
-        for spec in runtime.registry.specs(actor, engine.project_id)]})
+        for spec in runtime.registry.specs(actor, engine.project_id) if spec.name != 'propose_plan']})
 
 
 @hxengine_bp.post("/bridge/call")
@@ -105,6 +105,8 @@ def bridge_call():
             outcome = runtime._handle_tool_call(actor, session, project, task,
                 ToolCall(name=name, arguments=body.get("arguments", {})), LoopState(), memory.refresh(task["id"]))
             if outcome is not None:
+                if outcome.get('status') == tasks.STATUS_AWAITING_BUSINESS:
+                    outcome['message'] = '后台任务已接管。简短告知用户已提交并结束本轮回复；不要用 Shell 睡眠等待、轮询或重复启动，完成后网站会自动通知。'
                 return jsonify(engine.redact(outcome))
             old_ids = {item["id"] for item in before}
             results = [item["content"] for item in sessions.list_messages(session["id"])
@@ -112,6 +114,15 @@ def bridge_call():
             return jsonify(engine.redact({"status": "returned", "results": results}))
         except AgentError as exc:
             return jsonify(engine.redact({"error": exc.to_dict()}))
+        except FileNotFoundError:
+            return jsonify({'error': {'code': Code.RESOURCE_NOT_FOUND,
+                'message': '目标业务资源已删除或文件已不存在，请刷新资源列表后重新选择',
+                'execution_state': ExecutionState.UNKNOWN}})
+        except Exception:
+            current_app.logger.exception('engine_bridge_call_failed tool=%s', name)
+            return jsonify({'error': {'code': Code.TOOL_BACKEND_UNAVAILABLE,
+                'message': '业务工具执行异常，请核对服务端日志；结果待核实，不要重复提交写入',
+                'execution_state': ExecutionState.UNKNOWN}}), 500
 
 
 class HxEngineRuntime(AgentRuntime):
@@ -132,14 +143,15 @@ class HxEngineRuntime(AgentRuntime):
         self.registry.add_provider(WorkspaceTools())
 
     def _plan_gate(self, task, spec):
-        from agent.business_approval import automatic_mode
-        if automatic_mode(load_actor(task['owner_id']), task['session_id'], spec):
-            return None
-        from agent.inspection_loop import START, ROUTE
-        # 自带完整持久预览的工具不再要求第二份计划；执行按会话策略决定。
-        if spec.name in (START, ROUTE, 'workspace_review_record', 'workspace_manage_resource', 'workspace_delete_records', 'workspace_add_feedback', 'workspace_manage_project', 'workspace_manage_session', 'workspace_manage_manual', 'workspace_export_records_csv'):
-            return None
-        return super()._plan_gate(task, spec)
+        # OpenCode handles planning internally. Only concrete protected actions
+        # use approval cards; counting past writes must never add a plan gate.
+        return None
+
+    def _handle_tool_call(self, actor, session, project, task, call, state, note):
+        if call.name == 'propose_plan':
+            # Compatibility with an engine conversation cached before v1.5.
+            return {'status': 'continue', 'message': '无需计划卡或版本确认。信息齐全直接执行；缺少必要信息请用 ask_user 对话追问。'}
+        return super()._handle_tool_call(actor, session, project, task, call, state, note)
 
     def _automatic_business_mode(self, actor, session, spec, source):
         from agent.business_approval import automatic_mode
@@ -183,7 +195,7 @@ class HxEngineRuntime(AgentRuntime):
             self.registry.specs(actor, session["project_id"])]).encode()).hexdigest()
         demo_root = self.app.config.get("DEMO_WORKSPACE_ROOT")
         native_allowed = bool(demo_root) and workspace is not None and \
-            Path(demo_root).resolve() == Path(workspace).resolve()
+            Path(workspace).resolve().is_relative_to(Path(demo_root).resolve())
         return self.pool.get(actor, session, credentials, root, origin,
                              catalogue_key=catalogue_key, workspace=workspace, native_allowed=native_allowed)
 
@@ -247,6 +259,9 @@ class HxEngineRuntime(AgentRuntime):
                 "engine": "hxengine", "engine_version": "1.19.4"}
 
     def _run_loop(self, actor, session, project, task, *, resources=None, resume_reason=""):
+        if task['status'] == tasks.STATUS_AWAITING_PLAN:
+            tasks.clear_waiting(task['id'])
+            tasks.set_status(task['id'], tasks.STATUS_RUNNING, force=True)
         resumed = self._resume_automatic_actions(actor, session, project, task)
         if resumed is not None:
             return resumed
@@ -273,7 +288,10 @@ class HxEngineRuntime(AgentRuntime):
                 "停止依赖步骤，向用户说明；可继续回答无关问题。用户确认后会收到真实业务结果。"
                 "不要用文件或 Shell 工具修改网站数据库、权重注册或人工确认状态。"
                 "只在网站提供的项目工作目录内处理文件，不修改网站源码或业务数据库。原生权限批准不等于业务确认。"
-                "复杂业务任务通过 propose_plan 提计划；使用 ask_user 追问，wait_human 衔接人工页面。")
+                "自行安排执行步骤，不创建计划确认卡；缺少必要信息用 ask_user 对话追问，wait_for_human 衔接人工页面。")
+            system = '\n'.join(line for line in system.splitlines()
+                if '先用 propose_plan' not in line and '提出计划时，每个可执行步骤' not in line)
+            system += '\n历史计划及版本仅供参考，不再需要计划确认，不因旧计划阻止操作。只向用户简明汇报结论、进度和待补信息，不输出内部推理、长篇自我分析或重复执行旁白。工具过程由界面单独折叠展示。'
             mode = sessions.get_session(actor, session['id']).get('permission_mode', 'request')
             if mode in {'assist', 'full'}:
                 system = system.replace('训练、发布、反馈回流、定稿等业务动作由程序生成确认卡片；项目文件与命令按当前会话权限模式由程序判定；',
@@ -321,9 +339,10 @@ class HxEngineRuntime(AgentRuntime):
             system += ("\n用户要求从项目文件完成自动巡检闭环时，先用 workspace_discover_inputs 查候选，"
                 "明确一份数据集、一份权重、图片数量与置信度，然后直接调用 workspace_start_inspection_loop。"
                 "发现工具已返回类别、数量及模态摘要，整轮工具还会检查确切样本和文件哈希；参数齐全后不要再先用 Shell 逐张或逐目录计数。"
-                "它生成包含文件、类别索引对应、模态、检测范围和付费核查数量的整轮确认卡；无需额外 propose_plan，"
+                "它检查文件、类别索引、模态、检测范围和付费核查数量；不创建整体计划卡，按会话权限模式执行具体操作。"
                 "不要把这个整轮任务拆成逐份附件登记、单图检测或逐项业务确认。一次确认后由网站批任务持续推进，"
-                "用 workspace_inspection_state 查询真实进度，不能重复启动或声称尚未发生的成功。"
+                "仅在用户询问进度时用 workspace_inspection_state 查询。工具返回 awaiting_business 后简短回复已提交并结束本轮，"
+                "网站会自动发送真实结果和打开复核页；不要用 Shell/Start-Sleep 等待或连续轮询，不重复启动或声称尚未发生的成功。"
                 "复核支持页面操作或对话操作：结合消息的复核页面上下文定位当前记录和选中框，不要猜ID；先用workspace_review_state核实真实版本。"
                 "用workspace_review_view控制缩放、平移、选择或切换视图；用workspace_review_record准备草稿、修改框/类别/严重程度、确认无缺陷、驳回、删除或恢复。"
                 "用户只要求改草稿时operation=draft，不能顺便提交；坐标不明确先追问，不能凭文字编造框。"
@@ -363,15 +382,15 @@ class HxEngineRuntime(AgentRuntime):
             engine.worker.start()
             return self._snapshot(task["id"])
 
-    def _save_message(self, engine, task_id, remote_id, text):
+    def _save_message(self, engine, task_id, remote_id, text, *, intermediate=False):
         text = engine.redact(text)
         key = "oc_" + hashlib.sha256((engine.site_session + remote_id).encode()).hexdigest()[:28]
         conn = connect()
         try:
             conn.execute("INSERT INTO agent_message (id, session_id, task_id, role, content, refs_json, created_at) "
-                "VALUES (?, ?, ?, 'assistant', ?, '[]', ?) ON CONFLICT(id) DO UPDATE SET content=excluded.content "
+                "VALUES (?, ?, ?, 'assistant', ?, ?, ?) ON CONFLICT(id) DO UPDATE SET content=excluded.content, refs_json=excluded.refs_json "
                 "WHERE agent_message.session_id=excluded.session_id AND agent_message.task_id=excluded.task_id",
-                (key, engine.site_session, task_id, text, now()))
+                (key, engine.site_session, task_id, text, dumps([{'type': 'execution_note'}] if intermediate else []), now()))
             conn.commit()
         finally:
             conn.close()
@@ -390,13 +409,12 @@ class HxEngineRuntime(AgentRuntime):
 
     def _fallback_reply(self, engine, actor, session, task, notes, errors):
         """引擎被拒绝或异常收尾且没留下文字时，补一条可以据以继续的说明。"""
-        if notes:
-            text = ("本轮有操作被权限策略拒绝，引擎收到拒绝后提前结束了这一轮，所以没有留下答复。"
-                "该调用未获批准；此前已执行操作及文件变化请以执行记录为准。\n\n"
-                + "\n".join(f"- {note}" for note in notes[:5])
-                + "\n\n建议改成纯读取的简单命令，例如 "
-                  "`Get-ChildItem -LiteralPath \"<项目目录>\" -Recurse -Filter *.jpg`；"
-                  "需要新建、修改或删除文件时，请说明目标，我会走确认流程。")
+        from agent.inspection_loop import task_run, ACTIVE
+        batch = task_run(task['id'])
+        if batch and batch['status'] in ACTIVE:
+            text = '巡检任务已提交后台，完成后会自动通知并打开人工复核。无需再次发消息或重复启动。'
+        elif notes:
+            text = '有一项调用被权限策略拒绝，未执行该调用。已完成结果保留，具体原因可展开执行过程查看。'
         elif errors:
             text = "本轮模型调用结束，但没有返回文字答复。引擎报告：" + str(errors[-1])[:300]
         else:
@@ -406,7 +424,7 @@ class HxEngineRuntime(AgentRuntime):
         tasks.append_event(session["id"], task["id"], tasks.EVENT_ASSISTANT_MESSAGE, {"content": text})
 
     def _permissions(self, engine, actor, task_id):
-        from agent.native_policy import decide, inside, MODES
+        from agent.native_policy import decide, inside, confined_permission, MODES
         from agent.project_folders import checked_project_root
         current_session = sessions.get_session(actor, engine.site_session)
         mode = current_session.get('permission_mode', 'request')
@@ -426,20 +444,18 @@ class HxEngineRuntime(AgentRuntime):
                                           "decision": decision, "root": str(root), "ws": str(engine.workspace)},
                                          ensure_ascii=False, default=str)[:1500], flush=True, file=sys.stderr)
             if not actor.is_admin:
-                # 演示账号：只在演示文件夹范围内自动批准一次，其他目标一律拒绝。
-                confined = (root is not None and root == engine.workspace and bool(decision['targets'])
-                            and all(inside(engine.workspace, path) for path in decision['targets']))
-                engine.request("POST", f"/permission/{item['id']}/reply", {"reply": "once" if confined else "reject"})
-                tasks.append_event(engine.site_session, task_id,
-                                   'permission.demo_approved' if confined else 'permission.demo_rejected',
-                                   {'kind': decision['kind'], 'mode': mode,
-                                    'reason': '演示文件夹内的操作自动批准' if confined else '操作目标不在演示文件夹内'})
+                # Ordinary accounts use the same mode rules inside their bound
+                # folder. An empty/unknown scope is never an automatic grant.
+                confined = (root is not None and root == engine.workspace
+                            and confined_permission(item, decision, engine.workspace))
                 if not confined:
-                    # 引擎拿到拒绝后会直接结束本轮且不再产出文字，先记下来以便补一条说明。
+                    engine.request("POST", f"/permission/{item['id']}/reply", {"reply": "reject"})
+                    tasks.append_event(engine.site_session, task_id, 'permission.demo_rejected',
+                        {'kind': decision['kind'], 'mode': mode, 'reason': '无法确认操作完全位于当前项目文件夹内，请改用有明确目标的业务工具'})
                     if not hasattr(engine, "turn_notes"):
                         engine.turn_notes = []
                     engine.turn_notes.append(self._rejection_note(item, decision))
-                continue
+                    continue
             automatic = (decision['auto'] and (root is None or root == engine.workspace)
                          and all(inside(engine.workspace, path) for path in decision['targets']))
             existing = engine.native_actions.get(item['id'])
@@ -496,7 +512,10 @@ class HxEngineRuntime(AgentRuntime):
                         if generation != engine.generation:
                             return
                         if text:
-                            self._save_message(engine, task_id, info["id"], text)
+                            self._save_message(engine, task_id, info["id"], text,
+                                intermediate=tasks.get_task_by_id(task_id)['status'] == tasks.STATUS_AWAITING_INPUT or
+                                info.get('finish') in {'tool-calls', 'tool_calls'} or
+                                any(part.get('type') == 'tool' for part in row.get('parts', [])))
                         self._save_tool_events(engine, actor, task_id, row.get("parts", []))
                     statuses = engine.request("GET", "/session/status") or {}
                     active = statuses.get(engine.remote_session, {}).get("type") not in {None, "idle"}
@@ -597,8 +616,6 @@ class HxEngineRuntime(AgentRuntime):
                 self.pool.discard(actor.user_id,project_id=output.get('id') if action['tool_name']=='workspace_manage_project' else None,
                                   session_id=output.get('id') if action['tool_name']=='workspace_manage_session' else None)
             return response
-        if not actor.is_admin:
-            raise AgentError(Code.FORBIDDEN, "本机文件/命令工具仅允许管理员确认", http_status=403)
         if action["status"] in {actions.STATUS_REJECTED, actions.STATUS_SUPERSEDED}:
             raise AgentError(Code.ACTION_ALREADY_DECIDED, "该操作已拒绝或失效，不能再次批准", http_status=409)
         engine = self.pool.find(actor, action["session_id"])
@@ -621,6 +638,11 @@ class HxEngineRuntime(AgentRuntime):
             detail = engine.redact({key: pending.get(key) for key in ("permission", "patterns", "metadata", "tool")})
             if detail != action["parameters"]["detail"]:
                 raise AgentError(Code.ACTION_STALE, "命令参数已变化，不能使用旧确认", http_status=409)
+            if not actor.is_admin:
+                from agent.native_policy import decide, confined_permission
+                decision = decide(pending, engine.workspace, sessions.get_session(actor, engine.site_session)['permission_mode'])
+                if workspace != engine.workspace or not confined_permission(pending, decision, workspace):
+                    raise AgentError(Code.FORBIDDEN, '操作必须完全位于本人当前项目文件夹内', http_status=403)
             claimed = actions.confirm(actor, action_id, expected_revision=expected_revision)
             if claimed["claimed"]:
                 try:

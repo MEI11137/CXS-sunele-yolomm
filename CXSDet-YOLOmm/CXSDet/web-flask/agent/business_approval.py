@@ -7,7 +7,7 @@ from agent.tools.contract import SOURCE_BUSINESS
 
 ROUTINE_TOOLS = frozenset({
     'workspace_export_records_csv',
-    'workspace_attach_file', 'workspace_add_feedback',
+    'workspace_attach_file', 'workspace_add_feedback', 'business_file_register_local',
     'workspace_start_inspection_loop', 'workspace_route_reviewed_samples',
     'business_detection_run', 'business_review_ai', 'business_feedback_add_confirmed',
     'business_dataset_import', 'business_dataset_transform', 'business_dataset_split',

@@ -26,7 +26,8 @@ class ProjectTools(ToolProvider):
             "tab": {"type": "string", "enum": ['images', 'feedback', 'drafts']},
             "status": {"type": "string", "enum": ['all', 'pending', 'done', 'rejected'], "description": "识别记录页面状态筛选"}}, ["page"]),
             spec("workspace_list_resources", "列出当前项目的数据集、模型、识别记录、上传文件和已授权目录，返回真实 ID", {}, [])]
-        if actor.is_admin:
+        from agent.project_folders import demo_root
+        if actor.is_admin or demo_root() is not None:
             result.append(spec("workspace_attach_file", "把当前项目目录中的 ZIP、PT、图片或资料登记成上传附件；确认后复制保存，原文件不改。随后调用已有导入/检测工具处理附件 ID", {
                 "path": {"type": "string", "description": "项目目录内的相对路径或绝对文件路径"}}, ["path"], RISK_WRITE))
         return result

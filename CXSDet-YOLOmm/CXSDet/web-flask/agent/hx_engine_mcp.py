@@ -7,6 +7,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
+import urllib.error
 import urllib.request
 
 from mcp.server import Server
@@ -25,6 +27,40 @@ def relay(method, path, payload=None):
         return json.load(response)
 
 
+def call_relay(name, arguments):
+    try:
+        return relay('POST', '/call', {'name': name, 'arguments': arguments or {}})
+    except urllib.error.HTTPError as exc:
+        # Preserve structured business errors; never turn an HTTP 500 into
+        # "tool not connected", or expose HTML tracebacks and credentials.
+        try:
+            body = json.load(exc)
+            error = body.get('error') if isinstance(body, dict) else None
+            if isinstance(error, dict) and isinstance(error.get('code'), str):
+                return {'error': error}
+        except (ValueError, OSError):
+            pass
+        return {'error': {'code': 'AGENT_BRIDGE_HTTP_ERROR',
+            'message': f'业务工具返回 HTTP {exc.code}，请核对服务端日志；不要重复提交写入',
+            'execution_state': 'unknown'}}
+    except (TimeoutError, socket.timeout):
+        return {'error': {'code': 'AGENT_BRIDGE_TIMEOUT',
+            'message': '业务工具响应超时，结果待核实，请先查询状态，不要重复提交写入',
+            'execution_state': 'unknown'}}
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            return {'error': {'code': 'AGENT_BRIDGE_TIMEOUT',
+                'message': '业务工具响应超时，结果待核实，请先查询状态，不要重复提交写入',
+                'execution_state': 'unknown'}}
+        return {'error': {'code': 'AGENT_BRIDGE_UNAVAILABLE',
+            'message': '业务工具连接不可用，请检查服务器私有桥接服务；不要重复提交写入',
+            'execution_state': 'unknown'}}
+    except Exception:
+        return {'error': {'code': 'AGENT_BRIDGE_UNAVAILABLE',
+            'message': '业务工具连接不可用，请检查服务器私有桥接服务；不要重复提交写入',
+            'execution_state': 'unknown'}}
+
+
 async def main():
     server = Server("haixun_mcp")
 
@@ -39,14 +75,9 @@ async def main():
 
     @server.call_tool()
     async def call_tool(name, arguments):
-        try:
-            data = await asyncio.to_thread(relay, "POST", "/call",
-                                           {"name": name, "arguments": arguments or {}})
-            return CallToolResult(content=[TextContent(type="text", text=json.dumps(data, ensure_ascii=False))],
-                                  structuredContent=data, isError=bool(data.get("error")))
-        except Exception:
-            # 不回显 URL、令牌、请求体或模型 Key。
-            return CallToolResult(content=[TextContent(type="text", text="海巡智检工具连接失败；请在网站核对状态，不要重复提交写入。")], isError=True)
+        data = await asyncio.to_thread(call_relay, name, arguments)
+        return CallToolResult(content=[TextContent(type="text", text=json.dumps(data, ensure_ascii=False))],
+                              structuredContent=data, isError=bool(data.get("error")))
 
     async with stdio_server() as (reader, writer):
         await server.run(reader, writer, server.create_initialization_options())

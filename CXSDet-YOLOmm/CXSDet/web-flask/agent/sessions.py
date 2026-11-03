@@ -128,8 +128,6 @@ def set_permission_mode(actor: ActorContext, session_id: str, mode: str) -> Dict
     get_session(actor, session_id)
     if mode not in {'request', 'assist', 'full'}:
         raise AgentError(Code.VALIDATION, '未知权限模式')
-    if not actor.is_admin:
-        raise AgentError(Code.FORBIDDEN, '本机文件权限模式仅限本机管理员设置', http_status=403)
     conn = connect()
     try:
         conn.execute('UPDATE agent_session SET permission_mode=?, updated_at=? WHERE id=? AND owner_id=?',

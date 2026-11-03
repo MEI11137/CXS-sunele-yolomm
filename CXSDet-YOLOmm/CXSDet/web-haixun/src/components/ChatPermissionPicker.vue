@@ -44,7 +44,7 @@ async function choose(mode: Mode) {
   await save(mode)
 }
 async function save(mode: Mode) {
-  if (saving.value || props.disabled || auth.user?.role !== 1) return
+  if (saving.value || props.disabled || !auth.user) return
   saving.value = true
   const projectId = workspace.currentId
   try {
@@ -71,11 +71,10 @@ async function save(mode: Mode) {
       <div class="permission-popover" :style="popupStyle" role="dialog" aria-label="海巡助手权限">
         <strong class="picker-title">海巡助手权限</strong>
         <p class="scope-note">帮我批准 / 完全访问不会对每张检测或AI核查重复弹卡。文件访问限项目授权范围；已有文件删改、人工标注决定及未知命令保留批准。</p>
-        <template v-if="auth.user?.role === 1">
+        <template v-if="auth.user">
           <button v-for="mode in modes" :key="mode.id" class="mode-option" :class="{ selected: selected === mode.id }" :disabled="saving || disabled" @click="choose(mode.id)"><span class="option-heading">{{ mode.label }}<span v-if="selected === mode.id">✓</span></span><span class="option-desc">{{ mode.desc }}</span></button>
           <div v-if="pending" class="enable-confirm"><strong>启用{{ modes.find(item => item.id === pending)?.label }}？</strong><p>{{ modes.find(item => item.id === pending)?.desc }}待确认且符合此规则的文件操作，也会按新模式继续。</p><div class="confirm-buttons"><button class="btn btn-sm btn-primary" :disabled="saving || disabled" @click="save(pending)">启用此模式</button><button class="btn btn-sm" @click="pending = null">取消</button></div></div>
         </template>
-        <p v-else class="scope-note">普通账号保留网站业务权限；本机文件/命令授权需使用本机管理员账号。</p>
         <p class="scope-note bottom-note">批量删改先说明整批范围，一次批准当前操作；修改目标后重新确认。自动业务仍检查权限、真实状态和防重，不代表可自行训练、发布或扩大核查范围。</p>
         <p v-if="notice" class="error" role="alert">{{ notice }}</p>
       </div>

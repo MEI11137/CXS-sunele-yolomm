@@ -236,8 +236,7 @@ class AgentBackendTest(unittest.TestCase):
     def test_permission_mode_is_persisted_owner_only_and_not_model_controlled(self):
         session = self._session()
         self.assertEqual(sessions.get_session(self.a1, session['id'])['permission_mode'], 'request')
-        with self.assertRaises(AgentError):
-            sessions.set_permission_mode(self.a1, session['id'], 'assist')
+        self.assertEqual(sessions.set_permission_mode(self.a1, session['id'], 'assist')['permission_mode'], 'assist')
         conn = store.connect()
         try:
             conn.execute('UPDATE user SET role=1 WHERE id=1')

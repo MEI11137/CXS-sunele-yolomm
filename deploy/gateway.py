@@ -69,8 +69,8 @@ def install_gateway(app,dist,config,*,login_allowed,token_allowed):
             # 只放行"在预置清单内切换模型"这一个写接口，其余连接配置仍限本机。
             if path=='/api/agent/connection/model' and request.method=='POST':
                 pass
-            elif (path.startswith('/api/agent/connection') and request.method!='GET') or path.endswith('/permission-mode'):
-                return denied('模型连接和权限模式请在服务器本机预先配置')
+            elif path.startswith('/api/agent/connection') and request.method!='GET':
+                return denied('模型连接请在服务器本机预先配置')
             header=request.headers.get('Authorization','')
             token=header[7:] if header.startswith('Bearer ') else request.cookies.get('cxs_file_session') if path.startswith('/api/file/') else None
             if not token or not token_allowed(token): return denied('缺少有效的普通演示账号登录',401)

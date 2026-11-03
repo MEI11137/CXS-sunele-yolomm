@@ -1,14 +1,14 @@
-# 海巡智检 v1.4
+# 海巡智检 v1.5
 
 基于 Vue 3、Flask 和 YOLO 的巡检系统，支持图片、视频和实时检测，以及视觉大模型辅助核查。
 
-## 当前版本 1.4.0
+## 当前版本 1.5.0
 
-GitHub 版本分支为 `release/haixun-v1.4.0`。本版汇总此前已上传的修复及普通评委账号真实闭环验收，基线为 `67f276f`；更名不会清空业务数据或替换训练环境。网站内部仍使用海巡引擎 1.19.4，并保留原人工操作入口。源码不包含个人 API 配置、数据库、测试记录、模型权重、原始数据或本机依赖；新安装从空业务数据开始。模型服务繁忙时仍可能超时，真实 GPU 训练与公网入口仍须在训练服务器验收。
+GitHub 版本分支为 `release/haixun-v1.5.0`。本版基于 v1.4 与真实评委日志修复权限切换、计划卡阻塞、本地图片检测及闭环工具错误；保留原有业务数据与训练环境。网站内部仍使用海巡引擎 1.19.4，并保留原人工操作入口。源码不包含个人 API 配置、数据库、测试记录、模型权重、原始数据或本机依赖；新安装从空业务数据开始。模型服务繁忙时仍可能超时，真实 GPU 训练与公网入口仍须在训练服务器验收。
 
-- [海巡智检 v1.4 版本说明](docs/releases/haixun-v1.4.md)
+- [海巡智检 v1.5 版本说明](docs/releases/haixun-v1.5.md)
 - [另一台电脑部署与更新](先读我_另一台电脑部署.md)
-- [下载本版源码 ZIP](https://github.com/MEI11137/CXS-sunele-yolomm/archive/refs/heads/release/haixun-v1.4.0.zip)
+- [下载本版源码 ZIP](https://github.com/MEI11137/CXS-sunele-yolomm/archive/refs/heads/release/haixun-v1.5.0.zip)
 
 GitHub 源码 ZIP 不含预构建的 `dist`。远程演示前须在 `web-haixun` 执行 `npm ci` 和 `npm run build`；原有运行依赖与加密配置须在服务器本机准备，不能直接照抄开发电脑路径。
 
