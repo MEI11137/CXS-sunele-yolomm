@@ -25,6 +25,21 @@ NATIVE_TOOL = "engine_permission"
 _INIT_LOCK = threading.RLock()
 
 
+def _model_failure_message(error):
+    """Expose only a known status, never provider headers, bodies or credentials."""
+    data = error.get('data') if isinstance(error, dict) else None
+    status = data.get('statusCode') if isinstance(data, dict) else None
+    if type(status) is not int:
+        return '大模型调用失败，本轮未获得完整回复；请检查个人连接或稍后重试'
+    if status in {401, 403}:
+        return f'大模型连接认证或访问失败（{status}），请检查密钥、服务商地址与模型权限'
+    if status == 429:
+        return '大模型服务限流（429），本轮未获得完整回复；请稍后重试'
+    if 500 <= status <= 599:
+        return f'大模型服务暂时不可用（{status}），本轮未获得完整回复；已完成的工具结果保留，请稍后继续'
+    return f'大模型请求失败（{status}），本轮未获得完整回复；请检查个人连接和模型支持能力'
+
+
 @hxengine_bp.errorhandler(AgentError)
 def bridge_error(exc):
     return jsonify({"error": exc.to_dict()}), exc.http_status
@@ -506,7 +521,7 @@ class HxEngineRuntime(AgentRuntime):
                                 return
                             if errors:
                                 raise AgentError(Code.MODEL_CALL_FAILED,
-                                    "海巡引擎 模型调用失败，请核对个人模型连接：" + str(errors[-1])[:250])
+                                    _model_failure_message(errors[-1]))
                             if not latest or not any(p.get('type') == 'text' and p.get('text', '').strip()
                                                      and not p.get('synthetic') for p in latest.get('parts', [])):
                                 self._fallback_reply(engine, actor, sessions.get_session(actor, engine.site_session),
