@@ -1,0 +1,70 @@
+### .run\backend-20261031-192303.err.log（1 命中）
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+
+### .run\backend-20261101-132545.err.log（1 命中）
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+
+### .run\backend-20261101-134049.err.log（1 命中）
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+
+### .run\backend-20261101-134655.err.log（1 命中）
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+
+### .run\backend-20261101-134734.err.log（1 命中）
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+
+### .run\backend-20261102-171456.err.log（1 命中）
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+
+### .run\backend-20261102-191000.err.log（1 命中）
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+
+### .run\backend-20261103-192220.err.log（1 命中）
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+
+### .run\backend-20261103-193009.err.log（1 命中）
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+
+### .run\demo-err.log（12 命中）
+ERROR:app:Exception on /api/agent/engine/bridge/call [POST]
+Traceback (most recent call last):
+    raise FileNotFoundError("Model is not registered")
+FileNotFoundError: Model is not registered
+ERROR:app:Exception on /api/agent/engine/bridge/call [POST]
+Traceback (most recent call last):
+    raise FileNotFoundError("Model is not registered")
+FileNotFoundError: Model is not registered
+ERROR:app:Exception on /api/agent/engine/bridge/call [POST]
+Traceback (most recent call last):
+    raise FileNotFoundError("Model is not registered")
+FileNotFoundError: Model is not registered
+
+### .run\demo-out.log（1 命中）
+WARNING : 'modalities'  'modality'
+
+### .run\backend-20261031-192303.err.log（1 命中）
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+
+### .run\backend-20261101-132545.err.log（1 命中）
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+
+### .run\backend-20261101-134049.err.log（1 命中）
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+
+### .run\backend-20261101-134655.err.log（1 命中）
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+
+### .run\backend-20261101-134734.err.log（1 命中）
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+
+### .run\backend-20261102-171456.err.log（1 命中）
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+
+### .run\backend-20261102-191000.err.log（1 命中）
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+
+### .run\backend-20261103-192220.err.log（1 命中）
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+
+### .run\backend-20261103-193009.err.log（1 命中）
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m

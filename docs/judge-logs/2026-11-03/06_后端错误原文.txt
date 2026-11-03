@@ -1,0 +1,90 @@
+# 后端 stderr 中的异常原文（.run/demo-err.log，按 GBK 解码去重）
+
+每条异常出现次数：
+
+- 1 次：Traceback (most recent call last):
+- 1 次：FileNotFoundError: Model is not registered
+
+---
+
+  fig.savefig(plot_fname, dpi=250)
+ERROR:app:Exception on /api/agent/engine/bridge/call [POST]
+Traceback (most recent call last):
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\.venv\Lib\site-packages\flask\app.py", line 1511, in wsgi_app
+    response = self.full_dispatch_request()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\.venv\Lib\site-packages\flask\app.py", line 919, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\.venv\Lib\site-packages\flask_cors\extension.py", line 176, in wrapped_function
+    return cors_after_request(app.make_response(f(*args, **kwargs)))
+                                                ^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\.venv\Lib\site-packages\flask\app.py", line 917, in full_dispatch_request
+    rv = self.dispatch_request()
+         ^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\.venv\Lib\site-packages\flask\app.py", line 902, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\CXSDet-YOLOmm\CXSDet\web-flask\agent\hx_engine_runtime.py", line 105, in bridge_call
+    outcome = runtime._handle_tool_call(actor, session, project, task,
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\CXSDet-YOLOmm\CXSDet\web-flask\agent\runtime.py", line 640, in _handle_tool_call
+    prepared = provider.prepare(actor, spec, arguments,
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\CXSDet-YOLOmm\CXSDet\web-flask\services\project_storage.py", line 93, in wrapper
+    return func(self, actor, spec, arguments, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\CXSDet-YOLOmm\CXSDet\web-flask\agent\inspection_loop.py", line 385, in prepare
+    row = backend._model_row(resource['source_id'])
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\CXSDet-YOLOmm\CXSDet\web-flask\services\business_tools.py", line 429, in _model_row
+    raise FileNotFoundError("Model is not registered")
+FileNotFoundError: Model is not registered
+ERROR:app:Exception on /api/agent/engine/bridge/call [POST]
+Traceback (most recent call last):
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\.venv\Lib\site-packages\flask\app.py", line 1511, in wsgi_app
+    response = self.full_dispatch_request()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\.venv\Lib\site-packages\flask\app.py", line 919, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\.venv\Lib\site-packages\flask_cors\extension.py", line 176, in wrapped_function
+
+----------------------------------------------------------------------
+
+FileNotFoundError: Model is not registered
+ERROR:app:Exception on /api/agent/engine/bridge/call [POST]
+Traceback (most recent call last):
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\.venv\Lib\site-packages\flask\app.py", line 1511, in wsgi_app
+    response = self.full_dispatch_request()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\.venv\Lib\site-packages\flask\app.py", line 919, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\.venv\Lib\site-packages\flask_cors\extension.py", line 176, in wrapped_function
+    return cors_after_request(app.make_response(f(*args, **kwargs)))
+                                                ^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\.venv\Lib\site-packages\flask\app.py", line 917, in full_dispatch_request
+    rv = self.dispatch_request()
+         ^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\.venv\Lib\site-packages\flask\app.py", line 902, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\CXSDet-YOLOmm\CXSDet\web-flask\agent\hx_engine_runtime.py", line 105, in bridge_call
+    outcome = runtime._handle_tool_call(actor, session, project, task,
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\CXSDet-YOLOmm\CXSDet\web-flask\agent\runtime.py", line 640, in _handle_tool_call
+    prepared = provider.prepare(actor, spec, arguments,
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\CXSDet-YOLOmm\CXSDet\web-flask\services\project_storage.py", line 93, in wrapper
+    return func(self, actor, spec, arguments, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\CXSDet-YOLOmm\CXSDet\web-flask\agent\inspection_loop.py", line 385, in prepare
+    row = backend._model_row(resource['source_id'])
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\智能体创新大赛\海巡智检v1.4_完整源码\CXSDet-YOLOmm\CXSDet\web-flask\services\business_tools.py", line 429, in _model_row
+    raise FileNotFoundError("Model is not registered")
+FileNotFoundError: Model is not registered
+
+----------------------------------------------------------------------
+
