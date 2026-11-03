@@ -141,9 +141,15 @@ def test_csv_exports_only_current_project_page_with_safe_values_into_workspace(s
 
 
 def test_export_automatic_and_management_still_have_specific_confirmation(setup):
-    f=setup;runtime=HxEngineRuntime(f.app);sessions.set_permission_mode(f.actor,f.chat['id'],'full')
+    f=setup;runtime=HxEngineRuntime(f.app)
+    # full：内置业务（含项目/会话管理等已授权业务操作）直接执行，不生成确认卡。
+    sessions.set_permission_mode(f.actor,f.chat['id'],'full')
     assert invoke(f,runtime,f.task,'workspace_export_records_csv',{}) is None
     assert not actions.list_actions(f.task['id'],[actions.STATUS_PENDING])
+    assert invoke(f,runtime,f.task,'workspace_manage_session',{'operation':'create','title':'完全访问自动'}) is None
+    assert not actions.list_actions(f.task['id'],[actions.STATUS_PENDING])
+    # assist：同一业务动作仍需一张具体确认卡。
+    sessions.set_permission_mode(f.actor,f.chat['id'],'assist')
     out=invoke(f,runtime,f.task,'workspace_manage_session',{'operation':'create','title':'需确认'})
     assert out['status']==tasks.STATUS_AWAITING_ACTION
 

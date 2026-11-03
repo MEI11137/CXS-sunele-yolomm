@@ -314,13 +314,16 @@ export function mapMessage(value: unknown): ChatMessage | null {
   if (!id) return null
   const roleRaw = str(obj.role)
   if (roleRaw === 'tool' || roleRaw === 'system_event') return null
+  const refs = Array.isArray(obj.refs) ? obj.refs.map(ref => raw(ref)) : []
+  // 升级前误入库的引擎压缩摘要已由服务端标记；只认结构标记，不按正文猜测。
+  if (refs.some(ref => ref.type === 'internal_context')) return null
   const role = roleRaw === 'user' || roleRaw === 'system' ? roleRaw : 'assistant'
   return {
     id,
     session_id: str(obj.session_id),
     role,
     content: str(obj.content) || str(obj.text),
-    intermediate: Array.isArray(obj.refs) && obj.refs.some(ref => raw(ref).type === 'execution_note'),
+    intermediate: refs.some(ref => ref.type === 'execution_note'),
     created_at: toMillis(obj.created_at, Date.now()),
     cards: undefined,
   }

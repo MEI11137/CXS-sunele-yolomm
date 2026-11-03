@@ -253,8 +253,19 @@ def check_still_valid(row: Dict[str, Any]) -> None:
 
 
 def confirm(actor: ActorContext, action_id: str, *, expected_revision: Optional[int] = None,
-            decision_source: str = 'human') -> Dict[str, Any]:
-    """领取执行权。返回 ``{"claimed": bool, "action": {...}}``。"""
+            decision_source: str = 'human', human_clicked: Optional[bool] = None) -> Dict[str, Any]:
+    """领取执行权。返回 ``{"claimed": bool, "action": {...}}``。
+
+    ``human_clicked`` 默认从 ``decision_source`` 推导：会话策略领取一律记为
+    ``False``，人工点击路径一律记为 ``True``。不给调用方留下可写出互相矛盾
+    事件的组合，HTTP 确认接口也不透传该参数。
+    """
+    if decision_source not in ('human', 'session_policy'):
+        raise AgentError(Code.VALIDATION, '未知的确认来源', http_status=400)
+    if human_clicked is None:
+        human_clicked = decision_source != 'session_policy'
+    elif bool(human_clicked) != (decision_source != 'session_policy'):
+        raise AgentError(Code.VALIDATION, '确认来源与人工点击标记不一致', http_status=400)
     row = get_action(actor, action_id)
     if row["status"] in (STATUS_REJECTED,):
         raise AgentError(Code.ACTION_ALREADY_DECIDED, "该动作已被拒绝", http_status=409)
@@ -309,6 +320,7 @@ def confirm(actor: ActorContext, action_id: str, *, expected_revision: Optional[
             "action_id": action_id,
             "decision": "policy_approved" if decision_source == 'session_policy' else "confirmed",
             "decision_source": decision_source,
+            "human_clicked": bool(human_clicked),
             "claimed": claimed,
             "decided_by": actor.user_id,
         },

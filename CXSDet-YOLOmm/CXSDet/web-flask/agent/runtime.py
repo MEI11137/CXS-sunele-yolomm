@@ -613,6 +613,11 @@ class AgentRuntime:
         # 1) 资源权限：能用资源索引核对的先核对
         revisions, unverified, resource_projects = self._guard_arguments(actor, arguments)
 
+        # 1.5) 人工结论门禁：最终标注结论不能由模式或 AI 代替人提交
+        blocked = self._guard_human_decision(actor, session, task, spec, arguments)
+        if blocked is not None:
+            return blocked
+
         # 2) 计划门禁：多步写入必须先确认整体计划
         gate = self._plan_gate(task, spec)
         if gate is not None:
@@ -624,10 +629,17 @@ class AgentRuntime:
             return None
 
         # 3) 确认策略
-        automatic_mode = self._automatic_business_mode(actor, session, spec, source)
+        automatic_mode = self._automatic_business_mode(actor, session, spec, source, arguments)
         need_confirm = grants.needs_confirmation(
             actor, spec, project_id=project["id"], source=source
         )
+        if need_confirm and automatic_mode is None:
+            # full 下不属于自动范围的业务操作：明确拒绝/引导，不退回确认卡。
+            refused = self._deny_full_confirmation(
+                actor, session, task, spec, source, arguments
+            )
+            if refused is not None:
+                return refused
         if need_confirm:
             preview: Dict[str, Any] = {}
             prepared_id: Optional[str] = None
@@ -658,6 +670,24 @@ class AgentRuntime:
                 preview.setdefault("unverified_refs", unverified)
             if automatic_mode and isinstance(preview, dict) and preview.get('project_id') not in (None, project['id']):
                 automatic_mode = None  # Cross-project writes need a concrete target card.
+                # 完全访问不能借跨项目动作悄悄扩大目标：明确拒绝/要求切换，不生成卡片。
+                current_mode = session_store.get_session(actor, session["id"]).get('permission_mode', 'request')
+                if current_mode == 'full':
+                    reason = ('完全访问模式不会跨项目自动执行，也不会生成待点击卡片；'
+                              '请先切换到目标项目后重新提出，或由目标项目负责人本人操作。')
+                    task_store.set_waiting(task["id"], kind='human', reason=reason)
+                    task_store.set_status(task["id"], task_store.STATUS_AWAITING_HUMAN, summary=reason)
+                    session_store.append_message(session["id"], session_store.ROLE_ASSISTANT,
+                                                 reason, task_id=task["id"])
+                    task_store.append_event(session["id"], task["id"], 'permission.full_mode_refused',
+                        {'tool': spec.name, 'mode': 'full', 'kind': 'cross_project', 'reason': reason})
+                    memory.refresh(task["id"])
+                    latest_task = task_store.get_task_by_id(task["id"])
+                    return {'session_id': session["id"],
+                            'task': task_store.snapshot(latest_task),
+                            'status': task_store.STATUS_AWAITING_HUMAN,
+                            'reply': reason, 'action': None,
+                            'plan': latest_task.get('plan')}
             action = actions.create_action(
                 actor,
                 task_id=task["id"],
@@ -676,7 +706,7 @@ class AgentRuntime:
             if automatic_mode:
                 # The policy grants execution, not an invented human click. Keep
                 # fresh preflight, atomic claim, resource checks and request-key replay.
-                tasks_mode = self._automatic_business_mode(actor, session, spec, source)
+                tasks_mode = self._automatic_business_mode(actor, session, spec, source, action['parameters'])
                 if tasks_mode != automatic_mode:
                     self._feedback_tool_error(session, task, spec, '会话权限已改变，请按当前模式重新处理')
                     return None
@@ -684,7 +714,8 @@ class AgentRuntime:
                                           decision_source='session_policy')
                 task_store.append_event(session['id'], task['id'], 'permission.auto_approved',
                     {'action_id': action['id'], 'tool': spec.name, 'mode': automatic_mode,
-                     'kind': 'business', 'approval_source': 'session_policy', 'human_clicked': False})
+                     'kind': 'business', 'approval_source': 'session_policy',
+                     'decision_source': 'session_policy', 'human_clicked': False})
                 if not claimed['claimed']:
                     self._feedback_tool_error(session, task, spec, '该业务动作已领取或处理，请读取实际状态，不重复执行')
                     return None
@@ -1050,7 +1081,15 @@ class AgentRuntime:
     # ------------------------------------------------------------------ #
     # 门禁与辅助
     # ------------------------------------------------------------------ #
-    def _automatic_business_mode(self, actor, session, spec, source):
+    def _automatic_business_mode(self, actor, session, spec, source, arguments=None):
+        return None
+
+    def _guard_human_decision(self, actor, session, task, spec, arguments):
+        """人工结论类操作的门禁；由具体运行环境按需覆盖。"""
+        return None
+
+    def _deny_full_confirmation(self, actor, session, task, spec, source, arguments):
+        """full 下无法自动执行的业务操作返回拒绝/引导；由具体运行环境覆盖。"""
         return None
 
     def _guard_arguments(

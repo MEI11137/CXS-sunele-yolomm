@@ -84,6 +84,8 @@ export interface AgentTask {
 /** 动作预览：后端是对象（含 tool_title 等），不是一段字符串。 */
 export interface ActionPreview {
   tool_title?: string
+  /** 会话策略自动批准时后端会写入来源；source=session_policy 的短暂 pending 不应画成人工确认卡。 */
+  approval?: { source?: string; mode?: string }
   [key: string]: unknown
 }
 

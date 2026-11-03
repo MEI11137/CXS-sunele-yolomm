@@ -26,7 +26,12 @@ const messageError = ref('')
 const actionError = ref('')
 const busy = ref(false)
 const selectedActionId = ref('')
-const pendingActions = computed(() => snapshot.value?.actions.filter(action => action.status === 'pending') || [])
+/** 会话策略自动领取的短暂 pending 不应画成人工确认卡；仅人工批准的卡片进入 dock。 */
+function policyClaimed(action: Confirmation) {
+  const approval = action.preview?.approval as { source?: string } | undefined
+  return approval?.source === 'session_policy'
+}
+const pendingActions = computed(() => snapshot.value?.actions.filter(action => action.status === 'pending' && !policyClaimed(action)) || [])
 const selectedAction = computed(() => pendingActions.value.find(action => action.action_id === selectedActionId.value) || pendingActions.value[0])
 const selectedIndex = computed(() => pendingActions.value.findIndex(action => action.action_id === selectedAction.value?.action_id))
 watch(pendingActions, actions => {
@@ -91,7 +96,7 @@ const labels: Record<string, string> = { planning: '规划中', awaiting_plan: '
 const activity = computed(() => toolActivities(events.value, snapshot.value?.task?.id, snapshot.value?.actions))
 const automaticApprovals = computed(() => events.value.filter(event => event.type === 'permission.auto_approved' && event.task_id === snapshot.value?.task?.id).length)
 const batchProgress = computed(() => events.value.filter(event => event.type === 'task.progress' && event.task_id === snapshot.value?.task?.id && event.payload.inspection_run_id).slice(-8))
-const waitingApproval = computed(() => !!snapshot.value?.actions.some(action => action.status === 'pending'))
+const waitingApproval = computed(() => pendingActions.value.length > 0)
 const running = computed(() => !waitingApproval.value && ['running', 'planning', 'awaiting_business'].includes(snapshot.value?.task?.status || ''))
 const statusLabel = computed(() => waitingApproval.value ? '等待批准' : snapshot.value?.task ? labels[snapshot.value.task.status] || snapshot.value.task.status : '执行过程')
 const eventErrors = computed(() => events.value.filter(event => event.type.includes('error') && (!snapshot.value?.task || event.task_id === snapshot.value.task.id)))

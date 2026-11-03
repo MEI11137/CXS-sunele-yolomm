@@ -58,18 +58,52 @@ def test_request_mode_retains_card_and_model_cannot_claim_full_mode(setup):
     assert automatic_mode(f.actor,f.chat['id'],replace(spec,source='business',server_id='external')) is None
 
 
-def test_full_keeps_delete_and_final_human_decision_cards(setup):
+def test_full_delete_is_automatic_but_final_human_decision_waits_for_owner(setup):
+    """full：删除直接执行不生成卡片；最终人工结论只能本人去复核页提交，也不生成卡片。"""
     f=setup;run=start(f);sessions.set_permission_mode(f.actor,f.chat['id'],'full');runtime=HxEngineRuntime(f.app)
     record=run['state']['items'][0]['record_id']
-    for name,params in [
-        ('workspace_delete_records',{'project_id':f.project['id'],'records':[{'record_id':record,'expected_version':0}]}),
-        ('workspace_review_record',{'project_id':f.project['id'],'record_id':record,'operation':'confirmed','expected_version':0,
-            'annotations':[{'class_id':0,'class_name':'热斑','bbox':[.1,.1,.4,.4]}]})]:
-        task=tasks.create_task(f.actor,f.chat['id'],f.project['id'],'必须保留人工批准')
-        result=invoke(f,runtime,task,name,params)
-        assert result and result['status']==tasks.STATUS_AWAITING_ACTION, name
-    row=f.backend._read_record(record)
-    assert row['record_status']!='deleted' and row['human_review_status']=='pending'
+    task=tasks.create_task(f.actor,f.chat['id'],f.project['id'],'删除一条记录')
+    result=invoke(f,runtime,task,'workspace_delete_records',
+        {'project_id':f.project['id'],'records':[{'record_id':record,'expected_version':0}]})
+    assert result is None
+    assert not actions.list_actions(task['id'],[actions.STATUS_PENDING])
+    own=[event for event in tasks.list_events(f.chat['id']) if event.get('task_id')==task['id']]
+    assert any(event['type']=='permission.auto_approved'
+               and event['payload'].get('decision_source')=='session_policy'
+               and event['payload'].get('human_clicked') is False for event in own)
+    assert f.backend._read_record(record)['record_status']=='deleted'
+
+    task=tasks.create_task(f.actor,f.chat['id'],f.project['id'],'提交最终人工结论')
+    result=invoke(f,runtime,task,'workspace_review_record',
+        {'project_id':f.project['id'],'record_id':record,'operation':'confirmed','expected_version':0,
+         'annotations':[{'class_id':0,'class_name':'热斑','bbox':[.1,.1,.4,.4]}]})
+    assert result and result['status']==tasks.STATUS_AWAITING_HUMAN
+    assert result['action'] is None
+    assert not actions.list_actions(task['id'],[actions.STATUS_PENDING])
+    current=tasks.get_task_by_id(task['id'])
+    waiting=current.get('waiting_for') or {}
+    assert current['status']==tasks.STATUS_AWAITING_HUMAN
+    assert waiting.get('kind')=='human'
+    assert waiting.get('page_hint')=='/review/'+record
+    own=[event for event in tasks.list_events(f.chat['id']) if event.get('task_id')==task['id']]
+    assert any(event['type']=='review.manual_required' for event in own)
+    assert f.backend._read_record(record)['human_review_status']=='pending'
+
+
+def test_request_and_assist_keep_delete_and_final_human_decision_cards(setup):
+    """request/assist 保留原具体确认卡流程，不被 full 策略改写。"""
+    f=setup;run=start(f);runtime=HxEngineRuntime(f.app)
+    record=run['state']['items'][0]['record_id']
+    for mode in ('request','assist'):
+        sessions.set_permission_mode(f.actor,f.chat['id'],mode)
+        for name,params in [
+            ('workspace_delete_records',{'project_id':f.project['id'],'records':[{'record_id':record,'expected_version':0}]}),
+            ('workspace_review_record',{'project_id':f.project['id'],'record_id':record,'operation':'confirmed','expected_version':0,
+                'annotations':[{'class_id':0,'class_name':'热斑','bbox':[.1,.1,.4,.4]}]})]:
+            task=tasks.create_task(f.actor,f.chat['id'],f.project['id'],'保留人工批准 '+mode)
+            result=invoke(f,runtime,task,name,params)
+            assert result and result['status']==tasks.STATUS_AWAITING_ACTION, (mode,name)
+            assert actions.list_actions(task['id'],[actions.STATUS_PENDING]), (mode,name)
 
 
 def test_old_pending_ai_card_resumes_by_fresh_policy_without_click(setup):

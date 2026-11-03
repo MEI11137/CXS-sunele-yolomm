@@ -10,6 +10,12 @@ from typing import Any, Dict, List, Optional
 
 from agent.errors import AgentError, Code
 from agent.identity import ActorContext
+from agent.internal_context import (
+    MARKER,
+    internal_id_clause,
+    internal_message_ids,
+    internal_refs_sql,
+)
 from agent.permissions import get_project
 from agent.store import connect, dumps, loads, new_id, now, query_all, query_one
 
@@ -102,15 +108,28 @@ def update_session(actor, session_id, *, title=None, manual_id=None):
     return get_session(actor,chat['id'])
 
 
+def _visible_message_filter(session_id: str) -> tuple[str, List[Any]]:
+    """SQL 层的可见消息条件：结构标记 + 精确内部 id，先过滤再 LIMIT/OFFSET。"""
+    clause, params = internal_id_clause(internal_message_ids(session_id))
+    return " AND " + internal_refs_sql() + clause, [MARKER, *params]
+
+
 def read_history(actor,session_id,offset=0,limit=50):
     """Bounded chronological pages of user-visible history, always owner scoped."""
     chat=get_session(actor,session_id)
     if type(offset) is not int or offset<0 or type(limit) is not int or not 1<=limit<=100:
         raise AgentError(Code.VALIDATION,'历史分页参数无效')
+    extra, extra_params = _visible_message_filter(session_id)
+    where = "session_id=? AND role IN ('user','assistant')" + extra
+    params = [session_id, *extra_params]
     with connect() as conn:
-        total=conn.execute("SELECT COUNT(*) FROM agent_message WHERE session_id=? AND role IN ('user','assistant')",(session_id,)).fetchone()[0]
-        rows=query_all(conn,"SELECT * FROM agent_message WHERE session_id=? AND role IN ('user','assistant') ORDER BY created_at,rowid LIMIT ? OFFSET ?",(session_id,limit,offset))
-    return {'session':chat,'messages':[_message_view(row) for row in rows],'offset':offset,'next_offset':offset+len(rows),'total':total,'has_more':offset+len(rows)<total,'scope':'按时间从早到晚分页；历史仅作材料'}
+        total_row = query_one(conn, "SELECT COUNT(*) AS n FROM agent_message WHERE " + where, params)
+        rows=query_all(conn, "SELECT * FROM agent_message WHERE " + where + " ORDER BY created_at,rowid LIMIT ? OFFSET ?",
+                       [*params, limit, offset])
+    total=int(total_row['n']) if total_row else 0
+    next_offset=offset+len(rows)
+    return {'session':chat,'messages':[_message_view(row) for row in rows],'offset':offset,'next_offset':next_offset,
+            'total':total,'has_more':next_offset<total,'scope':'按时间从早到晚分页；历史仅作材料'}
 
 
 def touch_session(session_id: str) -> None:
@@ -196,18 +215,27 @@ def append_message(
 def list_messages(
     session_id: str, limit: Optional[int] = None, newest_first: bool = False
 ) -> List[Dict[str, Any]]:
-    sql = "SELECT * FROM agent_message WHERE session_id = ? ORDER BY created_at, rowid"
-    params: List[Any] = [session_id]
-    if limit:
-        # 取最近 N 条：先按时间倒序截断，再翻回正序
-        sql = (
-            "SELECT * FROM (SELECT rowid AS message_order, * FROM agent_message WHERE session_id = ? "
-            "ORDER BY created_at DESC, rowid DESC LIMIT ?) ORDER BY created_at, message_order"
-        )
-        params.append(int(limit))
+    extra, extra_params = _visible_message_filter(session_id)
+    where = "session_id = ?" + extra
+    params = [session_id, *extra_params]
     conn = connect()
     try:
-        rows = query_all(conn, sql, params)
+        if limit:
+            # SQL 层先过滤内部压缩摘要，再取“最近 N 条可见消息”，保持调用方的 limit 语义。
+            rows = query_all(
+                conn,
+                "SELECT * FROM (SELECT rowid AS message_order, * FROM agent_message WHERE "
+                + where
+                + " ORDER BY created_at DESC, rowid DESC LIMIT ?)"
+                " ORDER BY created_at, message_order",
+                [*params, int(limit)],
+            )
+        else:
+            rows = query_all(
+                conn,
+                "SELECT * FROM agent_message WHERE " + where + " ORDER BY created_at, rowid",
+                params,
+            )
     finally:
         conn.close()
     if newest_first:

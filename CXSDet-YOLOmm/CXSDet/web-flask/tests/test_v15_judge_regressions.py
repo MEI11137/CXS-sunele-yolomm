@@ -120,20 +120,46 @@ def test_ordinary_file_deletion_needs_approval_in_every_mode(setup, monkeypatch)
     actor = identity.load_actor(1)
     f.app.config['DEMO_WORKSPACE_ROOT'] = str(f.root)
     runtime = HxEngineRuntime(f.app)
-    approved = []
-    monkeypatch.setattr(runtime, 'confirm_action', lambda *args, **kwargs: approved.append(args))
+    human = []
+    policy = []
+    monkeypatch.setattr(runtime, 'confirm_action', lambda *args, **kwargs: human.append(args))
+
+    def fake_policy(engine, actor_, action_id, mode, kind, reason):
+        policy.append((mode, kind))
+        action = actions.get_action(actor_, action_id)
+        claimed = actions.confirm(actor_, action_id, expected_revision=action['revision'],
+                                  decision_source='session_policy')
+        assert claimed['claimed']
+        return True
+
+    monkeypatch.setattr(runtime, '_confirm_native_policy', fake_policy)
     target = str(f.source / 'labels/train/0.txt')
-    for mode in ('request', 'assist', 'full'):
+    for mode in ('request', 'assist'):
         sessions.set_permission_mode(actor, f.chat['id'], mode)
+        task = tasks.create_task(actor, f.chat['id'], f.project['id'], '文件删除待确认 ' + mode)
         item = {'id': mode, 'sessionID': 'remote', 'permission': 'edit',
             'metadata': {'files': [{'filePath': target, 'type': 'delete'}], 'diff': '+++ /dev/null'}}
         engine = SimpleNamespace(site_session=f.chat['id'], project_id=f.project['id'],
             remote_session='remote', workspace=f.root.resolve(), permission_decisions={},
             native_actions={}, fingerprint='fixture', redact=lambda value: value,
             request=lambda method, path, *args: [item] if path == '/permission' else None)
-        runtime._permissions(engine, actor, f.task['id'])
-    assert not approved
-    assert len(actions.list_actions(f.task['id'], [actions.STATUS_PENDING])) == 3
+        runtime._permissions(engine, actor, task['id'])
+        pending = actions.list_actions(task['id'], [actions.STATUS_PENDING])
+        assert len(pending) == 1, mode
+        assert pending[0]['preview']['approval'] == '等待人工批准'
+    # full：自动领取，不生成待点击卡片，也不冒充人工批准。
+    sessions.set_permission_mode(actor, f.chat['id'], 'full')
+    task = tasks.create_task(actor, f.chat['id'], f.project['id'], '文件删除自动执行')
+    item = {'id': 'full', 'sessionID': 'remote', 'permission': 'edit',
+        'metadata': {'files': [{'filePath': target, 'type': 'delete'}], 'diff': '+++ /dev/null'}}
+    engine = SimpleNamespace(site_session=f.chat['id'], project_id=f.project['id'],
+        remote_session='remote', workspace=f.root.resolve(), permission_decisions={},
+        native_actions={}, fingerprint='fixture', redact=lambda value: value,
+        request=lambda method, path, *args: [item] if path == '/permission' else None)
+    runtime._permissions(engine, actor, task['id'])
+    assert policy and policy[-1][0] == 'full'
+    assert not actions.list_actions(task['id'], [actions.STATUS_PENDING])
+    assert not human
 
 
 def test_unknown_or_mixed_commands_cannot_gain_remote_approval(setup, monkeypatch):
@@ -145,3 +171,154 @@ def test_unknown_or_mixed_commands_cannot_gain_remote_approval(setup, monkeypatc
     monkeypatch.setattr('agent.native_policy.inspect_command', lambda _: {
         'valid': True, 'commands': [{'name': 'Remove-Item'}, {'name': 'Invoke-Expression'}]})
     assert not confined_permission(item, {'kind': 'delete', 'targets': [target]}, f.root)
+
+
+def test_full_mode_native_scope_is_fully_proven_for_admin_and_owner(setup, monkeypatch):
+    """full 下原生命令必须先完整证明范围；无法证明时明确拒绝且不生成确认卡。"""
+    f = setup
+    runtime = HxEngineRuntime(f.app)
+    policy_claims = []
+
+    def fake_policy(engine, actor_, action_id, mode, kind, reason):
+        policy_claims.append((mode, kind))
+        action = actions.get_action(actor_, action_id)
+        claimed = actions.confirm(actor_, action_id, expected_revision=action['revision'],
+                                  decision_source='session_policy')
+        assert claimed['claimed']
+        return True
+
+    monkeypatch.setattr(runtime, '_confirm_native_policy', fake_policy)
+
+    def engine_for(item):
+        replies = []
+
+        def request(method, path, payload=None):
+            if path == '/permission':
+                return [item]
+            if method == 'POST':
+                replies.append(payload)
+                return {'ok': True}
+            return None
+
+        engine = SimpleNamespace(site_session=f.chat['id'], project_id=f.project['id'],
+            remote_session='remote', workspace=f.root.resolve(), permission_decisions={},
+            native_actions={}, fingerprint='fixture', redact=lambda value: value,
+            request=request)
+        return engine, replies
+
+    def run_case(actor, item, inspect):
+        sessions.set_permission_mode(actor, f.chat['id'], 'full')
+        task = tasks.create_task(actor, f.chat['id'], f.project['id'], 'native full scope')
+        monkeypatch.setattr('agent.native_policy.inspect_command', inspect)
+        engine, replies = engine_for(item)
+        runtime._permissions(engine, actor, task['id'])
+        return task, replies
+
+    # 管理员 full：删除命令里混入其它命令，无法证明完整范围 → 拒绝，不出卡。
+    mixed = {'id': 'mixed', 'sessionID': 'remote', 'permission': 'bash',
+             'metadata': {'command': 'Remove-Item safe.txt; Invoke-Expression $x'}}
+    task, replies = run_case(f.actor, mixed, lambda _: {'valid': True, 'commands': [
+        {'name': 'Remove-Item', 'elements': []},
+        {'name': 'Invoke-Expression', 'elements': []}]})
+    assert not actions.list_actions(task['id'], [actions.STATUS_PENDING])
+    assert replies[-1] == {'reply': 'reject'}
+
+    # 动态拼接路径的删除：第一条可识别也不能自动。
+    dynamic = {'id': 'dynamic', 'sessionID': 'remote', 'permission': 'bash',
+               'metadata': {'command': "Remove-Item -LiteralPath 'safe.txt'; "
+                                       "Remove-Item -LiteralPath ('C:\\outside\\' + 'f.txt')"}}
+    task, replies = run_case(f.actor, dynamic, lambda _: {'valid': True, 'commands': [
+        {'name': 'Remove-Item', 'elements': [
+            {'kind': 'parameter', 'name': 'LiteralPath',
+             'argument': {'kind': 'literal', 'values': ['safe.txt']}}]},
+        {'name': 'Remove-Item', 'elements': [
+            {'kind': 'parameter', 'name': 'LiteralPath',
+             'argument': {'kind': 'pipeline', 'values': []}}]}]})
+    assert not actions.list_actions(task['id'], [actions.STATUS_PENDING])
+    assert replies[-1] == {'reply': 'reject'}
+
+    # 项目内、目标与差异明确的删除：管理员 full 也要通过 confined 证明后才自动领取。
+    inside = {'id': 'inside', 'sessionID': 'remote', 'permission': 'edit',
+              'metadata': {'files': [{'filePath': str(f.source / 'labels/train/0.txt'), 'type': 'delete'}],
+                           'diff': '--- a\n+++ /dev/null'}}
+    task, replies = run_case(f.actor, inside, lambda _: {'valid': True, 'commands': []})
+    assert policy_claims and policy_claims[-1][0] == 'full'
+    assert not actions.list_actions(task['id'], [actions.STATUS_PENDING])
+
+    # 普通账号 full 同样要完整证明；项目外的编辑即使看起来是删除也拒绝且不出卡。
+    f.db.execute('UPDATE user SET role=0 WHERE id=1')
+    owner = identity.load_actor(1)
+    f.app.config['DEMO_WORKSPACE_ROOT'] = str(f.root)
+    outside = {'id': 'outside', 'sessionID': 'remote', 'permission': 'edit',
+               'metadata': {'files': [{'filePath': str(f.root.parent / 'outside.txt'), 'type': 'delete'}],
+                            'diff': '--- a\n+++ /dev/null'}}
+    task, replies = run_case(owner, outside, lambda _: {'valid': True, 'commands': []})
+    assert not actions.list_actions(task['id'], [actions.STATUS_PENDING])
+    assert replies[-1] == {'reply': 'reject'}
+
+
+def test_ordinary_request_and_assist_keep_clear_delete_card_that_can_be_claimed(setup, monkeypatch):
+    """范围证明不等于自动执行：普通账号 request/assist 下明确的删除仍应出卡并可人工领取。"""
+    f = setup
+    f.db.execute('UPDATE user SET role=0 WHERE id=1')
+    actor = identity.load_actor(1)
+    f.app.config['DEMO_WORKSPACE_ROOT'] = str(f.root)
+    runtime = HxEngineRuntime(f.app)
+    target = str(f.source / 'labels/train/0.txt')
+
+    def fake_inspect(command):
+        if 'dynamic' in command:
+            return {'valid': True, 'commands': [
+                {'name': 'Remove-Item', 'elements': [
+                    {'kind': 'parameter', 'name': 'LiteralPath',
+                     'argument': {'kind': 'pipeline', 'values': []}}]}]}
+        return {'valid': True, 'commands': [
+            {'name': 'Remove-Item', 'elements': [
+                {'kind': 'parameter', 'name': 'LiteralPath',
+                 'argument': {'kind': 'literal', 'values': [target]}}]}]}
+
+    monkeypatch.setattr('agent.native_policy.inspect_command', fake_inspect)
+    claims = []
+
+    def fake_native(actor_, action_id, *, expected_revision=None, decision_source='human'):
+        action = actions.get_action(actor_, action_id)
+        claims.append(decision_source)
+        actions.confirm(actor_, action_id, expected_revision=action['revision'],
+                        decision_source=decision_source)
+        return {'reply': 'claimed'}
+
+    monkeypatch.setattr(runtime, '_confirm_native_action', fake_native)
+
+    def engine_for(item, replies):
+        def request(method, path, payload=None):
+            if path == '/permission':
+                return [item]
+            if method == 'POST':
+                replies.append(payload)
+                return {'ok': True}
+            return None
+        return SimpleNamespace(site_session=f.chat['id'], project_id=f.project['id'],
+            remote_session='remote', workspace=f.root.resolve(), permission_decisions={},
+            native_actions={}, fingerprint='fixture', redact=lambda value: value,
+            request=request)
+
+    for mode in ('request', 'assist'):
+        sessions.set_permission_mode(actor, f.chat['id'], mode)
+        task = tasks.create_task(actor, f.chat['id'], f.project['id'], 'ordinary delete card ' + mode)
+        item = {'id': mode, 'sessionID': 'remote', 'permission': 'bash',
+                'metadata': {'command': "Remove-Item -LiteralPath '%s'" % target}}
+        runtime._permissions(engine_for(item, []), actor, task['id'])
+        pending = actions.list_actions(task['id'], [actions.STATUS_PENDING])
+        assert len(pending) == 1, mode
+        assert pending[0]['preview']['approval'] == '等待人工批准'
+        runtime.confirm_action(actor, pending[0]['id'])
+        assert claims[-1] == 'human'
+        assert actions.get_action(actor, pending[0]['id'])['status'] == actions.STATUS_EXECUTING
+        # 无法完整证明范围的动态命令仍然直接拒绝，不生成可点击卡片。
+        task = tasks.create_task(actor, f.chat['id'], f.project['id'], 'ordinary dynamic delete ' + mode)
+        dynamic = {'id': mode + '-dynamic', 'sessionID': 'remote', 'permission': 'bash',
+                   'metadata': {'command': "Remove-Item 'dynamic'"}}
+        replies = []
+        runtime._permissions(engine_for(dynamic, replies), actor, task['id'])
+        assert not actions.list_actions(task['id'], [actions.STATUS_PENDING])
+        assert replies[-1] == {'reply': 'reject'}
