@@ -1,10 +1,16 @@
-# 海巡智检 · CXS-sunele-yolomm
+# 海巡智检 v1.4
 
 基于 Vue 3、Flask 和 YOLO 的巡检系统，支持图片、视频和实时检测，以及视觉大模型辅助核查。
 
-## 海巡智检 v1.3.1 修正版
+## 当前版本 1.4.0
 
-当前版本 `1.3.1` 基于 `release/haixun-v1.3.0` 的 `32d1d34ea246ac0b4e039c15bfc9abb28eb85f82` 修正，在本地 `fix/v1.3-verified-workflows` 分支验证，尚未推送。网站内部使用海巡引擎 1.19.4，保留原人工操作入口。源码不包含个人 API 配置、数据库、测试记录、模型权重、原始数据或本机依赖；新安装从空业务数据开始。真实 GPU 训练仍须在训练服务器验收。详见 [本轮审查与更新说明](docs/releases/haixun-v1.3.1.md)。
+GitHub 版本分支为 `release/haixun-v1.4.0`。本版汇总此前已上传的修复及普通评委账号真实闭环验收，基线为 `67f276f`；更名不会清空业务数据或替换训练环境。网站内部仍使用海巡引擎 1.19.4，并保留原人工操作入口。源码不包含个人 API 配置、数据库、测试记录、模型权重、原始数据或本机依赖；新安装从空业务数据开始。模型服务繁忙时仍可能超时，真实 GPU 训练与公网入口仍须在训练服务器验收。
+
+- [海巡智检 v1.4 版本说明](docs/releases/haixun-v1.4.md)
+- [另一台电脑部署与更新](先读我_另一台电脑部署.md)
+- [下载本版源码 ZIP](https://github.com/MEI11137/CXS-sunele-yolomm/archive/refs/heads/release/haixun-v1.4.0.zip)
+
+GitHub 源码 ZIP 不含预构建的 `dist`。远程演示前须在 `web-haixun` 执行 `npm ci` 和 `npm run build`；原有运行依赖与加密配置须在服务器本机准备，不能直接照抄开发电脑路径。
 
 - [v1.2 版本说明](docs/releases/haixun-v1.2.md)
 - [Agent功能覆盖与边界](docs/integration/Agent功能覆盖复核_2026-10-29.md)
@@ -44,7 +50,7 @@ CXSDet-YOLOmm/CXSDet/
 2. 在 `CXSDet-YOLOmm/CXSDet/web-haixun` 运行 `npm ci`；使用这套前端的 `package-lock.json`。
 3. 在PowerShell设置 `HAIXUN_PYTHON` 为所用python.exe绝对路径，`HX_ENGINE_BIN` 为hxengine.exe绝对路径；Node在PATH中，或通过 `HAIXUN_NODE` 指定node.exe。也可将Node和海巡引擎分别放入仓库 `.runtime/node/node.exe`、`.runtime/hxengine/hxengine.exe`。
 4. 在仓库根目录运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1 -Check` 检查依赖，然后双击 **启动海巡智检.cmd** 启动前后端。**停止服务.cmd** 只停止同路径的本版本服务；运行中的训练/任务请先处理完毕。
-5. 打开 `http://127.0.0.1:5173/`，后端默认端口5020。首次初始化的管理员为 `admin / 123456`，正式使用时修改密码。
+5. 打开 `http://127.0.0.1:5173/`，后端默认端口5020。使用本机初始化流程创建的管理员账号登录，首次使用后设置新口令；初始账号的创建方式见服务器本机的初始化代码。
 6. 在“设置 → 大模型连接”配置自己的Key、地址和模型。创建项目并选择本机文件夹，再导入数据集/权重；聊天与网页AI功能使用相同个人连接。
 
 启动器不会替你安装依赖或下载模型。依赖检查通过后会在后台启动服务，错误与日志见仓库 `.run/`。新安装没有密钥文件是正常的：服务在首次需要时生成本机密钥，不要复制或上传其他人的密钥。已有整合包也可继续使用包根目录原启动入口。
