@@ -174,7 +174,9 @@ def migrate_legacy_resources() -> Dict[str, int]:
 
         if _table_exists(conn, "detection_records"):
             users: Dict[int, str] = {}
-            for row in query_all(conn, "SELECT id, user_id, title FROM detection_records"):
+            for row in query_all(conn, """SELECT dr.id, dr.user_id, dr.title FROM detection_records dr
+                    WHERE NOT EXISTS (SELECT 1 FROM agent_resource ar
+                        WHERE ar.source_table = 'detection_records' AND ar.source_id = dr.id)"""):
                 owner_id = int(row.get("user_id") or 0)
                 if owner_id <= 0:
                     result["skipped"] += 1
