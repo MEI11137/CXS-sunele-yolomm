@@ -113,7 +113,9 @@ def import_model_weight(
 
     temp_root = Path(TEMP_DIR)
     temp_root.mkdir(parents=True, exist_ok=True)
-    safe_name = secure_filename(original_filename) or "weight.pt"
+    # Sanitising a Chinese-only name such as "热斑.pt" returns "pt", losing
+    # the extension. Ultralytics then treats it as an exported backend path.
+    safe_name = (secure_filename(Path(original_filename).stem) or "weight") + ".pt"
     temp_path = temp_root / f"model-import-{uuid.uuid4().hex}-{safe_name}"
     stored: dict[str, str] | None = None
     try:

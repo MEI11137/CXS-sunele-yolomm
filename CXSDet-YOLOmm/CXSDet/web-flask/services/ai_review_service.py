@@ -161,6 +161,17 @@ def _public_exception_field(exc: Exception, field_name: str) -> str:
 def _upstream_failure_message(exc: Exception) -> str:
     if _public_exception_field(exc, "status_code") == "401":
         return "大模型 API 认证失败（401），请检查 API Key 与服务商地址是否匹配、密钥是否有效"
+    details = getattr(exc, 'details', None)
+    reason = details.get('reason') if isinstance(details, dict) else None
+    messages = {
+        'network_or_timeout': '大模型网络异常或请求超时，本次未获得核查结果；请检查网络后手动重试',
+        'rate_limited': '大模型服务限流，本次未获得核查结果；请稍后手动重试',
+        'auth_failed': '大模型 API 认证失败，请检查个人连接的密钥与服务商地址',
+        'model_unavailable': '当前模型不可用，请检查个人连接的模型名称',
+        'capability_unsupported': '当前模型不支持本次图片核查，请检查图片理解能力',
+    }
+    if reason in messages:
+        return messages[reason]
     return UPSTREAM_FAILURE_SUMMARY
 
 
@@ -233,7 +244,7 @@ def review_detection(record_id: str, client, database, storage_client) -> AIRevi
             _public_exception_field(exc, "code"),
         )
         message = _upstream_failure_message(exc)
-        fallback = AIReviewResult("needs_human_review", UPSTREAM_FAILURE_SUMMARY)
+        fallback = AIReviewResult("needs_human_review", message)
         _persist_review(database, record_id, fallback)
         raise AIReviewUpstreamError(message, public_message=message) from exc
 

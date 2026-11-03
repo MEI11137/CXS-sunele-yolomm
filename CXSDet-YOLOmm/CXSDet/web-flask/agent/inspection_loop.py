@@ -287,7 +287,11 @@ class InspectionLoopTools(ToolProvider):
                 supports_preview=write)
         result = [spec('workspace_inspection_state', '读取本轮巡检闭环的真实状态、复核进度、记录 ID 与人工页面；不是重新执行',
                        {'run_id': {'type': 'string'}}, ['run_id'])]
-        if not actor.is_admin:
+        from agent.project_folders import demo_root
+        # The server administrator has already bound the ordinary judge's
+        # project to this root. Every prepare/execute still checks ownership
+        # and checked_project_root; this does not grant arbitrary disk access.
+        if not actor.is_admin and demo_root() is None:
             return result
         result += [spec('workspace_discover_inputs', '只读查找当前项目文件夹内的数据集目录、ZIP 与 PT 权重；不会逐张询问授权', {}),
             spec(START, '自动图片巡检闭环：一次确认完整计划后，自动登记文件、导入数据集与权重、发布本轮自用模型、批量检测、逐图 AI 看图核查，再打开人工复核。不要拆成逐个附件确认。必须先得到用户要求的范围和置信度。', {
@@ -593,7 +597,9 @@ def _detect(run):
         _message(run, f'已完成项的 AI 核查未报告疑点；另有 {failed} 项失败，见逐项记录。检测记录已保留，未伪造人工确认，也未自动回流；如需回流，请先到识别记录页面人工复核指定样本。')
         return
     _save(run, status='awaiting_human')
-    reason = '检测与 AI 核查阶段已结束，请人工检查本轮记录；AI 一致也不会自动记为人工确认'
+    failures = sum(bool(item.get('error')) for item in run['state']['items'])
+    reason = (f'本轮已处理 {len(run["state"]["items"])} 张，其中 {failures} 项失败；失败不算核查成功，不自动重复付费。'
+              '请人工检查本轮记录；AI 一致也不会自动记为人工确认')
     _wait(run, tasks.STATUS_AWAITING_HUMAN, reason)
     navigation = {'project_id': run['project_id'], 'path': view(run)['review_path'], 'title': '本轮人工复核'}
     tasks.append_event(run['session_id'], run['task_id'], 'workspace.navigate', navigation)
@@ -801,6 +807,11 @@ def _complete(run):
         if run['state'].get('training'):
             message += ' 增量训练已完成，新模型 ID：' + run['state']['training']['model_id'] + '。对比指标及验证条件已记录；条件不同不能宣称一定更优。'
         _message(run, message)
+        tasks.append_event(run['session_id'], run['task_id'], 'workspace.navigate', {
+            'project_id': run['project_id'],
+            'path': '/projects/' + run['project_id'] + '/datasets',
+            'title': '查看复核生成的数据集',
+        })
 
 
 def reconcile(actor, task_id):

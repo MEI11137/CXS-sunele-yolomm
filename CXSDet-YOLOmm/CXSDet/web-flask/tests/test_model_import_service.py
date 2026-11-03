@@ -1,5 +1,6 @@
 from io import BytesIO
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 from werkzeug.datastructures import FileStorage
@@ -54,6 +55,21 @@ def _upload(filename="best.pt", content=b"checkpoint"):
 
 def _multimodal_detector():
     return SimpleNamespace(model=SimpleNamespace(mm_router=object()))
+
+
+@pytest.mark.parametrize('filename', ['热斑验收权重.pt', '权重.PT', 'best.pt'])
+def test_import_keeps_pt_extension_for_runtime_dispatch(tmp_path, monkeypatch, filename):
+    from services import model_import_service as service
+    monkeypatch.setattr(service, 'TEMP_DIR', str(tmp_path))
+    calls = []
+    def loader(path, mode, yaml):
+        calls.append(path)
+        assert Path(path).suffix == '.pt'
+        assert Path(path).read_bytes() == b'checkpoint'
+        return _multimodal_detector()
+    service.import_model_weight('中文权重测试', '', 'dataset-mm', _upload(filename),
+        FakeDatabase(), FakeStorage(), detector_loader=loader)
+    assert calls and not list(tmp_path.glob('model-import-*'))
 
 
 def test_imported_weight_is_validated_stored_and_registered_with_dataset_modality(
