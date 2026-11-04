@@ -195,6 +195,7 @@ class OpenAIGateway:
         tools: Optional[List[Dict[str, Any]]] = None,
         *,
         temperature: float = 0.2,
+        timeout: Optional[float] = None,
     ) -> ModelTurn:
         payload: Dict[str, Any] = {
             "model": self.credentials.model,
@@ -205,7 +206,11 @@ class OpenAIGateway:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
         try:
-            response = self._get_client().chat.completions.create(**payload)
+            client = self._get_client()
+            if timeout is not None and hasattr(client, "with_options"):
+                # 视觉复核单次可能要几十秒，聊天默认 60 秒不够；按调用方要求放宽本次请求。
+                client = client.with_options(timeout=timeout, max_retries=0)
+            response = client.chat.completions.create(**payload)
         except AgentError:
             raise
         except BaseException as exc:  # noqa: BLE001 - SDK 异常类型不稳定

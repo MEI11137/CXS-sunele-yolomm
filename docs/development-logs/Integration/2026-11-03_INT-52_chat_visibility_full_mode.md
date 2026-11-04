@@ -179,3 +179,43 @@ python -m agent.internal_context --all --limit 200
   API Key、令牌、完整用户聊天、数据库或运行数据。
 
 训练与大规模巡检不属于本次验收范围；最终人工标注仍由本人在复核页提交，范围不明或越界的命令明确拒绝。
+
+## 6. 2026-11-04 补充修复（AI 复核演示可用性）
+
+- 单次请求超时：`agent/llm/provider.py` `complete()` 增加可选 `timeout`，仅在调用方传入时使用
+  `with_options(timeout=..., max_retries=0)` 放宽本次请求；`services/personal_review_client.py`
+  复核传 180s、改进建议传 120s，聊天默认行为不变。未做图片降采样（保留原图，避免小热斑信息损失）。
+- 批量错误脱敏：`services/batch_review_service.py` 遇 `AgentError` 时，仅白名单错误码展示站内提示
+  并先经 `agent.guard.redact` 脱敏；白名单之外统一固定文案，避免上游原始报错中的 sk/Bearer 透出。
+- 第三根因（私有桥身份）：聊天内 Agent 工具经私有 MCP 桥回调站点时没有站点 JWT，`flask.g.user_id`
+  为空，个人复核/模型工厂抛 `AGENT_UNAUTHENTICATED`。修复：`agent/hx_engine_runtime.py`
+  `_bridge_engine()` 在认证引擎令牌并核对 owner/session 后写回 `g.user_id = actor.user_id`
+  （与 `agent/inspection_loop.py:506` 既有做法一致）。手工页面批量复核走站点 JWT，不会暴露该问题；
+  页面单条 200 不能证明 Agent→私有 MCP→复核工厂这条链可用。新增非付费单测
+  `tests/test_engine_bridge_principal.py`：有效令牌得到真实 owner、伪造/失效令牌 401 且不写/不覆盖身份、
+  非本机来源拒绝、伪造请求头不能覆盖 token owner 对应的身份。
+- 测试：新增 `tests/test_agent_review_timeout.py`；`tests/test_integration_int06.py` 的 FakeGateway
+  接受新增 timeout 参数（原关键断言保留，未删/未跳过用例）。最终 5 文件 30 passed；扩展相关回归
+  50 passed、18 skipped、9 subtests passed。日志：`.integration-checks/20261104-final-review-tests.txt`。
+  本轮未提交、未推送。
+
+### 6.1 私有 MCP 桥 + 真实付费核查的独立验收（宿主，2026-11-04）
+
+根线程（Codex）用普通演示账号通过真实 HTTP 入口独立验收，证据：
+`.integration-checks/20261104_bridge_acceptance.json`（未上传、未提交）：
+
+- 会话 `ses_02e5938b212743d28512`，任务 `tsk_36a247c30bd24aa5bfc4`，最终 `status=completed`。
+- 调用链：Agent → 私有 MCP 桥 → `business_review_ai`（个人模型连接），单条记录
+  `6dc4e187-d917-4ee0-88c5-005724543db3`（项目 `prj_c46be19bcb324262906a`，review_version 0）。
+- 结果：`requested=1, succeeded=1, failed=0`，AI 结论 `consistent`（检测框与红外热斑位置吻合），
+  未重试、未核查其他记录、未创建检测、未改标注、未人工确认、未回流、未训练。
+- 同任务随后返回正常最终回答（含结果摘要与人工复核提醒），说明 `_bridge_engine()` 写回
+  `g.user_id` 后 Agent→私有 MCP→个人复核工厂这条链在真实服务上可用，身份修复得到独立验证。
+- 该证据由根线程产生并记录，本次执行端未重复付费调用、未重启网站、未推送。
+
+剩余风险（本轮未追加大改）：
+
+- `agent/hx_engine_mcp.py:26` 私有 MCP relay 的 HTTP `open(timeout=90)` 仍短于视觉单次 SDK
+  timeout（180s）；Agent 批量复核工具串行处理 3 张图时可能超过 90s 而 relay 侧先超时。
+  上面的独立验收是单条记录；批量 3 张图的整链仍需宿主按需核验，并视需要提高 relay 超时
+  或为批量路径设置独立预算。本轮不重复付费调用、不重启运行实例。

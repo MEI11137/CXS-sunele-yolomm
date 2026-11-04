@@ -6,11 +6,28 @@ import sqlite3
 from collections import OrderedDict
 from typing import Any, Callable
 
+from agent.errors import DEFAULT_MESSAGES, AgentError, Code
+from agent.guard import redact
+
 from services.ai_review_service import AIReviewError
 from services.feedback_dataset_service import FeedbackValidationError, add_confirmed_record
 
 
 MAX_BATCH_SIZE = 50
+
+# 仅这些“站内业务阻断”允许把异常自带的中文提示展示给用户；
+# 其它错误码一律用固定文案，避免把上游原始报错（可能含密钥/令牌）透出。
+_SAFE_AGENT_ERROR_CODES = frozenset(
+    {
+        Code.UNAUTHENTICATED,
+        Code.MODEL_NOT_CONFIGURED,
+        Code.MODEL_CAPABILITY_MISSING,
+        Code.MODEL_CALL_FAILED,
+        Code.CONNECTION_CHECK_FAILED,
+        Code.SECRET_STORE_FAILED,
+    }
+)
+_UNTRUSTED_AGENT_ERROR_TEXT = "本轮复核未执行，请检查个人连接与模型设置后重试"
 
 
 class BatchValidationError(ValueError):
@@ -98,6 +115,22 @@ def run_batch_ai_reviews(
                     "record_id": record_id,
                     "status": "failed",
                     "error": exc.public_message,
+                }
+            )
+        except AgentError as exc:
+            # 连接/能力等站内业务阻断：展示可执行的提示，但要先脱敏；
+            # 白名单之外的错误码不透出上游原始文本，避免密钥/令牌/HTML 报错外露。
+            if exc.code in _SAFE_AGENT_ERROR_CODES:
+                safe_message = redact(str(exc.message or ""))[:200]
+            else:
+                safe_message = (
+                    DEFAULT_MESSAGES.get(exc.code) or _UNTRUSTED_AGENT_ERROR_TEXT
+                )
+            items.append(
+                {
+                    "record_id": record_id,
+                    "status": "failed",
+                    "error": f"AI辅助复核失败: {safe_message}",
                 }
             )
         except Exception as exc:

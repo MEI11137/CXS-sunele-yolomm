@@ -36,7 +36,7 @@ if ($Stop) {
     }
     StopOwned $FrontendPort $viteFile
     StopOwned $BackendPort $appFile
-    Write-Host 'HaiXun v1.5.0 services stopped. Files and data are preserved.'
+    Write-Host 'HaiXun v1.6.0 services stopped. Files and data are preserved.'
     exit 0
 }
 
@@ -67,7 +67,7 @@ try {
     & $node --version
     & $engineExe --version
     if ($LASTEXITCODE -ne 0) { throw '海巡引擎 check failed.' }
-    if ($Check) { Write-Host "CHECK_OK: HaiXun v1.5.0; Python=$python; frontend=web-haixun"; exit 0 }
+    if ($Check) { Write-Host "CHECK_OK: HaiXun v1.6.0; Python=$python; frontend=web-haixun"; exit 0 }
     $targets = @()
     if ($Service -ne 'Frontend') { $targets += [pscustomobject]@{ Port=$BackendPort; Entry=$appFile } }
     if ($Service -ne 'Backend') { $targets += [pscustomobject]@{ Port=$FrontendPort; Entry=$viteFile } }
@@ -117,7 +117,7 @@ try {
         foreach ($item in $started) { try { StopOwned $item.Port $item.Entry } catch {} }
         throw
     }
-    Write-Host "READY: http://127.0.0.1:$FrontendPort/ (v1.5.0). Logs: $runDir"
+    Write-Host "READY: http://127.0.0.1:$FrontendPort/ (v1.6.0). Logs: $runDir"
     if (!$NoBrowser -and $Service -ne 'Backend') { Start-Process "http://127.0.0.1:$FrontendPort/" }
 } catch {
     Write-Host ("START_FAILED: " + $_.Exception.Message) -ForegroundColor Red

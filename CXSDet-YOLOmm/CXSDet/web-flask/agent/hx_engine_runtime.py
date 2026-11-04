@@ -64,6 +64,11 @@ def _bridge_engine():
         raise AgentError(Code.UNAUTHENTICATED, "海巡引擎 私有工具连接无效", http_status=401)
     actor = load_actor(engine.owner_id, source="hxengine-mcp")
     sessions.get_session(actor, engine.site_session)
+    # 复核/模型等业务工厂通过 flask.g 读取“当前用户”；私有桥请求只带引擎令牌、
+    # 没有站点 JWT，必须把已认证的引擎所有者显式写回请求上下文，否则会误报
+    # AGENT_UNAUTHENTICATED（“无法确定当前用户”）。
+    from flask import g
+    g.user_id = actor.user_id
     return runtime, engine, actor
 
 

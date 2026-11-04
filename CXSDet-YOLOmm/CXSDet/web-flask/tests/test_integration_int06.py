@@ -34,7 +34,10 @@ class FakeGateway:
         self.messages = []
         self.text = '{"status":"consistent","summary":"ok"}'
 
-    def complete(self, messages, tools=None, *, temperature=0.2):
+    def complete(self, messages, tools=None, *, temperature=0.2, timeout=None):
+        # 新增 timeout 参数只为兼容复核客户端的单次超时放宽；本用例仍只关心发出的消息内容。
+        self.timeouts = getattr(self, "timeouts", [])
+        self.timeouts.append(timeout)
         self.messages.append(messages)
         return SimpleNamespace(text=self.text, tool_calls=[])
 
