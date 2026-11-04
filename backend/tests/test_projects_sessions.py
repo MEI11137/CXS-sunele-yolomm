@@ -146,10 +146,12 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
         data = body(response)["data"]
         self.assertEqual(data["message"]["role"], "user")
+        # 这个兼容入口只落库用户消息，不生成任何“助手回复”。
         self.assertIsNone(data["assistant"])
-        self.assertIn("WB17-02", data["notice"])
+        self.assertEqual(data["notice"], "")
 
-        messages = body(api(self.client, "GET", f"/api/sessions/{session['id']}/messages"))["data"]["messages"]
+        payload = body(api(self.client, "GET", f"/api/sessions/{session['id']}/messages"))["data"]
+        messages = payload["messages"]
         self.assertEqual(len(messages), 1)
         self.assertEqual(messages[0]["content"], "检查 D:/data/panel-01 下的图片")
 

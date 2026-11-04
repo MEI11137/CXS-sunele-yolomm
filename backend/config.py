@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
@@ -20,7 +21,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIRNAME = "var"
 DEFAULT_PORT = 5080
 DEFAULT_SESSION_HOURS = 12
-STAGE = "WB17-01"
+STAGE = "WB17-02"
+
+# OpenCode 引擎：版本与可执行文件都可用环境变量覆盖，便于换机/换版本；
+# 默认值只对应本机已核验的组合（1.19.4 + E:/OpenCode/bin/opencode.exe）。
+DEFAULT_ENGINE_EXE = "E:/OpenCode/bin/opencode.exe"
+DEFAULT_ENGINE_VERSION = "1.19.4"
 
 # 功能开关：True 表示“本轮真实现并有测试覆盖”，False 表示“界面必须显示未实现”。
 FEATURES: dict[str, bool] = {
@@ -31,8 +37,11 @@ FEATURES: dict[str, bool] = {
     "message_history": True,
     "directories": True,
     "personal_connection": True,
+    "agent_runtime": True,
+    "agent_tools": True,
+    # 命令执行能力本轮不开放：无法在不引入 OS 沙箱的前提下证明范围。
+    "agent_shell": False,
     # 以下仍未实现，任何页面都不得宣称可用。
-    "agent_runtime": False,
     "detection": False,
     "review": False,
     "datasets": False,
@@ -94,6 +103,14 @@ class Settings:
     serve_dist: bool
     cookie_secure: bool
     session_ttl_hours: int
+    engine_exe: str = DEFAULT_ENGINE_EXE
+    engine_python: str = ""
+    engine_version: str = DEFAULT_ENGINE_VERSION
+    engine_strict_version: bool = True
+    engine_idle_seconds: int = 1800
+    turn_timeout_seconds: int = 900
+    # 只允许测试夹具打开：生产环境不得接受假引擎/假成功。
+    allow_fake_engine: bool = False
     features: Mapping[str, bool] = field(default_factory=lambda: dict(FEATURES))
 
     def public(self) -> dict:
@@ -104,6 +121,7 @@ class Settings:
             "stage": self.stage,
             "serve_dist": self.serve_dist,
             "features": dict(self.features),
+            "engine_version": self.engine_version,
         }
 
 
@@ -138,5 +156,20 @@ def load_settings(
         session_ttl_hours=_env_int(
             "HX17_SESSION_HOURS", DEFAULT_SESSION_HOURS, minimum=1, maximum=720
         ),
+        engine_exe=(os.environ.get("HX17_ENGINE_EXE") or DEFAULT_ENGINE_EXE).strip(),
+        engine_python=(
+            os.environ.get("HX17_ENGINE_PYTHON") or sys.executable or ""
+        ).strip(),
+        engine_version=(
+            os.environ.get("HX17_ENGINE_VERSION") or DEFAULT_ENGINE_VERSION
+        ).strip(),
+        engine_strict_version=_env_flag("HX17_ENGINE_STRICT_VERSION", default=True),
+        engine_idle_seconds=_env_int(
+            "HX17_ENGINE_IDLE_SECONDS", 1800, minimum=60, maximum=86400
+        ),
+        turn_timeout_seconds=_env_int(
+            "HX17_TURN_TIMEOUT", 900, minimum=30, maximum=7200
+        ),
+        allow_fake_engine=_env_flag("HX17_ALLOW_FAKE_ENGINE"),
         features=dict(FEATURES),
     )

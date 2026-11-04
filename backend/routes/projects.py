@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from flask import Blueprint, request
+from flask import Blueprint, current_app, request
 
 from backend import auth, db, paths
 from backend.errors import ok
@@ -15,6 +15,16 @@ def _user() -> dict:
     user = auth.current_user()
     assert user is not None
     return user
+
+
+def _stop_project_turns(project_id: str, user_id: int, reason: str) -> None:
+    runtime = current_app.config.get("HX17_AGENT")
+    if runtime is None:
+        return
+    try:
+        runtime.invalidate_project(user_id, project_id, reason=reason)
+    except Exception:
+        pass
 
 
 def _trash_flag() -> bool:
@@ -71,8 +81,17 @@ def update_project(project_id: str):
 @auth.login_required
 def delete_project(project_id: str):
     conn = db.get_db()
-    row = projects.get_owned(conn, project_id, int(_user()["id"]))
+    user_id = int(_user()["id"])
+    row = projects.get_owned(conn, project_id, user_id)
     projects.soft_delete(conn, row)
+    runtime = current_app.config.get("HX17_AGENT")
+    if runtime is not None:
+        try:
+            runtime.invalidate_project(
+                user_id, project_id, reason="项目已删除，运行中的轮次已终止"
+            )
+        except Exception:
+            pass
     return ok({"deleted": True, "project_id": project_id})
 
 
@@ -97,6 +116,7 @@ def bind_root(project_id: str):
     updated = projects.bind_root(
         conn, row, raw_path=str(payload.get("path") or ""), replace=replace
     )
+    _stop_project_turns(updated["id"], int(_user()["id"]), "项目目录已变更，运行中的轮次已终止")
     return ok({"project": projects.public(updated), "replaced": replace})
 
 
@@ -106,6 +126,7 @@ def unbind_root(project_id: str):
     conn = db.get_db()
     row = projects.get_owned(conn, project_id, int(_user()["id"]))
     updated = projects.unbind_root(conn, row)
+    _stop_project_turns(updated["id"], int(_user()["id"]), "项目目录绑定已解除，运行中的轮次已终止")
     return ok({"project": projects.public(updated)})
 
 

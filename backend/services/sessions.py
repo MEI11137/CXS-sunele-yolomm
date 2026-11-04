@@ -141,12 +141,37 @@ def message_public(row: sqlite3.Row) -> dict:
     }
 
 
-def list_messages(conn: sqlite3.Connection, session_id: str, *, limit: int = 200) -> list[dict]:
+def list_messages(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    limit: int = 100,
+    before: int | None = None,
+) -> dict:
+    """按“最近一页 + 向前翻页”读取消息。
+
+    旧实现是 ``ORDER BY id ASC LIMIT 200``：对话超过 200 条后，**所有新消息**
+    （包括助手最终回答）都会落在窗口之外，历史接口永远看不到。
+    这里改成取最后 N 条（按 id 倒序再反转），并用 ``before=<id>`` 向前翻。
+    """
+    cap = max(1, min(int(limit), 200))
+    params: list = [str(session_id)]
+    clause = "session_id = ?"
+    if before is not None:
+        clause += " AND id < ?"
+        params.append(int(before))
+    params.append(cap + 1)
     rows = conn.execute(
-        "SELECT * FROM messages WHERE session_id = ? ORDER BY id ASC LIMIT ?",
-        (str(session_id), max(1, min(int(limit), 500))),
+        f"SELECT * FROM messages WHERE {clause} ORDER BY id DESC LIMIT ?", params
     ).fetchall()
-    return [message_public(row) for row in rows]
+    has_more = len(rows) > cap
+    page = rows[:cap]
+    page.reverse()
+    return {
+        "messages": [message_public(row) for row in page],
+        "has_more": has_more,
+        "next_before": (int(page[0]["id"]) if has_more and page else None),
+    }
 
 
 def append_message(
@@ -156,14 +181,19 @@ def append_message(
     role: str,
     content: str,
     meta: dict | None = None,
+    limit: int = CONTENT_MAX,
 ) -> dict:
     if role not in {"user", "assistant", "system"}:
         raise ApiError(400, "BAD_ROLE", "消息角色不合法")
     text = str(content or "").strip()
     if not text:
         raise ApiError(400, "VALIDATION", "消息内容不能为空")
-    if len(text) > CONTENT_MAX:
-        raise ApiError(400, "VALIDATION", f"单条消息不能超过 {CONTENT_MAX} 个字符")
+    # 用户输入上限 8000；助手最终回答允许更长（由调用方传入 limit）。
+    cap = max(1, int(limit))
+    if len(text) > cap:
+        if role == "user":
+            raise ApiError(400, "VALIDATION", f"单条消息不能超过 {cap} 个字符")
+        text = text[:cap]
     now = security.now_iso()
     cursor = conn.execute(
         "INSERT INTO messages (session_id, role, content, meta, created_at) VALUES (?, ?, ?, ?, ?)",

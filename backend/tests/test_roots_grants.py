@@ -204,7 +204,10 @@ class MigrationTest(unittest.TestCase):
                 conn.commit()
 
                 db.ensure_schema(conn)
-                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+                # 迁移只向前追加：v3 加的是 Agent 相关空表，同样不发放任何目录授权。
+                self.assertEqual(
+                    conn.execute("PRAGMA user_version").fetchone()[0], len(db.MIGRATIONS)
+                )
                 granted = conn.execute("SELECT COUNT(*) FROM root_grants").fetchone()[0]
                 self.assertEqual(granted, 0)
                 # 旧授权根仍然存在，只是没有归属。

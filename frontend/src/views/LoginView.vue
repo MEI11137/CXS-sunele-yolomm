@@ -46,7 +46,7 @@ async function submit(): Promise<void> {
         <span class="brand-mark" aria-hidden="true">✳</span>
         <div>
           <h1>海巡智检</h1>
-          <p class="subtitle">v{{ auth.meta?.version ?? '1.7.0' }} · {{ auth.meta?.stage ?? 'WB17-01' }}</p>
+          <p class="subtitle">v{{ auth.meta?.version ?? '1.7.0' }}</p>
         </div>
       </header>
 

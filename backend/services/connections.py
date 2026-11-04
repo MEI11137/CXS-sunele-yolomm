@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import json
+import random
 import re
 import sqlite3
 import struct
@@ -49,8 +50,8 @@ BASE_URL_MAX = 300
 CONNECTION_NOT_FOUND = "尚未保存个人模型连接"
 
 
-def _tiny_png_base64() -> str:
-    """用标准库拼一张 1x1 白色 PNG，供视觉能力探测使用。"""
+def _solid_png_base64(rgb: tuple[int, int, int], size: int = 32) -> str:
+    """用标准库拼一张纯色 PNG，供视觉能力探测使用。"""
 
     def chunk(tag: bytes, payload: bytes) -> bytes:
         return (
@@ -60,17 +61,47 @@ def _tiny_png_base64() -> str:
             + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
         )
 
-    raw = b"\x00\xff\xff\xff"
+    row = b"\x00" + bytes(rgb) * size
+    raw = row * size
     png = (
         b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
         + chunk(b"IDAT", zlib.compress(raw))
         + chunk(b"IEND", b"")
     )
     return base64.b64encode(png).decode("ascii")
 
 
-_TINY_PNG_B64 = _tiny_png_base64()
+# 颜色挑战：随机取一种，模型必须答对才认为“真的看到了图”。
+COLOR_PALETTE: dict[str, tuple[int, int, int]] = {
+    "红色": (220, 38, 38),
+    "绿色": (22, 163, 74),
+    "蓝色": (37, 99, 235),
+    "黄色": (250, 204, 21),
+    "紫色": (147, 51, 234),
+    "橙色": (234, 88, 12),
+}
+_COLOR_ALIASES = {
+    "红色": ("红色", "红", "red"),
+    "绿色": ("绿色", "绿", "green"),
+    "蓝色": ("蓝色", "蓝", "blue"),
+    "黄色": ("黄色", "黄", "yellow"),
+    "紫色": ("紫色", "紫", "purple", "violet"),
+    "橙色": ("橙色", "橙", "orange"),
+}
+_REFUSAL_MARKERS = (
+    "无法查看",
+    "看不到",
+    "无法识别",
+    "没有收到图片",
+    "没有图片",
+    "无法访问图片",
+    "cannot see",
+    "can't see",
+    "unable to view",
+    "no image",
+    "as an ai",
+)
 
 
 # --------------------------------------------------------------------------- 入参规范化
@@ -334,6 +365,12 @@ def probe(
         return {
             **capabilities,
             "auth_state": auth_state,
+            "capability_states": {
+                "auth": auth_state,
+                "chat": "unverified",
+                "vision": "not_attempted",
+                "tools": "not_attempted",
+            },
             "evidence": evidence,
             "checked_at": security.now_iso(),
             "summary": _STATE_SUMMARIES.get(auth_state, note),
@@ -341,6 +378,10 @@ def probe(
 
     capabilities["chat"] = True
 
+    # ---- 视觉：真实图像挑战 -------------------------------------------------
+    # 随机选一种颜色，模型必须答对才算通过。只返回 200 或返回一段“无法查看图片”
+    # 的文本都不能说明它具备视觉能力（审查复现过这种假阳性）。
+    color_name = random.choice(list(COLOR_PALETTE))
     vision = _safe_call(
         send,
         url,
@@ -351,10 +392,13 @@ def probe(
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "这张图是什么颜色？只回答颜色。"},
+                        {"type": "text", "text": "这张纯色图片是什么颜色？只回答一个颜色词。"},
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{_TINY_PNG_B64}"},
+                            "image_url": {
+                                "url": "data:image/png;base64,"
+                                + _solid_png_base64(COLOR_PALETTE[color_name])
+                            },
                         },
                     ],
                 }
@@ -367,19 +411,24 @@ def probe(
         secrets=(api_key,),
     )
     vision_choice = _first_choice(vision.body)
-    vision_text = _message_of(vision_choice).get("content")
-    evidence["vision"] = _describe(vision, step="vision", secrets=(api_key,))
-    capabilities["vision"] = bool(
-        vision.status == 200 and vision_choice is not None and str(vision_text or "").strip()
-    )
+    vision_text = str(_message_of(vision_choice).get("content") or "").strip()
+    vision_state, vision_note = _judge_vision(vision, vision_text, color_name)
+    evidence["vision"] = {
+        **_describe(vision, step="vision", secrets=(api_key,)),
+        "state": vision_state,
+        "expected_color": color_name,
+        "answer_seen": bool(vision_text),
+    }
+    capabilities["vision"] = vision_state == "verified"
 
+    # ---- 工具：必须出现真实 tool_calls --------------------------------------
     tools = _safe_call(
         send,
         url,
         headers,
         {
             "model": model,
-            "messages": [{"role": "user", "content": "调用 hx_probe 返回当前状态。"}],
+            "messages": [{"role": "user", "content": "请调用 hx_probe 工具，参数 state=ready。"}],
             "tools": [
                 {
                     "type": "function",
@@ -404,24 +453,86 @@ def probe(
     )
     tools_choice = _first_choice(tools.body)
     tool_calls = _message_of(tools_choice).get("tool_calls")
-    evidence["tools"] = _describe(tools, step="tools", secrets=(api_key,))
-    evidence["tools"]["tool_calls"] = bool(tool_calls)
-    # 200 且返回结构完整即视为“接受 tools 参数”；是否真的发起调用记录在证据里。
-    capabilities["tools"] = bool(tools.status == 200 and tools_choice is not None)
+    called_names = _tool_call_names(tool_calls)
+    tools_state, tools_note = _judge_tools(tools, called_names)
+    evidence["tools"] = {
+        **_describe(tools, step="tools", secrets=(api_key,)),
+        "state": tools_state,
+        "tool_calls": bool(called_names),
+        "called": called_names[:3],
+    }
+    capabilities["tools"] = tools_state == "verified"
+
+    states = {
+        "auth": "verified",
+        "chat": "verified",
+        "vision": vision_state,
+        "tools": tools_state,
+    }
+    evidence["states"] = states
+    evidence["vision"]["note"] = vision_note
+    evidence["tools"]["note"] = tools_note
 
     summary_parts = [
         "认证通过（200 且返回了 chat 回复）",
-        "chat 可用" if capabilities["chat"] else "chat 不可用",
-        "视觉可用" if capabilities["vision"] else "视觉未通过",
-        "工具调用可用" if capabilities["tools"] else "工具调用未通过",
+        "chat 可用",
+        "视觉已通过图像挑战" if capabilities["vision"] else f"视觉未通过（{vision_note}）",
+        "工具调用已实际发起" if capabilities["tools"] else f"工具调用未通过（{tools_note}）",
     ]
     return {
         **capabilities,
         "auth_state": "verified",
+        "capability_states": states,
         "evidence": evidence,
         "checked_at": security.now_iso(),
         "summary": "；".join(summary_parts),
     }
+
+
+def _judge_vision(response: ProbeResponse, text: str, expected: str) -> tuple[str, str]:
+    if response.status == 0:
+        return "network_error", "图像挑战没有拿到响应（网络问题）"
+    if response.status in (401, 403):
+        return "rejected", "视觉请求被凭据拒绝"
+    if response.status != 200:
+        return "unverified", f"图像挑战返回 HTTP {response.status}"
+    lowered = text.lower()
+    if any(marker in lowered for marker in _REFUSAL_MARKERS):
+        return "unsupported", "模型明确表示看不到图片，按“不支持图像输入”处理"
+    if not text:
+        return "unverified", "图像挑战没有返回内容"
+    aliases = _COLOR_ALIASES.get(expected, (expected,))
+    if any(alias in lowered for alias in aliases):
+        return "verified", "答对了随机颜色，确认能读取图像内容"
+    return "unverified", "回答与图片颜色不符，不能认为具备视觉能力"
+
+
+def _tool_call_names(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    names: list[str] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function")
+        name = function.get("name") if isinstance(function, dict) else None
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def _judge_tools(response: ProbeResponse, names: list[str]) -> tuple[str, str]:
+    if response.status == 0:
+        return "network_error", "工具请求没有拿到响应（网络问题）"
+    if response.status in (401, 403):
+        return "rejected", "工具请求被凭据拒绝"
+    if response.status != 200:
+        return "unverified", f"工具请求返回 HTTP {response.status}"
+    if "hx_probe" in names:
+        return "verified", "模型实际发起了 hx_probe 调用"
+    if names:
+        return "unverified", "模型发起了别的工具调用，不能据此认为支持本工程工具"
+    return "unverified", "模型没有发起工具调用（HTTP 接受参数不等于会调用工具）"
 
 
 # --------------------------------------------------------------------------- 存取
@@ -438,6 +549,18 @@ def get_row(conn: sqlite3.Connection, user_id: int) -> sqlite3.Row:
     return row
 
 
+def effective_model(conn: sqlite3.Connection, user_id: int) -> str | None:
+    """实际会请求的模型。
+
+    走和 Agent 侧同一个解析器（``agent.identity.resolve``），避免“界面按偏好选、
+    后台按连接选”两套结论；两套选择的直接后果是把 A 验证过的视觉能力声明给 B。
+    """
+    from backend.agent import identity
+
+    selection = identity.resolve(conn, int(user_id))
+    return selection.model if selection is not None else None
+
+
 def view(conn: sqlite3.Connection, user_id: int) -> dict | None:
     row = _row(conn, user_id)
     if row is None:
@@ -448,17 +571,21 @@ def view(conn: sqlite3.Connection, user_id: int) -> dict | None:
         capabilities = {}
     if not isinstance(capabilities, dict):
         capabilities = {}
+    model = effective_model(conn, user_id) or str(row["model"])
     stale = (
         not capabilities
         or row["checked_fingerprint"] != row["key_fingerprint"]
         or row["checked_base_url"] != row["base_url"]
-        or row["checked_model"] != row["model"]
+        or row["checked_model"] != model
         or row["checked_provider"] != row["provider"]
     )
     return {
         "provider": row["provider"],
         "base_url": row["base_url"],
         "model": row["model"],
+        # 连接里保存的模型与实际会请求的模型可能不同（用户在对话里另选了模型）。
+        # 分开给出，界面就能说清“检查的是哪个模型”，不用猜。
+        "effective_model": model,
         "display_name": row["display_name"],
         # 只给掩码；完整 Key 与密文都不出现在响应里。
         "key_hint": row["key_hint"],
@@ -555,14 +682,17 @@ def check(
     api_key = crypto.decrypt_text(row["key_cipher"], key, aad=_aad(user_id))
     # 先把“这次检查针对哪套配置”拍下来，探测期间连接若被改动，结果必须丢弃，
     # 否则旧结论会被写成新连接的能力。
-    snapshot = (
+    guard = (
         row["base_url"],
         row["model"],
         row["provider"],
         row["key_fingerprint"],
     )
+    # 探测的必须是**实际会请求的模型**：只检查连接里保存的默认模型，
+    # 用户切到另一个模型后就会拿着 A 的证据去给 B 声明视觉能力。
+    model = effective_model(conn, user_id) or str(row["model"])
     result = probe(
-        base_url=row["base_url"], api_key=api_key, model=row["model"], transport=transport
+        base_url=row["base_url"], api_key=api_key, model=model, transport=transport
     )
     now = security.now_iso()
     cursor = conn.execute(
@@ -577,10 +707,13 @@ def check(
                 {k: v for k, v in result.items() if k != "summary"}, ensure_ascii=False
             ),
             now,
-            *snapshot,
+            row["base_url"],
+            model,
+            row["provider"],
+            row["key_fingerprint"],
             now,
             int(user_id),
-            *snapshot,
+            *guard,
         ),
     )
     conn.commit()

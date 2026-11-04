@@ -5,26 +5,55 @@
 
 from __future__ import annotations
 
+import dataclasses
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
-from backend import db
+from backend import config, db
 from backend.app import create_app
-from backend.services import projects, roots, sessions, users
+from backend.services import connections, projects, roots, sessions, users
+from backend.tests.fake_engine import FakeEngine, fake_spawner
 
 PASSWORD = "correct-horse-9"
 
 
 class Harness:
-    def __init__(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="hx17-test-")
-        self.data_dir = Path(self._tmp.name)
-        self.app = create_app(data_dir=self.data_dir, serve_dist=False)
+    def __init__(self, *, fake_engine: bool = False) -> None:
+        # 用 mkdtemp 而不是 TemporaryDirectory：后者在对象被回收时会**随时**删除目录，
+        # 而后台轮次线程可能还在写库，删除时机不可控。
+        self.data_dir = Path(tempfile.mkdtemp(prefix="hx17-test-"))
+        # 业务工作区必须与数据目录分开：数据目录是服务端私有区（数据库/密钥/引擎），
+        # 测试也不该为了让文件工具跑通而放宽这条生产边界。
+        self.workspace_dir = Path(tempfile.mkdtemp(prefix="hx17-ws-"))
+        self.fake: FakeEngine | None = None
+        settings = config.load_settings(data_dir=self.data_dir, serve_dist=False, port=5099)
+        spawner = None
+        if fake_engine:
+            self.fake = FakeEngine()
+            self.fake.start()
+            # 假引擎只在显式打开的测试配置里可用；生产默认不允许。
+            settings = dataclasses.replace(settings, allow_fake_engine=True)
+            spawner = fake_spawner(self.fake)
+        else:
+            # 默认用例不该启动真实引擎进程：指向不存在的可执行文件，让轮次快速失败。
+            settings = dataclasses.replace(
+                settings, engine_exe=str(self.data_dir / "missing-opencode.exe")
+            )
+        self.app = create_app(settings=settings, serve_dist=False, engine_spawner=spawner)
         self.settings = self.app.config["HX17"]
 
     def close(self) -> None:
-        self._tmp.cleanup()
+        try:
+            self.app.config["HX17_AGENT"].shutdown()
+        except Exception:
+            pass
+        if self.fake is not None:
+            self.fake.stop()
+        # 不主动删除临时目录：Windows 上 sqlite 句柄释放有延迟，
+        # 删除过程中偶发的文件锁会干扰后续用例。进程退出后由系统清理。
+        return
 
     # ------------------------------------------------------------------ 数据
 
@@ -102,9 +131,62 @@ class Harness:
             connection.close()
 
     def make_dir(self, name: str) -> Path:
-        target = self.data_dir / "workspace" / name
+        target = self.workspace_dir / name
         target.mkdir(parents=True, exist_ok=True)
         return target
+
+    def save_connection(
+        self,
+        user_id: int,
+        *,
+        base_url: str = "http://127.0.0.1:9/v1",
+        model: str = "probe-model",
+        provider: str = "custom",
+        api_key: str = "test-key-1234567890",
+    ) -> None:
+        """直接写库保存个人连接（不触发任何真实网络请求）。"""
+        connection = self.conn()
+        try:
+            connections.save(
+                connection,
+                int(user_id),
+                {
+                    "provider": provider,
+                    "base_url": base_url,
+                    "model": model,
+                    "display_name": "测试连接",
+                    "api_key": api_key,
+                },
+                key=self.app.config["HX17_CONNECTION_KEY"],
+            )
+        finally:
+            connection.close()
+
+    def delete_connection(self, user_id: int) -> None:
+        connection = self.conn()
+        try:
+            connections.delete(connection, int(user_id))
+        finally:
+            connection.close()
+
+    def set_mode(self, user_id: int, mode: str) -> None:
+        connection = self.conn()
+        try:
+            from backend.agent import store as turn_store
+
+            turn_store.save_prefs(connection, int(user_id), mode=mode, model=None)
+        finally:
+            connection.close()
+
+    def bind_project(self, project_id: str, path: Path, username: str) -> None:
+        connection = self.conn()
+        try:
+            row = projects.get_owned(
+                connection, project_id, users.find_by_username(connection, username)["id"]
+            )
+            projects.bind_root(connection, row, raw_path=str(path))
+        finally:
+            connection.close()
 
     # ------------------------------------------------------------------ 客户端
 
@@ -140,3 +222,17 @@ def body(response) -> dict:
     data = response.get_json()
     assert data is not None, response.get_data(as_text=True)
     return data
+
+
+def wait_turn(client, turn_id: str, *, timeout: float = 20.0, after: int = 0) -> dict:
+    """轮询事件直到轮次进入终态；返回最后一次响应。"""
+    deadline = time.time() + timeout
+    last: dict = {}
+    while time.time() < deadline:
+        response = api(client, "GET", f"/api/turns/{turn_id}?after=0")
+        assert response.status_code == 200, response.get_data(as_text=True)
+        last = body(response)["data"]
+        if last["turn"]["status"] in {"completed", "failed", "stopped"}:
+            return last
+        time.sleep(0.1)
+    raise AssertionError(f"轮次未在 {timeout}s 内结束：{last}")

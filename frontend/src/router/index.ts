@@ -26,9 +26,10 @@ const router = createRouter({
       meta: { title: '项目' },
     },
     {
+      // 对话在中间主区；项目配置走“项目详情”入口，不占主位。
       path: '/projects/:projectId/sessions/:sessionId',
       name: 'session',
-      component: () => import('@/views/ProjectHome.vue'),
+      component: () => import('@/views/SessionView.vue'),
       props: true,
       meta: { title: '会话' },
     },

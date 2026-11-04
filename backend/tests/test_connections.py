@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
+import base64
 import sqlite3
+import struct
 import unittest
+import zlib
 from unittest import mock
 
 from backend import crypto
@@ -30,6 +33,27 @@ def _reply(content: str = "ok", *, tool_calls: bool = False) -> dict:
     return {"choices": [{"index": 0, "message": message, "finish_reason": "stop"}]}
 
 
+def _color_of(payload: dict) -> str:
+    """从探测请求里解出纯色 PNG 的颜色，模拟“真的看到了图”的模型。"""
+    content = payload["messages"][0]["content"]
+    url = next(item["image_url"]["url"] for item in content if item["type"] == "image_url")
+    data = base64.b64decode(url.split(",", 1)[1])
+    pos, idat = 8, b""
+    while pos < len(data):
+        length = struct.unpack(">I", data[pos : pos + 4])[0]
+        tag = data[pos + 4 : pos + 8]
+        body = data[pos + 8 : pos + 8 + length]
+        if tag == b"IDAT":
+            idat += body
+        pos += 12 + length
+    raw = zlib.decompress(idat)
+    rgb = tuple(raw[1:4])
+    for name, expected in connections.COLOR_PALETTE.items():
+        if tuple(expected) == rgb:
+            return name
+    return "不知道"
+
+
 class FakeTransport:
     """按顺序返回预置响应，并记录每次调用，用于证明没有重试。"""
 
@@ -41,7 +65,8 @@ class FakeTransport:
         self.calls.append({"url": url, "payload": payload, "headers": headers, "timeout": timeout})
         if not self.responses:
             return ProbeResponse(500, None, "unexpected extra call", 1)
-        return self.responses.pop(0)
+        item = self.responses.pop(0)
+        return item(payload) if callable(item) else item
 
 
 class ConnectionCrudTest(unittest.TestCase):
@@ -202,7 +227,7 @@ class ConnectionCheckTest(unittest.TestCase):
         transport = FakeTransport(
             [
                 ProbeResponse(200, _reply("ok"), "", 12),
-                ProbeResponse(200, _reply("白色"), "", 20),
+                lambda payload: ProbeResponse(200, _reply(_color_of(payload)), "", 20),
                 ProbeResponse(200, _reply("", tool_calls=True), "", 18),
             ]
         )
@@ -252,7 +277,7 @@ class ConnectionCheckTest(unittest.TestCase):
         transport = FakeTransport(
             [
                 ProbeResponse(200, _reply("ok"), "", 10),
-                ProbeResponse(200, _reply("白色"), "", 10),
+                lambda payload: ProbeResponse(200, _reply(_color_of(payload)), "", 10),
                 ProbeResponse(200, _reply("", tool_calls=True), "", 10),
             ]
         )
@@ -272,7 +297,7 @@ class ConnectionCheckTest(unittest.TestCase):
         transport = FakeTransport(
             [
                 ProbeResponse(200, _reply("ok"), "", 10),
-                ProbeResponse(200, _reply("白色"), "", 10),
+                lambda payload: ProbeResponse(200, _reply(_color_of(payload)), "", 10),
                 ProbeResponse(200, _reply("", tool_calls=True), "", 10),
             ]
         )

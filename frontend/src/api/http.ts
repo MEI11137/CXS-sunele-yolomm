@@ -88,3 +88,11 @@ export function errorMessage(error: unknown): string {
 export function errorCode(error: unknown): string {
   return error instanceof ApiError ? error.code : ''
 }
+
+/**
+ * HTTP 状态码。0 表示**请求没有到服务器**（断网/后端挂了），结果未知；
+ * 其余表示服务端明确给了答复，界面不该把它当成“稍后自动会好”。
+ */
+export function errorStatus(error: unknown): number {
+  return error instanceof ApiError ? error.status : 0
+}

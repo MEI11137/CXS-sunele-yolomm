@@ -7,3 +7,7 @@ itsdangerous>=2.1,<3.0
 cryptography>=42
 # requests：仅用于“检查连接”这一显式动作，单次请求、超时受限、无重试
 requests>=2.31
+# mcp：私有 stdio 工具桥的服务端 SDK（Agent 侧 stdio server，只有本机子进程连得上）
+# anyio 是 mcp 的运行时依赖，一并显式声明，避免离线环境漏装
+mcp>=1.26,<2.0
+anyio>=4.4,<5.0

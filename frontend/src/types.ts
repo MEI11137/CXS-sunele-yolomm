@@ -168,3 +168,113 @@ export interface AuditEntry {
   target: string
   detail: string
 }
+
+/* ---------------- Agent 轮次 / 事件 / 动作 ---------------- */
+
+export type TurnStatus =
+  | 'queued'
+  | 'running'
+  | 'waiting_action'
+  | 'completed'
+  | 'failed'
+  | 'stopped'
+
+export type PermissionMode = 'request' | 'assist' | 'full'
+
+export interface Turn {
+  id: string
+  session_id: string
+  project_id: string
+  kind: 'user' | 'continuation'
+  mode: PermissionMode
+  provider: string
+  model: string
+  status: TurnStatus
+  stop_requested: boolean
+  error_code: string | null
+  error_message: string | null
+  started_at: string | null
+  finished_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface TurnEvent {
+  seq: number
+  turn_id: string
+  /** text / tool / notice / error / final / turn.status / action / question / ui.navigate */
+  type: string
+  payload: Record<string, unknown>
+  created_at: string
+}
+
+export type ActionStatus =
+  | 'proposed'
+  | 'executing'
+  | 'done'
+  | 'failed'
+  | 'rejected'
+  | 'expired'
+
+export interface AgentAction {
+  id: string
+  turn_id: string
+  session_id: string
+  tool: string
+  risk: 'read' | 'write' | 'destructive' | string
+  title: string
+  preview: string
+  status: ActionStatus
+  result: Record<string, unknown>
+  error: { code: string | null; message: string | null } | null
+  created_at: string
+  decided_at: string | null
+}
+
+export interface ModeOption {
+  id: PermissionMode
+  label: string
+  hint: string
+}
+
+export interface AgentPreferences {
+  mode: PermissionMode
+  mode_label: string
+  mode_hint: string
+  model: string | null
+  models: string[]
+  modes: ModeOption[]
+  updated_at: string | null
+}
+
+export interface AgentToolSpec {
+  name: string
+  title: string
+  risk: string
+  requires_root: boolean
+}
+
+export interface AgentCapabilities {
+  runtime: Record<string, unknown>
+  tools: AgentToolSpec[]
+  services: Record<string, { available: boolean; note: string }>
+  connection: {
+    configured: boolean
+    provider: string | null
+    model: string | null
+    fingerprint: string | null
+  }
+  modes: ModeOption[]
+}
+
+export interface TurnDetail {
+  turn: Turn
+  events: TurnEvent[]
+  actions: AgentAction[]
+}
+
+export interface SessionTurns {
+  turns: Turn[]
+  active: Turn | null
+  actions: AgentAction[]
+}

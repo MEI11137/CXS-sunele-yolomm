@@ -1,4 +1,4 @@
-# 本机检查：后端单元测试 + 前端类型检查与构建。
+﻿# 本机检查：后端单元测试 + 前端类型检查与构建。
 # 用法：powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\check.ps1
 param(
     [string]$Python = $env:HAIXUN_PYTHON,
@@ -29,6 +29,8 @@ try {
     $env:PATH = (Split-Path -Parent (Get-Command $Node).Source) + ';' + $env:PATH
     npm run typecheck
     if ($LASTEXITCODE -ne 0) { throw 'frontend typecheck failed' }
+    npm run test:logic
+    if ($LASTEXITCODE -ne 0) { throw 'frontend logic tests failed' }
     npm run build
     if ($LASTEXITCODE -ne 0) { throw 'frontend build failed' }
 } finally {

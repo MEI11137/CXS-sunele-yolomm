@@ -3,13 +3,11 @@ import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import DialogShell from '@/components/DialogShell.vue'
 import DirectoryBrowser from '@/components/DirectoryBrowser.vue'
-import { useRuntimeStore } from '@/stores/runtime'
 import { useWorkspaceStore } from '@/stores/workspace'
 
 const route = useRoute()
 const router = useRouter()
 const workspace = useWorkspaceStore()
-const runtime = useRuntimeStore()
 
 const projectId = computed(() => String(route.params.projectId ?? ''))
 const sessionId = computed(() => String(route.params.sessionId ?? ''))
@@ -173,7 +171,38 @@ async function confirmDeleteSession(): Promise<void> {
   }
 }
 
-const agentsReady = computed(() => runtime.featureEnabled('agent_runtime'))
+/**
+ * 项目详情是**低频**入口：日常操作直接进会话。
+ *
+ * 打开项目时，如果已经有会话就自动进入最近的会话（点击即进入上下文）；
+ * 只有显式 `?details=1`（从“项目详情”按钮进来）或还没有会话时才停留在这里。
+ */
+const detailsMode = computed(() => route.query.details === '1')
+
+function enterConversation(): void {
+  const first = sessions.value[0]
+  if (!first) return
+  void router.push({
+    name: 'session',
+    params: { projectId: projectId.value, sessionId: first.id },
+  })
+}
+
+watch(
+  [project, sessions, detailsMode],
+  () => {
+    if (!projectId.value || detailsMode.value) return
+    const first = sessions.value[0]
+    if (!first) return
+    // 自动进入用 replace：否则“项目页 → 会话页”会在历史里堆一层，
+    // 用户点返回又立刻被送回会话页，等于返回不了。
+    void router.replace({
+      name: 'session',
+      params: { projectId: projectId.value, sessionId: first.id },
+    })
+  },
+  { immediate: true, flush: 'post' },
+)
 </script>
 
 <template>
@@ -236,6 +265,9 @@ const agentsReady = computed(() => runtime.featureEnabled('agent_runtime'))
           </p>
         </div>
         <div class="header-actions">
+          <button v-if="sessions.length" class="primary" type="button" @click="enterConversation">
+            进入对话
+          </button>
           <button class="ghost" type="button" @click="openRename">改名</button>
           <button class="ghost danger-text" type="button" @click="deleteOpen = true">删除</button>
         </div>
@@ -286,8 +318,9 @@ const agentsReady = computed(() => runtime.featureEnabled('agent_runtime'))
       <section class="card">
         <h2>会话</h2>
         <p class="body-text">
-          会话保存真实消息记录；助手运行时（OpenCode + 私有工具桥）计划在 WB17-02 接入，
-          当前发送的消息只入库、不会产生助手回复。
+          会话保存真实消息记录。打开会话后，「海巡助手」会在本项目绑定目录内
+          列目录、读文件、写入/移动/删除文件，也能查项目与会话；
+          写入类动作是否要你确认由权限模式决定。
         </p>
         <div class="inline-form">
           <input v-model="newSessionTitle" placeholder="新会话名称（可留空）" @keydown.enter="createSession" />
@@ -325,14 +358,6 @@ const agentsReady = computed(() => runtime.featureEnabled('agent_runtime'))
         <p v-else class="empty-hint">还没有会话。新建一个后可在右侧助手区留下消息记录。</p>
       </section>
 
-      <section class="card">
-        <h2>后续能力</h2>
-        <p class="body-text">
-          检测、AI 核查、复核、数据集与训练仍属未实现，按计划在 WB17-02 至 WB17-05 交付；
-          当前界面不会显示任何模拟结果。
-        </p>
-        <p class="hint">Agent 运行时：{{ agentsReady ? '已启用' : '未实现' }}</p>
-      </section>
     </template>
   </section>
 

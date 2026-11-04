@@ -1,23 +1,43 @@
 import { defineStore } from 'pinia'
-import { reactive, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { errorMessage, http } from '@/api/http'
 import type { ChatMessage, ChatSession, Project } from '@/types'
+
+interface MessagePage {
+  messages: ChatMessage[]
+  has_more: boolean
+  next_before: number | null
+}
 
 /**
  * 项目、会话、消息。
  *
  * 所有数据都来自后端真实接口；客户端不做乐观伪造，失败时把后端文案放进 ``error``。
+ *
+ * 消息**按会话分开缓存**，并且每次读取都带一个代次（generation）：
+ * 会话 A 的慢请求返回时，如果用户已经在看会话 B，就不能把 A 的内容写进当前列表。
+ * 只用一个全局数组的旧写法在“A 慢、B 快”或“A 在后台跑完”时会把当前会话覆盖掉。
  */
 export const useWorkspaceStore = defineStore('workspace', () => {
   const projects = ref<Project[]>([])
   const deletedProjects = ref<Project[]>([])
   const deletedSessions = ref<ChatSession[]>([])
   const sessionsByProject = reactive<Record<string, ChatSession[]>>({})
-  const messages = ref<ChatMessage[]>([])
-  const messagesSessionId = ref('')
-  const lastNotice = ref('')
+  const messagesBySession = reactive<Record<string, ChatMessage[]>>({})
+  const pagingBySession = reactive<Record<string, { hasMore: boolean; nextBefore: number | null }>>({})
+  const currentSessionId = ref('')
+  /** sessionId -> 最近一次读取的代次；只有代次相同的返回才允许落盘。 */
+  const loadGeneration = new Map<string, number>()
   const loading = ref(false)
   const error = ref('')
+
+  /** 当前打开的会话的消息；没有选中会话时是空数组。 */
+  const messages = computed<ChatMessage[]>(() =>
+    currentSessionId.value ? (messagesBySession[currentSessionId.value] ?? []) : [],
+  )
+  const hasOlderMessages = computed<boolean>(() =>
+    currentSessionId.value ? Boolean(pagingBySession[currentSessionId.value]?.hasMore) : false,
+  )
 
   async function run<T>(task: () => Promise<T>): Promise<T | null> {
     loading.value = true
@@ -164,10 +184,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       await http.del(`/sessions/${sessionId}`)
       const list = sessionsByProject[projectId] ?? []
       sessionsByProject[projectId] = list.filter((item) => item.id !== sessionId)
-      if (messagesSessionId.value === sessionId) {
-        messages.value = []
-        messagesSessionId.value = ''
-      }
+      dropSessionMessages(sessionId)
       return true
     })
     return result === true
@@ -183,41 +200,82 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     return result === true
   }
 
-  async function loadMessages(sessionId: string): Promise<void> {
-    if (messagesSessionId.value === sessionId && messages.value.length) return
-    await run(async () => {
-      const data = await http.get<{ messages: ChatMessage[] }>(`/sessions/${sessionId}/messages`)
-      messages.value = data.messages
-      messagesSessionId.value = sessionId
-      lastNotice.value = ''
-    })
+  /** 切换当前会话：只改“在看哪个”，不清别人缓存。 */
+  function selectSession(sessionId: string): void {
+    currentSessionId.value = sessionId
   }
 
-  async function sendMessage(sessionId: string, content: string): Promise<boolean> {
-    const result = await run(async () => {
-      const data = await http.post<{ message: ChatMessage; notice: string }>(
-        `/sessions/${sessionId}/messages`,
-        { content },
-      )
-      if (messagesSessionId.value !== sessionId) {
-        messages.value = []
-        messagesSessionId.value = sessionId
+  /**
+   * 读取某个会话的最近一页消息。
+   *
+   * ``force`` 用于轮次结束后的刷新；``before`` 用于向前翻历史。
+   * 返回时代次已经变了，说明期间又发起了更新的读取，这次结果直接丢弃——
+   * 否则 A 会话的旧返回会把 B 会话刚加载好的消息盖掉。
+   */
+  async function loadMessages(
+    sessionId: string,
+    force = false,
+    options: { before?: number } = {},
+  ): Promise<void> {
+    const before = options.before
+    if (!before && !force && (messagesBySession[sessionId] ?? []).length) return
+    const generation = (loadGeneration.get(sessionId) ?? 0) + 1
+    loadGeneration.set(sessionId, generation)
+    const query = before ? `?before=${before}` : ''
+    try {
+      const data = await http.get<MessagePage>(`/sessions/${sessionId}/messages${query}`)
+      if (loadGeneration.get(sessionId) !== generation) return
+      if (before) {
+        const existing = messagesBySession[sessionId] ?? []
+        const known = new Set(existing.map((item) => item.id))
+        messagesBySession[sessionId] = [
+          ...data.messages.filter((item) => !known.has(item.id)),
+          ...existing,
+        ]
+      } else {
+        messagesBySession[sessionId] = data.messages
       }
-      messages.value = [...messages.value, data.message]
-      lastNotice.value = data.notice
-      return true
-    })
-    return result === true
+      pagingBySession[sessionId] = { hasMore: data.has_more, nextBefore: data.next_before }
+      error.value = ''
+    } catch (failure) {
+      if (loadGeneration.get(sessionId) !== generation) return
+      error.value = errorMessage(failure)
+    }
+  }
+
+  /** 向前翻一页更早的消息。 */
+  async function loadOlderMessages(sessionId: string): Promise<void> {
+    const paging = pagingBySession[sessionId]
+    if (!paging?.hasMore || paging.nextBefore === null) return
+    await loadMessages(sessionId, true, { before: paging.nextBefore })
+  }
+
+  /** 本地追加一条已由后端确认的消息（发送成功后立即可见，不做假数据）。 */
+  function appendMessage(sessionId: string, message: ChatMessage): void {
+    const list = messagesBySession[sessionId] ?? []
+    if (list.some((item) => item.id === message.id)) return
+    messagesBySession[sessionId] = [...list, message]
+  }
+
+  function dropSessionMessages(sessionId: string): void {
+    delete messagesBySession[sessionId]
+    delete pagingBySession[sessionId]
+    loadGeneration.set(sessionId, (loadGeneration.get(sessionId) ?? 0) + 1)
+    if (currentSessionId.value === sessionId) currentSessionId.value = ''
   }
 
   function reset(): void {
     projects.value = []
     deletedProjects.value = []
     deletedSessions.value = []
-    messages.value = []
-    messagesSessionId.value = ''
-    lastNotice.value = ''
+    currentSessionId.value = ''
     error.value = ''
+    // 清缓存的同时把代次推高：登出后旧账号还没回来的读取结果必须作废。
+    for (const key of Object.keys(messagesBySession)) {
+      loadGeneration.set(key, (loadGeneration.get(key) ?? 0) + 1)
+      delete messagesBySession[key]
+    }
+    for (const key of Object.keys(pagingBySession)) delete pagingBySession[key]
     for (const key of Object.keys(sessionsByProject)) delete sessionsByProject[key]
   }
 
@@ -227,8 +285,9 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     deletedSessions,
     sessionsByProject,
     messages,
-    messagesSessionId,
-    lastNotice,
+    messagesBySession,
+    currentSessionId,
+    hasOlderMessages,
     loading,
     error,
     projectById,
@@ -245,8 +304,11 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     renameSession,
     deleteSession,
     restoreSession,
+    selectSession,
     loadMessages,
-    sendMessage,
+    loadOlderMessages,
+    appendMessage,
+    dropSessionMessages,
     reset,
   }
 })

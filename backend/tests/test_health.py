@@ -26,7 +26,7 @@ class PublicSurfaceTest(unittest.TestCase):
         self.assertEqual(data["status"], "ok")
         self.assertEqual(data["service"], "haixun-1.7-backend")
         self.assertEqual(data["version"], "1.7.0")
-        self.assertEqual(data["stage"], "WB17-01")
+        self.assertEqual(data["stage"], "WB17-02")
         # 绝对路径不应出现在匿名可读的响应里。
         self.assertNotIn("data_dir", data)
         self.assertNotIn(str(self.harness.data_dir), response.get_data(as_text=True))
@@ -46,8 +46,10 @@ class PublicSurfaceTest(unittest.TestCase):
         self.assertTrue(features["auth"])
         self.assertTrue(features["projects"])
         self.assertTrue(features["personal_connection"])
+        # WB17-02 起运行时已接入，但命令执行仍不开放。
+        self.assertTrue(features["agent_runtime"])
+        self.assertFalse(features["agent_shell"])
         # 未实现的必须保持 False，界面据此显示“未实现”。
-        self.assertFalse(features["agent_runtime"])
         self.assertFalse(features["detection"])
         self.assertFalse(features["training"])
 

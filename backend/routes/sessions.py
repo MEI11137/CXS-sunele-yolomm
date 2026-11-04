@@ -1,12 +1,12 @@
 """会话与消息接口。
 
-本轮只落库用户消息，不生成助手回复；响应里 ``assistant`` 恒为 null 并给出说明，
-前端据此显示“运行时未接入”，而不是伪造一条回答。
+消息只保存真实内容：用户入口写 user，助手最终回答由服务端运行器写入 assistant。
+没有最终回答时如实返回失败，不填占位文本。
 """
 
 from __future__ import annotations
 
-from flask import Blueprint, request
+from flask import Blueprint, current_app, request
 
 from backend import auth, db
 from backend.errors import ok
@@ -14,7 +14,7 @@ from backend.services import projects, sessions
 
 bp = Blueprint("sessions", __name__)
 
-AGENT_NOTICE = "内部 Agent 运行时尚未接入（WB17-02）：这条消息已保存，但不会产生助手回复。"
+AGENT_NOTICE = ""
 
 
 def _user() -> dict:
@@ -84,6 +84,12 @@ def rename_session(session_id: str):
 def delete_session(session_id: str):
     conn, row = _owned_session(session_id)
     sessions.soft_delete(conn, row)
+    runtime = current_app.config.get("HX17_AGENT")
+    if runtime is not None:
+        try:
+            runtime.invalidate_session(session_id, reason="会话已删除，运行中的轮次已终止")
+        except Exception:
+            pass
     return ok({"deleted": True, "session_id": session_id})
 
 
@@ -99,7 +105,10 @@ def restore_session(session_id: str):
 @auth.login_required
 def list_messages(session_id: str):
     conn, row = _owned_session(session_id)
-    return ok({"messages": sessions.list_messages(conn, row["id"])})
+    before_raw = request.args.get("before")
+    before = int(before_raw) if before_raw and before_raw.isdigit() else None
+    limit = int(request.args.get("limit") or 100)
+    return ok(sessions.list_messages(conn, row["id"], limit=limit, before=before))
 
 
 @bp.post("/sessions/<session_id>/messages")

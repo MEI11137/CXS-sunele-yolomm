@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from flask import Blueprint, request
+from flask import Blueprint, current_app, request
 
 from backend import auth, db
 from backend.errors import ApiError, forbidden, ok
@@ -59,6 +59,16 @@ def set_user_status(user_id: int):
         raise forbidden("不能停用或启用自己")
     row = users.set_status(db.get_db(), user_id, status)
     audit.record(db.get_db(), admin["id"], f"user.status.{status}", row["username"])
+    runtime = current_app.config.get("HX17_AGENT")
+    if runtime is not None and status != "active":
+        try:
+            runtime.invalidate_user(
+                int(user_id),
+                code="USER_DISABLED",
+                reason="账号已被停用，运行中的轮次已终止",
+            )
+        except Exception:
+            pass
     return ok({"user": users.public(row)})
 
 

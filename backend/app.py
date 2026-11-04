@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import atexit
 import sys
 from pathlib import Path
 
@@ -21,8 +22,11 @@ from flask import Flask, jsonify, request  # noqa: E402
 from werkzeug.exceptions import HTTPException  # noqa: E402
 
 from backend import auth, config, db, security  # noqa: E402
+from backend.agent import store as turn_store  # noqa: E402
+from backend.agent.runtime import AgentRuntime  # noqa: E402
 from backend.errors import ApiError  # noqa: E402
 from backend.routes.admin import bp as admin_bp  # noqa: E402
+from backend.routes.agent import bp as agent_bp  # noqa: E402
 from backend.routes.auth import bp as auth_bp  # noqa: E402
 from backend.routes.connections import bp as connections_bp  # noqa: E402
 from backend.routes.directories import bp as directories_bp  # noqa: E402
@@ -51,6 +55,7 @@ def create_app(
     *,
     serve_dist: bool | None = None,
     data_dir: str | Path | None = None,
+    engine_spawner=None,
 ) -> Flask:
     if settings is None:
         settings = config.load_settings(data_dir=data_dir, serve_dist=serve_dist)
@@ -67,6 +72,22 @@ def create_app(
     db.init_app(app)
     auth.init_app(app)
 
+    # 上次进程退出时没跑完的轮次：明确标成“中断”，不伪装完成，也不在启动时偷偷重跑。
+    conn = db.connect(settings.db_path)
+    try:
+        turn_store.interrupted(
+            conn,
+            code="SERVER_RESTART",
+            message="服务端重启，本轮已中断，没有生成最终回答；请重新发送。",
+        )
+    finally:
+        conn.close()
+
+    runtime = AgentRuntime(settings, spawner=engine_spawner)
+    runtime.start()
+    app.config["HX17_AGENT"] = runtime
+    atexit.register(runtime.shutdown)
+
     for blueprint in (
         health_bp,
         meta_bp,
@@ -76,6 +97,7 @@ def create_app(
         sessions_bp,
         directories_bp,
         connections_bp,
+        agent_bp,
     ):
         app.register_blueprint(blueprint, url_prefix="/api")
 

@@ -2,6 +2,7 @@
 import { computed, reactive } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import { useAgentStore } from '@/stores/agent'
 import { useConnectionStore } from '@/stores/connection'
 import { useRuntimeStore } from '@/stores/runtime'
 import { useWorkspaceStore } from '@/stores/workspace'
@@ -10,12 +11,12 @@ const auth = useAuthStore()
 const runtime = useRuntimeStore()
 const workspace = useWorkspaceStore()
 const connection = useConnectionStore()
+const agent = useAgentStore()
 const router = useRouter()
 const route = useRoute()
 
 const expanded = reactive<Record<string, boolean>>({})
 const version = computed(() => runtime.meta?.version ?? runtime.health?.version ?? '—')
-const stage = computed(() => runtime.meta?.stage ?? '—')
 
 function projectLink(id: string) {
   return { name: 'project', params: { projectId: id } }
@@ -42,6 +43,7 @@ function isCurrentSession(id: string): boolean {
 
 async function logout(): Promise<void> {
   await auth.logout()
+  agent.reset()
   workspace.reset()
   connection.reset()
   await router.replace({ name: 'login' })
@@ -54,7 +56,7 @@ async function logout(): Promise<void> {
       <span class="brand-mark" aria-hidden="true">✳</span>
       <span class="brand-text">
         <strong>海巡智检</strong>
-        <small>v{{ version }} · {{ stage }}</small>
+        <small>v{{ version }}</small>
       </span>
     </div>
 
