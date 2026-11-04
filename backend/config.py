@@ -1,0 +1,142 @@
+"""海巡智检 v1.7 后端配置。
+
+设计约束（WB17-00 / WB17-01）：
+
+* 数据目录在 **应用工厂创建时** 一次性解析成 :class:`Settings`，之后所有请求只从
+  ``app.config["HX17"]`` 读取；请求期间再改环境变量不会切库。
+* 代码里不出现固定口令、API Key、默认账号；初始化账号只能由本机 CLI 创建。
+* 数据库、会话签名密钥、连接加密密钥都在同一个隔离数据目录内，且已被 .gitignore 覆盖。
+* 公开接口（``/api/meta``、``/api/health``）不得输出 data_dir、端口等内部信息。
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Mapping
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DATA_DIRNAME = "var"
+DEFAULT_PORT = 5080
+DEFAULT_SESSION_HOURS = 12
+STAGE = "WB17-01"
+
+# 功能开关：True 表示“本轮真实现并有测试覆盖”，False 表示“界面必须显示未实现”。
+FEATURES: dict[str, bool] = {
+    "auth": True,
+    "users": True,
+    "projects": True,
+    "sessions": True,
+    "message_history": True,
+    "directories": True,
+    "personal_connection": True,
+    # 以下仍未实现，任何页面都不得宣称可用。
+    "agent_runtime": False,
+    "detection": False,
+    "review": False,
+    "datasets": False,
+    "models": False,
+    "training": False,
+}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} 必须是整数") from None
+    if not minimum <= value <= maximum:
+        raise SystemExit(f"{name} 超出 {minimum}-{maximum}")
+    return value
+
+
+def version() -> str:
+    """读取仓库根目录 VERSION；缺失时返回 unknown，不猜版本号。"""
+    try:
+        return (PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def _resolve_data_dir(raw: str | os.PathLike[str] | None) -> Path:
+    if raw:
+        target = Path(str(raw)).expanduser()
+    else:
+        env = (os.environ.get("HX17_DATA_DIR") or "").strip()
+        target = Path(env).expanduser() if env else PROJECT_ROOT / DEFAULT_DATA_DIRNAME
+    target = target.resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+@dataclass(frozen=True)
+class Settings:
+    """不可变的运行配置快照，存进 ``app.config["HX17"]``。"""
+
+    service: str
+    version: str
+    stage: str
+    data_dir: Path
+    db_path: Path
+    secret_dir: Path
+    port: int
+    serve_dist: bool
+    cookie_secure: bool
+    session_ttl_hours: int
+    features: Mapping[str, bool] = field(default_factory=lambda: dict(FEATURES))
+
+    def public(self) -> dict:
+        """可公开的运行元信息：不含任何绝对路径、端口与凭据配置。"""
+        return {
+            "service": self.service,
+            "version": self.version,
+            "stage": self.stage,
+            "serve_dist": self.serve_dist,
+            "features": dict(self.features),
+        }
+
+
+def load_settings(
+    *,
+    data_dir: str | os.PathLike[str] | None = None,
+    port: int | None = None,
+    serve_dist: bool | None = None,
+    cookie_secure: bool | None = None,
+) -> Settings:
+    """解析运行配置。只在应用工厂里调用一次。"""
+    resolved = _resolve_data_dir(data_dir)
+    secret_dir = resolved / "secrets"
+    secret_dir.mkdir(parents=True, exist_ok=True)
+    if port is None:
+        port = _env_int("HX17_PORT", DEFAULT_PORT, minimum=1, maximum=65535)
+    if serve_dist is None:
+        serve_dist = _env_flag("HX17_SERVE_DIST")
+    if cookie_secure is None:
+        # 本机 http 联调默认关闭；放到 HTTPS 入口后面时用 HX17_COOKIE_SECURE=1 打开。
+        cookie_secure = _env_flag("HX17_COOKIE_SECURE")
+    return Settings(
+        service="haixun-1.7-backend",
+        version=version(),
+        stage=STAGE,
+        data_dir=resolved,
+        db_path=resolved / "haixun.db",
+        secret_dir=secret_dir,
+        port=port,
+        serve_dist=bool(serve_dist),
+        cookie_secure=bool(cookie_secure),
+        session_ttl_hours=_env_int(
+            "HX17_SESSION_HOURS", DEFAULT_SESSION_HOURS, minimum=1, maximum=720
+        ),
+        features=dict(FEATURES),
+    )

@@ -1,0 +1,73 @@
+import { createRouter, createWebHistory } from 'vue-router'
+import { useAuthStore } from '@/stores/auth'
+
+// 路由按“项目维度”组织：业务页面都属于某个项目，设置与管理独立。
+const router = createRouter({
+  history: createWebHistory(),
+  routes: [
+    { path: '/', redirect: '/projects' },
+    {
+      path: '/login',
+      name: 'login',
+      component: () => import('@/views/LoginView.vue'),
+      meta: { title: '登录' },
+    },
+    {
+      path: '/projects',
+      name: 'projects',
+      component: () => import('@/views/ProjectHome.vue'),
+      meta: { title: '项目' },
+    },
+    {
+      path: '/projects/:projectId',
+      name: 'project',
+      component: () => import('@/views/ProjectHome.vue'),
+      props: true,
+      meta: { title: '项目' },
+    },
+    {
+      path: '/projects/:projectId/sessions/:sessionId',
+      name: 'session',
+      component: () => import('@/views/ProjectHome.vue'),
+      props: true,
+      meta: { title: '会话' },
+    },
+    {
+      path: '/trash',
+      name: 'trash',
+      component: () => import('@/views/TrashView.vue'),
+      meta: { title: '回收站' },
+    },
+    {
+      path: '/admin',
+      name: 'admin',
+      component: () => import('@/views/AdminView.vue'),
+      meta: { title: '本机管理' },
+    },
+    {
+      path: '/settings',
+      name: 'settings',
+      component: () => import('@/views/SettingsView.vue'),
+      meta: { title: '设置' },
+    },
+    { path: '/:pathMatch(.*)*', redirect: '/projects' },
+  ],
+})
+
+router.beforeEach(async (to) => {
+  const auth = useAuthStore()
+  // 首次导航前确认登录态，避免先渲染业务页再跳登录。
+  if (auth.state === 'unknown') await auth.bootstrap()
+  if (!auth.isAuthenticated && to.name !== 'login') {
+    return { name: 'login', query: { next: to.fullPath } }
+  }
+  if (auth.isAuthenticated && to.name === 'login') return { name: 'projects' }
+  if (to.name === 'admin' && !auth.isAdmin) return { name: 'projects' }
+  return true
+})
+
+router.afterEach((to) => {
+  document.title = `${String(to.meta.title ?? '项目')} · 海巡智检 v1.7`
+})
+
+export default router

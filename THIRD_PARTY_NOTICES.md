@@ -1,35 +1,42 @@
-# 第三方组件声明
+# 第三方组件与来源声明
 
-## OpenCode 1.19.4
+本工程为全新开发的 v1.7。下列组件为开源依赖或需要单独声明的第三方来源；
+后续引入新组件时必须同步更新本文件，并保留上游许可文本。
 
-本项目的站点 Agent 执行层调用 OpenCode 1.19.4 本机进程；海巡智检的身份、业务资源、人工确认与 YOLO 服务由本站实现和管理。
+## 运行时依赖（npm，见 frontend/package.json）
 
-- 官方源码：https://github.com/anomalyco/opencode
-- 使用版本：https://github.com/anomalyco/opencode/releases/tag/v1.19.4
-- 许可证：MIT。以下保留该版本原始版权声明及完整许可文本。
-- 本项目不包含或主张拥有远程大模型权重，也不转授任何服务商的账号、额度、API 或模型使用权。
-- 其他依赖和既有网站、YOLO、数据集及权重的许可分别适用；本文件不是其完整许可证清单。
+| 组件 | 用途 | 许可 |
+| --- | --- | --- |
+| Vue 3 | 前端框架 | MIT |
+| Vue Router | 路由 | MIT |
+| Pinia | 状态管理 | MIT |
+| Vite（含 @vitejs/plugin-vue、vue-tsc、TypeScript） | 构建与类型检查（开发依赖） | MIT / Apache-2.0 |
 
-```text
-MIT License
+说明：前端 `package-lock.json` 复用自本机已验证的 v1.6 前端构建基础（同一套锁定版本），
+仅用于锁定依赖版本，没有复制 v1.6 的业务源码。
 
-Copyright (c) 2025 opencode
+## 运行时依赖（Python，见 backend/requirements.txt）
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+| 组件 | 用途 | 许可 |
+| --- | --- | --- |
+| Flask | HTTP 框架 | BSD-3-Clause |
+| itsdangerous | 会话令牌的签名与篡改检测（Flask 已依赖，显式声明） | BSD-3-Clause |
+| cryptography | 个人连接 API Key 的 AES-256-GCM 加密 | Apache-2.0 / BSD-3-Clause |
+| requests | “检查连接”时的单次 HTTP 探测（超时受限、无重试） | Apache-2.0 |
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+## 计划引入（尚未加入本工程）
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
+| 组件 | 用途 | 状态 |
+| --- | --- | --- |
+| OpenCode（内部 Agent 执行层） | 模型循环与工具调用 | WB17-02，按上游许可与版本核对后引入并补声明 |
+| vendor 定制 YOLO（ultralytics 派生） | 检测与训练 | 后续阶段以第三方组件方式明确来源与许可 |
+
+## 未包含内容
+
+本仓库不包含：旧版数据库、账号、API Key、模型权重、原始数据集、训练产物、
+个人连接配置、node_modules 与 Python 虚拟环境。
+
+## 参考来源（非代码来源）
+
+功能与交互契约参考海巡智检 v1.6（保留其原有版权与许可声明）；v1.7 的业务代码按本工程
+结构重新实现，不整目录复制旧站源码。

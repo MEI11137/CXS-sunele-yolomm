@@ -1,2 +1,0 @@
-# Install into the existing working YOLO Python environment; do not reinstall Torch.
-waitress==3.0.2

@@ -1,0 +1,176 @@
+"""会话与消息。
+
+会话属于项目与用户，两者必须同时匹配；软删除后可恢复。
+WB17-01 只保存用户消息，**不生成助手回复**：内部 Agent 运行时在 WB17-02 接入。
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from typing import Any
+
+from backend import security
+from backend.errors import ApiError, conflict, not_found
+
+TITLE_MAX = 80
+CONTENT_MAX = 8000
+DEFAULT_TITLE = "新会话"
+
+
+def public(row: sqlite3.Row | dict) -> dict:
+    data = dict(row)
+    return {
+        "id": data["id"],
+        "project_id": data["project_id"],
+        "title": data["title"],
+        "status": data["status"],
+        "created_at": data["created_at"],
+        "updated_at": data["updated_at"],
+        "deleted_at": data["deleted_at"],
+    }
+
+
+def _validate_title(raw: Any, *, fallback: str = DEFAULT_TITLE) -> str:
+    title = str(raw or "").strip() or fallback
+    if len(title) > TITLE_MAX:
+        raise ApiError(400, "VALIDATION", f"会话名称不能超过 {TITLE_MAX} 个字符")
+    return title
+
+
+def create(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    owner_id: int,
+    title: str | None = None,
+) -> sqlite3.Row:
+    now = security.now_iso()
+    session_id = security.new_id("ses")
+    conn.execute(
+        """
+        INSERT INTO sessions (id, project_id, owner_id, title, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'active', ?, ?)
+        """,
+        (session_id, project_id, int(owner_id), _validate_title(title), now, now),
+    )
+    conn.commit()
+    return get_owned(conn, session_id, owner_id)
+
+
+def list_for(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    owner_id: int,
+    include_deleted: bool = False,
+) -> list[dict]:
+    status = "deleted" if include_deleted else "active"
+    rows = conn.execute(
+        """
+        SELECT * FROM sessions
+        WHERE project_id = ? AND owner_id = ? AND status = ?
+        ORDER BY updated_at DESC, created_at DESC
+        """,
+        (str(project_id), int(owner_id), status),
+    ).fetchall()
+    return [public(row) for row in rows]
+
+
+def get_owned(
+    conn: sqlite3.Connection,
+    session_id: str,
+    owner_id: int,
+    *,
+    include_deleted: bool = False,
+) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM sessions WHERE id = ? AND owner_id = ?",
+        (str(session_id), int(owner_id)),
+    ).fetchone()
+    if row is None:
+        raise not_found("会话")
+    if row["status"] == "deleted" and not include_deleted:
+        raise not_found("会话")
+    return row
+
+
+def rename(conn: sqlite3.Connection, session: sqlite3.Row, title: str) -> sqlite3.Row:
+    label = _validate_title(title, fallback=session["title"])
+    conn.execute(
+        "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?",
+        (label, security.now_iso(), session["id"]),
+    )
+    conn.commit()
+    return get_owned(conn, session["id"], session["owner_id"])
+
+
+def soft_delete(conn: sqlite3.Connection, session: sqlite3.Row) -> None:
+    now = security.now_iso()
+    conn.execute(
+        "UPDATE sessions SET status = 'deleted', deleted_at = ?, updated_at = ? WHERE id = ?",
+        (now, now, session["id"]),
+    )
+    conn.commit()
+
+
+def restore(conn: sqlite3.Connection, session: sqlite3.Row) -> sqlite3.Row:
+    if session["status"] != "deleted":
+        raise conflict("该会话未处于回收站", code="NOT_DELETED")
+    conn.execute(
+        "UPDATE sessions SET status = 'active', deleted_at = NULL, updated_at = ? WHERE id = ?",
+        (security.now_iso(), session["id"]),
+    )
+    conn.commit()
+    return get_owned(conn, session["id"], session["owner_id"])
+
+
+def message_public(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    try:
+        meta = json.loads(data.get("meta") or "{}")
+    except ValueError:
+        meta = {}
+    return {
+        "id": data["id"],
+        "session_id": data["session_id"],
+        "role": data["role"],
+        "content": data["content"],
+        "meta": meta if isinstance(meta, dict) else {},
+        "created_at": data["created_at"],
+    }
+
+
+def list_messages(conn: sqlite3.Connection, session_id: str, *, limit: int = 200) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM messages WHERE session_id = ? ORDER BY id ASC LIMIT ?",
+        (str(session_id), max(1, min(int(limit), 500))),
+    ).fetchall()
+    return [message_public(row) for row in rows]
+
+
+def append_message(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    role: str,
+    content: str,
+    meta: dict | None = None,
+) -> dict:
+    if role not in {"user", "assistant", "system"}:
+        raise ApiError(400, "BAD_ROLE", "消息角色不合法")
+    text = str(content or "").strip()
+    if not text:
+        raise ApiError(400, "VALIDATION", "消息内容不能为空")
+    if len(text) > CONTENT_MAX:
+        raise ApiError(400, "VALIDATION", f"单条消息不能超过 {CONTENT_MAX} 个字符")
+    now = security.now_iso()
+    cursor = conn.execute(
+        "INSERT INTO messages (session_id, role, content, meta, created_at) VALUES (?, ?, ?, ?, ?)",
+        (str(session_id), role, text, json.dumps(meta or {}, ensure_ascii=False), now),
+    )
+    # 会话列表按 updated_at 排序，有新消息就把会话顶上去。
+    conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (now, str(session_id)))
+    conn.commit()
+    row = conn.execute("SELECT * FROM messages WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    return message_public(row)

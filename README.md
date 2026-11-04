@@ -1,79 +1,139 @@
-# 海巡智检 v1.6
+# 海巡智检 v1.7
 
-基于 Vue 3、Flask 和 YOLO 的巡检系统，支持图片、视频和实时检测，以及视觉大模型辅助核查。
+光伏（RGB+IR）巡检与数据质量闭环系统。当前版本 **1.7.0**，阶段 **WB17-01：账号 / 项目 / 会话 / 目录 / 个人模型连接**。
 
-## 当前版本 1.6.0
+本目录是从空白工程重新开发的 v1.7 工程。v1.6 仅作为只读功能参考，不复制其源码目录；
+契约（接口形态、权限规则、工具语义）可以参考，代码按本工程结构重新实现。
 
-GitHub 版本分支为 `release/haixun-v1.6.0`。本版在 v1.5（提交 `61eb328`）基础上，修复聊天内 Agent 使用本人模型连接做 AI 核查时的身份问题、单次模型请求超时与批量复核错误脱敏，并将引擎内部压缩上下文从用户消息中隐藏；完全访问模式下已授权内置业务直接执行、不再逐项生成确认卡，但最终人工复核结论仍必须由本人在复核页提交。网站内部仍使用海巡引擎 1.19.4，并保留原人工操作入口。源码不包含个人 API 配置、数据库、测试记录、模型权重、原始数据或本机依赖；新安装从空业务数据开始。批量 3 张图片串行核查的私有桥 90 秒上限尚未解决，真实 GPU 训练与公网入口仍须在训练服务器验收。
+## 现状（重要）
 
-- [海巡智检 v1.6 版本说明](docs/releases/haixun-v1.6.md)
-- [另一台电脑部署与更新](先读我_另一台电脑部署.md)
-- [下载本版源码 ZIP](https://github.com/MEI11137/CXS-sunele-yolomm/archive/refs/heads/release/haixun-v1.6.0.zip)
+WB17-01 已实现并可实际使用：
 
-GitHub 源码 ZIP 不含预构建的 `dist`。远程演示前须在 `web-haixun` 执行 `npm ci` 和 `npm run build`；原有运行依赖与加密配置须在服务器本机准备，不能直接照抄开发电脑路径。
+- 账号：本机 CLI 建号、登录/登出/当前用户、改密、管理员建普通账号与启停；**无注册入口、无默认账号**；
+- 项目与会话：CRUD、软删除/恢复、真实消息历史；每个项目与会话都按 owner 隔离；
+- 目录：管理员登记授权根目录，并**按账号授予**；普通用户只能看到/浏览/绑定自己获授的目录，
+  撤销授予后已绑定的项目立即被拒绝；新增根目录默认不共享；
+- 个人模型连接：按用户加密保存，Key 只回显掩码；可显式“检查连接”实测认证 / chat / 视觉 / 工具；
+  证据只保留状态、耗时、环节与固定说明，上游正文（可能回显凭据）不落库、不回显；
+- 设置页：连接配置、能力状态、改密、深浅色主题。
 
-- [v1.2 版本说明](docs/releases/haixun-v1.2.md)
-- [Agent功能覆盖与边界](docs/integration/Agent功能覆盖复核_2026-10-29.md)
-- [版本日志](CHANGELOG.md)
-- [Windows训练电脑远程演示部署](docs/deployment/Windows训练电脑远程演示部署.md)：可选的独立演示模式，复用现有YOLO环境，提供受控HTTPS入口；不会随本机启动器自动开放公网。
+仍未实现（界面会明确标注，不会伪造结果）：
 
-历史 v1.0 整合分支及 `haixun-v1.0` 标签保持原样：
+- 内部 Agent 运行时（OpenCode + 私有工具桥）与助手回复 —— WB17-02；
+- 文件发现、检测、AI 核查 —— WB17-03；人工复核与数据回流 —— WB17-04；
+- 数据集、模型、训练 —— WB17-05；公网 HTTPS 与正式部署 —— WB17-06。
 
-- [v1.0 版本说明](docs/releases/haixun-v1.0.md)
-- [启动与交接说明](docs/integration/接续说明_2026-10-26.md)
-- [完整检查结果](docs/development-logs/Integration/2026-10-26_INT-12_01.md)
-
-## 本次更新
-
-- 聊天内 Agent 以普通账号本人连接执行 AI 核查时，私有 MCP 桥现在会写回站点用户身份，不再返回 `AGENT_UNAUTHENTICATED`；页面按钮路径不变。
-- 复核单次模型调用使用独立超时（复核 180 秒、改进建议 120 秒），聊天默认超时不变；不自动重试计费请求。
-- 批量复核中的 Agent 错误按安全白名单与凭据脱敏输出，未识别错误只给固定提示，不回显上游原文。
-- 引擎内部压缩上下文不再作为普通助手回答进入消息列表；历史已入库摘要按结构标记隐藏，原文保留供审计。
-- 完全访问模式下，已授权的平台内置业务（含删除、恢复与已有文件修改）直接执行且不逐项生成确认卡；外部 MCP、新授权、越界或无法证明范围的命令明确拒绝；最终人工复核结论仍必须由本人在复核页提交。
-- 项目内会话、全局助手对话与业务页面联动；项目绑定本人电脑的文件夹。
-- 内部Agent读取工作区素材，调用检测、AI核查和反馈等业务工具，人工仍负责最终复核标注。
-- 项目/会话管理、CSV导出、资料原文、任务手册和明确的界面命令可通过对话调用。
-- 图片检测结果支持 AI 辅助核查、人工修改标注和人工确认。
-- 人工复核类别按当前记录所用模型关联的数据集读取，保持 YOLO 类别编号顺序。
-- 已确认记录可进入反馈池、生成数据集版本，并用于后续增量训练和模型对比。
-- 支持个人兼容接口连接，并明确提示认证、视觉或工具能力不满足要求的环节；认证成功不代表支持看图。
-
-## 项目目录
+## 目录
 
 ```text
-CXSDet-YOLOmm/CXSDet/
-├─ web-flask/    # Flask 后端、YOLO 运行时和训练及复核服务
-├─ web-haixun/   # 当前Vue前端，默认开发端口5173
-└─ web-vue/      # 保留的旧前端
+backend/
+  app.py            应用工厂（配置快照、密钥加载、蓝图注册、错误封装）
+  config.py         环境变量解析与功能开关
+  db.py             SQLite 连接生命周期与迁移
+  auth.py           登录态、CSRF、权限装饰器
+  security.py       口令哈希（scrypt/PBKDF2）、签名令牌、掩码
+  crypto.py         API Key 的 AES-256-GCM 加解密
+  paths.py          目录边界校验（盘符 / UNC / .. / 链接 / 联接）
+  cli.py            本机管理命令行
+  routes/           health / meta / auth / admin / projects / sessions / directories / connections
+  services/         users / projects / sessions / connections / roots / audit
+  tests/            131 项 unittest（含越权、过期、畸形令牌、密钥文件字节安全、按账号授权、脱敏、越界）
+frontend/           Vue 3 + TypeScript + Pinia + Vite
+deploy/serve.py     生产同源启动器（后端托管 frontend/dist）
+docs/               开发文档，含 WB17-00 / WB17-01 记录
+scripts/            check.ps1（测试+类型检查+构建）、smoke_http.py（真实 HTTP 烟测）
 ```
 
-## 启动
+## 环境
 
-先准备适配硬件的Python/Torch环境、Node.js，以及海巡引擎 1.19.4的Windows可执行程序。Python依赖原有锁定环境涉及Python 3.12/CUDA 12.1，实际运行环境须与本机设备匹配；不要直接复制队友的虚拟环境。
+- Python 3.10+（本机验证：3.14.6，Flask 3.1.3，cryptography 50.0.2）
+- Node 20+（本机验证：22.2.0，npm 10.7.0）
 
-1. 在 `CXSDet-YOLOmm/CXSDet/web-flask` 安装 `requirements.txt` 和 `requirements-agent.txt`。
-2. 在 `CXSDet-YOLOmm/CXSDet/web-haixun` 运行 `npm ci`；使用这套前端的 `package-lock.json`。
-3. 在PowerShell设置 `HAIXUN_PYTHON` 为所用python.exe绝对路径，`HX_ENGINE_BIN` 为hxengine.exe绝对路径；Node在PATH中，或通过 `HAIXUN_NODE` 指定node.exe。也可将Node和海巡引擎分别放入仓库 `.runtime/node/node.exe`、`.runtime/hxengine/hxengine.exe`。
-4. 在仓库根目录运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1 -Check` 检查依赖，然后双击 **启动海巡智检.cmd** 启动前后端。**停止服务.cmd** 只停止同路径的本版本服务；运行中的训练/任务请先处理完毕。
-5. 打开 `http://127.0.0.1:5173/`，后端默认端口5020。使用本机初始化流程创建的管理员账号登录，首次使用后设置新口令；初始账号的创建方式见服务器本机的初始化代码。
-6. 在“设置 → 大模型连接”配置自己的Key、地址和模型。创建项目并选择本机文件夹，再导入数据集/权重；聊天与网页AI功能使用相同个人连接。
+不重装 Torch/CUDA，不安装训练相关大包；vendor YOLO 在后续阶段以第三方组件方式引入。
 
-启动器不会替你安装依赖或下载模型。依赖检查通过后会在后台启动服务，错误与日志见仓库 `.run/`。新安装没有密钥文件是正常的：服务在首次需要时生成本机密钥，不要复制或上传其他人的密钥。已有整合包也可继续使用包根目录原启动入口。
+## 首次初始化（没有默认账号）
 
-使用自定义端口可运行 `.\start.ps1 -BackendPort 5031 -FrontendPort 5181 -NoBrowser`；前端代理与Agent业务桥同步使用所选后端端口。旧 `web-vue/3000` 保留作参考，本入口不启动它。
+```powershell
+# 在工程根目录；密码在提示符里输入，或从 stdin 读入，不要写在命令行
+python -m backend.cli status
+python -m backend.cli create-user --username 你的名字 --role admin
 
-## 数据与模型
+# 授权普通用户可以绑定的服务器目录（只能是具体目录，不能是磁盘根）
+python -m backend.cli add-root "D:\巡检数据" --label 训练与巡检数据 --grant-to 你的用户名
 
-运行数据库、上传图片、检测记录、训练数据、模型权重、依赖目录和本地密钥不随源码上传。部署后需自行上传数据集、导入或训练匹配的模型并发布，再开始检测。
+# 之后给别的账号追加 / 收回同一目录
+python -m backend.cli grant-root "D:\巡检数据" --username 另一个账号
+python -m backend.cli revoke-root "D:\巡检数据" --username 另一个账号
+```
 
-使用图片巡检时，类别来自所选模型关联的数据集；导入权重时应选择与权重类别编号一致的数据集。AI 仅提供辅助建议，训练反馈标签由人工确认。
+其它命令：`reset-password`、`set-status`、`list-users`、`list-roots`、`remove-root`。
+`add-root` 不带 `--grant-to` 时只是登记目录（默认不共享）；管理员页面也能逐条授予/收回。
+账号密码不会出现在命令行参数里，也不会写进 shell 历史。
 
-## 原项目说明
+## 运行（开发）
 
-保留原项目作者及第三方代码中的版权和使用声明；使用范围以原有授权和相关组件许可为准。
+```powershell
+python backend/app.py          # 默认 5080，数据目录 var/
 
-## 海巡引擎 接入开发分支
+cd frontend
+npm ci
+npm run dev                    # 5173，/api 代理到 5080
+```
 
-当前 Agent 默认由本机 海巡引擎 **1.19.4** 执行，复用网站的业务工具、权限和人工确认。独立体验版与网站会话分开，网站只使用本人设置的模型连接。启动要求、原生文件/命令边界与回滚见 [接入说明](docs/integration/海巡引擎接入与参赛说明.md)，开源许可见 [第三方声明](开源组件声明.md)。此前 `haixun-v1.0` 标签保持不变。
+## 运行（同源生产模式）
 
-海巡引擎的执行层为 OpenCode 1.19.4，官方程序可从 https://github.com/anomalyco/opencode/releases/tag/v1.19.4 获取；解压后可将 opencode.exe 复制命名为 hxengine.exe，按上述 HX_ENGINE_BIN 配置。原始来源和许可保留在 THIRD_PARTY_NOTICES.md。
+```powershell
+cd frontend
+npm run build
+cd ..
+$env:HX17_PORT = '8080'
+python deploy\serve.py --check
+python deploy\serve.py
+```
+
+浏览器访问 `http://127.0.0.1:8080/`。深层链接（如 `/projects`）回落到 `index.html`，
+`/api/*` 不会被前端路由截获。当前仍是 Flask 自带服务器，仅供本机验证；正式对外部署
+与 HTTPS 入口在 WB17-06 单独验收。
+
+> HTTPS 入口后面请设置 `HX17_COOKIE_SECURE=1`，让会话与 CSRF Cookie 带上 Secure。
+
+## 配置
+
+| 环境变量 | 作用 | 默认 |
+| --- | --- | --- |
+| `HX17_PORT` | 监听端口 | 5080（`deploy/serve.py` 下为 8080） |
+| `HX17_DATA_DIR` | 运行数据目录（工厂创建时固定） | `<工程>/var` |
+| `HX17_SERVE_DIST` | 是否托管前端构建产物 | 关闭 |
+| `HX17_COOKIE_SECURE` | Cookie 是否带 Secure（HTTPS 下开启） | 关闭 |
+| `HX17_SESSION_HOURS` | 登录有效期（小时） | 12 |
+| `VITE_BACKEND_ORIGIN` | 开发代理目标 | `http://127.0.0.1:5080` |
+
+数据目录内包含 `haixun.db` 与 `secrets/{session,connection}.key`；两者都被 `.gitignore`
+覆盖，数据库被单独拷走也无法解出 API Key。
+
+## 安全边界（实现要点）
+
+- 口令用 `scrypt`（不可用时 PBKDF2）加盐哈希；登录失败按 IP+用户名节流；
+- 令牌用 itsdangerous 签名（不再自维护协议），放 HttpOnly + SameSite=Lax Cookie；服务端会话表可即时吊销；
+  停用/改密立即失效；任何畸形 Cookie 一律按未登录处理，不会 500；
+- 主密钥只在文件不存在时创建（完整内容 + 原子硬链接）；已有文件损坏/不可读时明确失败，
+  **绝不覆盖**，避免毁掉旧密文的解密关系；
+- 写操作要求 `X-CSRF-Token` 双提交 + Origin 校验，且只接受 `application/json`；
+- 目录绑定先 `realpath` 归一化再做包含判断，盘符相对路径、设备前缀、UNC、`..`、
+  符号链接/NTFS 联接越界全部拒绝；替换已有绑定必须显式 `replace=true`；
+- 目录授权按账号存于 `root_grants`；列表、浏览、绑定、已绑定项目的访问都重新校验授予；
+- 连接能力检查只在“200 且返回真实回复”时记认证通过；402/429/5xx/404 一律不当作 Key 已被接受；
+- `/api/health`、`/api/meta` 不返回数据目录、端口、密钥路径。
+
+## 检查
+
+```powershell
+python -m unittest discover -s backend/tests -t . -v
+python scripts/smoke_http.py      # 真实起服务 + Cookie/CSRF 全流程，自动停服
+powershell -File scripts/check.ps1 -Python <python> -Node <node>
+```
+
+## 许可与来源
+
+第三方组件与许可声明见 `THIRD_PARTY_NOTICES.md`。OpenCode（内部 Agent 执行层）与
+vendor YOLO 将在后续阶段按上游许可引入并更新该文件。
