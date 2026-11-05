@@ -21,7 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIRNAME = "var"
 DEFAULT_PORT = 5080
 DEFAULT_SESSION_HOURS = 12
-STAGE = "WB17-03"
+STAGE = "WB17-04"
 
 # OpenCode 引擎：版本与可执行文件都可用环境变量覆盖，便于换机/换版本；
 # 默认值只对应本机已核验的组合（1.19.4 + E:/OpenCode/bin/opencode.exe）。
@@ -48,9 +48,11 @@ FEATURES: dict[str, bool] = {
     "datasets": True,
     "models": True,
     "business_jobs": True,
-    # 人工复核与数据回流在 WB17-04；训练在 WB17-05。未实现就不宣称。
-    "review": False,
-    "feedback": False,
+    # WB17-04 接入：人工复核版本、反馈池与数据回流（真实文件）。
+    "review": True,
+    "feedback": True,
+    "reflow": True,
+    # 训练评估在 WB17-05；未实现就不宣称。
     "training": False,
 }
 

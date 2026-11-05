@@ -24,7 +24,7 @@ const session = computed(
     ) ?? null,
 )
 
-function openBusiness(name: 'inspect' | 'records' | 'datasets' | 'models'): void {
+function openBusiness(name: 'inspect' | 'records' | 'reviewQueue' | 'reflow' | 'datasets' | 'models'): void {
   void router.push({ name, params: { projectId: projectId.value } })
 }
 
@@ -50,6 +50,8 @@ function openDetails(): void {
       <div class="header-actions">
         <button class="ghost small" type="button" @click="openBusiness('inspect')">图片巡检</button>
         <button class="ghost small" type="button" @click="openBusiness('records')">识别记录</button>
+        <button class="ghost small" type="button" @click="openBusiness('reviewQueue')">复核队列</button>
+        <button class="ghost small" type="button" @click="openBusiness('reflow')">数据回流</button>
         <button class="ghost small" type="button" @click="openBusiness('datasets')">数据集</button>
         <button class="ghost small" type="button" @click="openBusiness('models')">模型</button>
         <button class="ghost small" type="button" @click="openDetails">项目详情</button>

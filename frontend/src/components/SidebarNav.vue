@@ -26,7 +26,7 @@ function sessionLink(projectId: string, sessionId: string) {
   return { name: 'session', params: { projectId, sessionId } }
 }
 
-function businessLink(name: 'inspect' | 'records' | 'datasets' | 'models', projectId: string) {
+function businessLink(name: 'inspect' | 'records' | 'reviewQueue' | 'reflow' | 'datasets' | 'models', projectId: string) {
   return { name, params: { projectId } }
 }
 
@@ -135,6 +135,22 @@ async function logout(): Promise<void> {
                 :class="{ active: isCurrentBusiness('records') }"
                 :to="businessLink('records', project.id)"
                 >识别记录</RouterLink
+              >
+            </li>
+            <li>
+              <RouterLink
+                class="session-item"
+                :class="{ active: isCurrentBusiness('reviewQueue') }"
+                :to="businessLink('reviewQueue', project.id)"
+                >人工复核队列</RouterLink
+              >
+            </li>
+            <li>
+              <RouterLink
+                class="session-item"
+                :class="{ active: isCurrentBusiness('reflow') }"
+                :to="businessLink('reflow', project.id)"
+                >数据回流</RouterLink
               >
             </li>
             <li>

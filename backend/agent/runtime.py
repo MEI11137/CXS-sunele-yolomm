@@ -53,6 +53,9 @@ class AgentRuntime:
         self.manager.stop_session(session_id)
         conn = db.connect(self.settings.db_path)
         try:
+            from backend.services import followups as followup_service
+
+            followup_service.cancel_session(conn, session_id, "会话已删除")
             return store.interrupt_scope(
                 conn,
                 code="SESSION_CLOSED",
@@ -68,6 +71,9 @@ class AgentRuntime:
         self.manager.stop_project(int(user_id), project_id)
         conn = db.connect(self.settings.db_path)
         try:
+            from backend.services import followups as followup_service
+
+            followup_service.cancel_project(conn, project_id, int(user_id), "项目已关闭或目录权限被撤销")
             return store.interrupt_scope(
                 conn,
                 code="PROJECT_CLOSED",
@@ -85,6 +91,9 @@ class AgentRuntime:
         self.manager.stop_user(int(user_id))
         conn = db.connect(self.settings.db_path)
         try:
+            from backend.services import followups as followup_service
+
+            followup_service.cancel_user(conn, int(user_id), "个人模型连接已变更或失效，需重新确认")
             return store.interrupt_scope(
                 conn, code=code, message=reason, owner_id=int(user_id)
             )

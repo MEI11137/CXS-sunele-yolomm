@@ -513,6 +513,147 @@ DROP TABLE jobs_v7;
 CREATE INDEX idx_jobs_project ON jobs(project_id, owner_id, created_at);
 """
 
+
+# v9：人工复核版本、反馈池与数据集版本列。
+#
+# * 复核用**版本**而不是一行状态：草稿可反复保存，提交后产生不可变版本；
+#   同一记录可以有多次确认/驳回，历史与冲突检查都靠 (detection_id, version)。
+# * 驳回不是删除：它是一条 status='rejected' 的版本，记录因此离开待复核队列，
+#   需要显式 reopen 才会重新出现。
+# * 反馈池只认“已确认且尚未回流的版本”（UNIQUE(detection_id, review_version_id)），
+#   版本变了就是另一条反馈，不会把旧结论复用到新图上。
+SCHEMA_V9 = """
+ALTER TABLE detections ADD COLUMN deleted_at TEXT;
+ALTER TABLE detections ADD COLUMN deleted_by INTEGER;
+ALTER TABLE detections ADD COLUMN flow_id TEXT;
+
+ALTER TABLE datasets ADD COLUMN parent_dataset_id TEXT;
+ALTER TABLE datasets ADD COLUMN kind TEXT NOT NULL DEFAULT 'import';
+ALTER TABLE datasets ADD COLUMN seed INTEGER;
+ALTER TABLE datasets ADD COLUMN split_strategy TEXT NOT NULL DEFAULT 'source';
+ALTER TABLE datasets ADD COLUMN request_key TEXT;
+ALTER TABLE datasets ADD COLUMN manifest_rel TEXT;
+ALTER TABLE datasets ADD COLUMN export_rel TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_datasets_request
+    ON datasets(project_id, request_key) WHERE request_key IS NOT NULL;
+
+ALTER TABLE dataset_samples ADD COLUMN origin_record_id TEXT;
+ALTER TABLE dataset_samples ADD COLUMN origin_sample_key TEXT;
+ALTER TABLE dataset_samples ADD COLUMN review_version_id TEXT;
+ALTER TABLE dataset_samples ADD COLUMN sha256 TEXT;
+ALTER TABLE dataset_samples ADD COLUMN pixel_sha256 TEXT;
+
+CREATE TABLE IF NOT EXISTS review_versions (
+    id              TEXT    PRIMARY KEY,
+    project_id      TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    owner_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    detection_id    TEXT    NOT NULL,
+    version         INTEGER NOT NULL,
+    status          TEXT    NOT NULL CHECK (status IN ('draft', 'confirmed', 'rejected')),
+    outcome         TEXT    CHECK (outcome IS NULL OR outcome IN ('defect', 'no_defect')),
+    boxes           TEXT    NOT NULL DEFAULT '[]',
+    class_table     TEXT    NOT NULL DEFAULT '[]',
+    image_width     INTEGER NOT NULL DEFAULT 0,
+    image_height    INTEGER NOT NULL DEFAULT 0,
+    model_id        TEXT,
+    dataset_id      TEXT,
+    note            TEXT    NOT NULL DEFAULT '',
+    reject_reason   TEXT,
+    request_key     TEXT,
+    created_at      TEXT    NOT NULL,
+    updated_at      TEXT    NOT NULL,
+    submitted_at    TEXT,
+    UNIQUE (project_id, detection_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_review_detection ON review_versions(detection_id, version);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_review_draft
+    ON review_versions(detection_id, owner_id) WHERE status = 'draft';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_review_request
+    ON review_versions(project_id, request_key) WHERE request_key IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS record_feedback (
+    id                TEXT    PRIMARY KEY,
+    project_id        TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    owner_id          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    detection_id      TEXT    NOT NULL,
+    review_version_id TEXT    NOT NULL,
+    dataset_id        TEXT,
+    status            TEXT    NOT NULL CHECK (status IN ('pending', 'reflowed', 'void')),
+    note              TEXT    NOT NULL DEFAULT '',
+    created_at        TEXT    NOT NULL,
+    reflowed_at       TEXT,
+    UNIQUE (detection_id, review_version_id)
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_project ON record_feedback(project_id, status, created_at);
+"""
+
+# v10：回流草稿与数据集回收站。草稿在定稿之前不生成 images/labels/ZIP，
+# 定稿后才是可训练的数据集版本；删除只打时间戳，不动原目录。
+SCHEMA_V10 = """
+ALTER TABLE datasets ADD COLUMN deleted_at TEXT;
+
+CREATE TABLE IF NOT EXISTS reflow_drafts (
+    id              TEXT    PRIMARY KEY,
+    project_id      TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    owner_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_id      TEXT,
+    name            TEXT    NOT NULL,
+    mode            TEXT    NOT NULL CHECK (mode IN ('revision', 'new')),
+    parent_dataset_id TEXT,
+    strategy        TEXT    NOT NULL DEFAULT 'even',
+    ratios          TEXT    NOT NULL DEFAULT '{}',
+    seed            INTEGER NOT NULL DEFAULT 0,
+    selections      TEXT    NOT NULL DEFAULT '[]',
+    plan            TEXT    NOT NULL DEFAULT '{}',
+    status          TEXT    NOT NULL CHECK (status IN ('editing', 'ready', 'failed', 'finalized', 'deleted')),
+    error_code      TEXT,
+    error_message   TEXT,
+    dataset_id      TEXT,
+    created_at      TEXT    NOT NULL,
+    updated_at      TEXT    NOT NULL,
+    finalized_at    TEXT,
+    deleted_at      TEXT,
+    UNIQUE (project_id, owner_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_reflow_drafts_scope
+    ON reflow_drafts(project_id, owner_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS review_followups (
+    id            TEXT    PRIMARY KEY,
+    project_id    TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    owner_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_id    TEXT    NOT NULL,
+    record_id     TEXT    NOT NULL,
+    intent        TEXT    NOT NULL CHECK (intent IN ('notify', 'open_reflow', 'reflow_preview', 'reflow')),
+    instruction   TEXT    NOT NULL DEFAULT '',
+    payload       TEXT    NOT NULL DEFAULT '{}',
+    mode          TEXT    NOT NULL,
+    provider      TEXT    NOT NULL,
+    model         TEXT    NOT NULL,
+    fingerprint   TEXT    NOT NULL,
+    status        TEXT    NOT NULL CHECK (status IN ('waiting', 'ready', 'running', 'done', 'cancelled', 'failed')),
+    result        TEXT    NOT NULL DEFAULT '{}',
+    request_id    TEXT,
+    cancel_reason TEXT,
+    created_at    TEXT    NOT NULL,
+    updated_at    TEXT    NOT NULL,
+    completed_at  TEXT,
+    UNIQUE (project_id, owner_id, session_id, record_id, intent)
+);
+CREATE INDEX IF NOT EXISTS idx_review_followups_scope
+    ON review_followups(session_id, status, created_at);
+"""
+
+# v11：样本身份的**文件戳**。03 导入的样本在 04 才有 sha256/pixel_sha256 列，
+# 老行全为 NULL，匹配器只比这两列就把它当“新图”。这里不预填指纹（那等于编造），
+# 只加两个可空列记录“算指纹时文件的 size/mtime”：命中就免读盘，不命中就重算并比对，
+# 于是缓存永远服从当前真实文件，不会用旧指纹盖掉文件已被改的事实。
+SCHEMA_V11 = """
+ALTER TABLE dataset_samples ADD COLUMN identity_size INTEGER;
+ALTER TABLE dataset_samples ADD COLUMN identity_mtime_ns INTEGER;
+"""
+
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, SCHEMA_V1),
     (2, SCHEMA_V2),
@@ -522,6 +663,9 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
     (6, SCHEMA_V6),
     (7, SCHEMA_V7),
     (8, SCHEMA_V8),
+    (9, SCHEMA_V9),
+    (10, SCHEMA_V10),
+    (11, SCHEMA_V11),
 )
 
 

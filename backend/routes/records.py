@@ -15,7 +15,7 @@ from backend import auth, db, security
 from backend.errors import ApiError, ok
 from backend.services import aireview, detection as detection_service
 from backend.services import jobs as job_service
-from backend.services import pipelines
+from backend.services import pipelines, records as record_service
 
 bp = Blueprint("records", __name__)
 
@@ -51,6 +51,7 @@ def list_records(project_id: str):
         date_to=(request.args.get("date_to") or "").strip() or None,
         limit=int(request.args.get("limit") or 20),
         before=(request.args.get("before") or "").strip() or None,
+        deleted=(request.args.get("deleted") or "exclude").strip(),
     )
     reviews = aireview.latest_for_records(
         conn,
@@ -68,7 +69,7 @@ def list_records(project_id: str):
 def get_record(project_id: str, record_id: str):
     conn = db.get_db()
     row = detection_service.get_owned(conn, int(_user()["id"]), project_id, record_id)
-    data = detection_service.public(row)
+    data = detection_service.public_with_labels(conn, int(_user()["id"]), project_id, row)
     data["latest_review"] = aireview.latest_for_records(
         conn, int(_user()["id"]), project_id, [record_id]
     ).get(record_id)
@@ -180,5 +181,62 @@ def job_events(project_id: str):
             project_id,
             after=int(request.args.get("after") or 0),
             session_id=(request.args.get("session_id") or "").strip() or None,
+        )
+    )
+
+
+# --------------------------------------------------------------------------- 记录操作
+
+
+def _ids(payload: dict) -> list[str]:
+    raw = payload.get("record_ids")
+    if not isinstance(raw, list) or not raw:
+        raise ApiError(400, "VALIDATION", "需要 record_ids")
+    return [str(item) for item in raw]
+
+
+@bp.post("/projects/<project_id>/detections/delete")
+@auth.login_required
+def delete_records(project_id: str):
+    payload = request.get_json(silent=True) or {}
+    conn = db.get_db()
+    return ok(record_service.soft_delete(conn, int(_user()["id"]), project_id, _ids(payload)))
+
+
+@bp.post("/projects/<project_id>/detections/restore")
+@auth.login_required
+def restore_records(project_id: str):
+    payload = request.get_json(silent=True) or {}
+    conn = db.get_db()
+    return ok(record_service.restore(conn, int(_user()["id"]), project_id, _ids(payload)))
+
+
+@bp.post("/projects/<project_id>/detections/<record_id>/feedback")
+@auth.login_required
+def add_feedback(project_id: str, record_id: str):
+    payload = request.get_json(silent=True) or {}
+    conn = db.get_db()
+    feedback, created = record_service.add_feedback(
+        conn,
+        int(_user()["id"]),
+        project_id,
+        record_id,
+        note=str(payload.get("note") or ""),
+        request_key=_key(payload, "fbk"),
+    )
+    return ok({"feedback": feedback, "created": created})
+
+
+@bp.get("/projects/<project_id>/feedback")
+@auth.login_required
+def list_feedback(project_id: str):
+    conn = db.get_db()
+    return ok(
+        record_service.list_feedback(
+            conn,
+            int(_user()["id"]),
+            project_id,
+            status=(request.args.get("status") or "pending").strip(),
+            limit=int(request.args.get("limit") or 50),
         )
     )

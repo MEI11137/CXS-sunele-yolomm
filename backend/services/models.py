@@ -253,18 +253,47 @@ def _build_mapping(native: list[dict], dataset_classes: list[str], explicit: dic
     return auto
 
 
-def class_labels(row: sqlite3.Row) -> dict[int, str]:
-    """输出侧展示用的类别名：优先数据集类别（映射后），否则权重自带名称。"""
+def class_labels(
+    row: sqlite3.Row, dataset_classes: list[str] | None = None
+) -> dict[int, str]:
+    """输出侧展示用的类别名。
+
+    键是**目标类别索引**（数据集口径），值优先取目标数据集的类别名；
+    只有模型没绑定数据集时才回落到权重自带名称。之前这里把 native 名称放到
+    target 键上，导致映射到「单一热斑」后界面仍显示 ``single_hotspot``。
+    """
     mapping = _loads(row["class_map"], {})
     native = {int(item["index"]): str(item["name"]) for item in _loads(row["classes"], [])}
     if not mapping:
         return native
-    return {int(target): native.get(int(source), str(target)) for source, target in mapping.items()}
+    labels: dict[int, str] = {}
+    for source, target in mapping.items():
+        source_id, target_id = int(source), int(target)
+        if dataset_classes and 0 <= target_id < len(dataset_classes):
+            labels[target_id] = str(dataset_classes[target_id])
+        else:
+            labels[target_id] = native.get(source_id, str(target_id))
+    return labels
+
+
+def labels_for(conn, row: sqlite3.Row) -> dict[int, str]:
+    """按模型绑定的数据集取目标类别名（没有数据集才用权重自带名称）。"""
+    classes: list[str] = []
+    dataset_id = row["dataset_id"]
+    if dataset_id:
+        found = conn.execute(
+            "SELECT classes FROM datasets WHERE id = ? AND project_id = ?",
+            (str(dataset_id), str(row["project_id"])),
+        ).fetchone()
+        if found is not None:
+            classes = [str(item) for item in _loads(found["classes"], [])]
+    return class_labels(row, classes)
 
 
 __all__ = [
     "archive",
     "class_labels",
+    "labels_for",
     "get_owned",
     "import_model",
     "list_for_project",

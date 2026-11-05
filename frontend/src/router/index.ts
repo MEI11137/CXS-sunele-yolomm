@@ -41,11 +41,32 @@ const router = createRouter({
       meta: { title: '图片巡检', dock: true },
     },
     {
+      // 本轮人工队列：可按 flow_id 或 record_ids 定位。
+      path: '/projects/:projectId/review',
+      name: 'reviewQueue',
+      component: () => import('@/views/ReviewQueueView.vue'),
+      meta: { title: '人工复核队列', dock: true },
+    },
+    {
+      // 人工复核：RGB / 配图 / 结果图对照 + 标注编辑；提交/驳回只能在这里做。
+      path: '/projects/:projectId/records/:recordId/review',
+      name: 'review',
+      component: () => import('@/views/ReviewView.vue'),
+      meta: { title: '人工复核', dock: true },
+    },
+    {
       // 业务页把对话停靠到右侧，任何一页都不会“把助手弄丢”。
       path: '/projects/:projectId/records',
       name: 'records',
       component: () => import('@/views/RecordsView.vue'),
       meta: { title: '识别记录', dock: true },
+    },
+    {
+      // 数据回流：把已确认结论变成真实数据集版本（预览不写文件）。
+      path: '/projects/:projectId/reflow',
+      name: 'reflow',
+      component: () => import('@/views/ReflowView.vue'),
+      meta: { title: '数据回流', dock: true },
     },
     {
       path: '/projects/:projectId/datasets',

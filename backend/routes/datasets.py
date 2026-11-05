@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from flask import Blueprint, request
+from flask import Blueprint, request, send_file
 
 from backend import auth, db
 from backend.errors import ApiError, ok
 from backend.services import datasets as dataset_service
+from backend.services import identity as identity_service
+from backend.services import reflow as reflow_service
 
 bp = Blueprint("datasets", __name__)
 
@@ -21,7 +23,15 @@ def _user() -> dict:
 @auth.login_required
 def list_datasets(project_id: str):
     conn = db.get_db()
-    return ok(dataset_service.list_for_project(conn, int(_user()["id"]), project_id))
+    return ok(
+        dataset_service.list_for_project(
+            conn,
+            int(_user()["id"]),
+            project_id,
+            limit=int(request.args.get("limit") or 50),
+            deleted=(request.args.get("deleted") or "exclude").strip(),
+        )
+    )
 
 
 @bp.post("/projects/<project_id>/datasets")
@@ -71,3 +81,185 @@ def list_samples(project_id: str, dataset_id: str):
             limit=int(request.args.get("limit") or 200),
         )
     )
+
+
+@bp.get("/projects/<project_id>/datasets/<dataset_id>/report")
+@auth.login_required
+def dataset_report(project_id: str, dataset_id: str):
+    """只读身份检查：重复、跨划分泄漏、标注冲突。不改任何数据。"""
+    conn = db.get_db()
+    return ok(identity_service.dataset_report(conn, int(_user()["id"]), project_id, dataset_id))
+
+
+@bp.post("/projects/<project_id>/datasets/<dataset_id>/match")
+@auth.login_required
+def match_records(project_id: str, dataset_id: str):
+    payload = request.get_json(silent=True) or {}
+    ids = payload.get("record_ids")
+    if not isinstance(ids, list) or not ids:
+        raise ApiError(400, "VALIDATION", "需要 record_ids")
+    conn = db.get_db()
+    return ok(
+        {
+            "matches": identity_service.match_records(
+                conn, int(_user()["id"]), project_id, dataset_id, [str(item) for item in ids]
+            )
+        }
+    )
+
+
+@bp.post("/projects/<project_id>/reflow/preview")
+@auth.login_required
+def reflow_preview(project_id: str):
+    payload = request.get_json(silent=True) or {}
+    conn = db.get_db()
+    return ok(
+        reflow_service.preview(
+            conn,
+            int(_user()["id"]),
+            project_id,
+            mode=str(payload.get("mode") or "revision"),
+            dataset_id=payload.get("dataset_id"),
+            selections=payload.get("selections") or [],
+            strategy=str(payload.get("strategy") or "even"),
+            ratios=payload.get("ratios"),
+            seed=int(payload.get("seed") or 0),
+        )
+    )
+
+
+@bp.post("/projects/<project_id>/reflow/apply")
+@auth.login_required
+def reflow_apply(project_id: str):
+    payload = request.get_json(silent=True) or {}
+    conn = db.get_db()
+    return ok(
+        {
+            "dataset": reflow_service.apply(
+                conn,
+                int(_user()["id"]),
+                project_id,
+                mode=str(payload.get("mode") or "revision"),
+                dataset_id=payload.get("dataset_id"),
+                selections=payload.get("selections") or [],
+                name=str(payload.get("name") or ""),
+                strategy=str(payload.get("strategy") or "even"),
+                ratios=payload.get("ratios"),
+                seed=int(payload.get("seed") or 0),
+                request_key=str(payload.get("request_key") or ""),
+                session_id=(payload.get("session_id") or None),
+            )
+        }
+    )
+
+
+@bp.get("/projects/<project_id>/datasets/<dataset_id>/export")
+@auth.login_required
+def download_export(project_id: str, dataset_id: str):
+    conn = db.get_db()
+    row = dataset_service.get_owned(conn, int(_user()["id"]), project_id, dataset_id)
+    rel = str(row["export_rel"] or "")
+    if not rel:
+        raise ApiError(404, "NO_EXPORT", "这个数据集还没有导出包")
+    from backend.services import storage
+
+    root = storage.project_root(conn, int(_user()["id"]), project_id)
+    path = storage.resolve_rel(root, rel, must_exist=True)
+    return send_file(path, mimetype="application/zip", as_attachment=True,
+                     download_name=f"{row['name']}.zip", max_age=0)
+
+
+# --------------------------------------------------------------------------- 草稿 / 定稿 / 重新划分
+
+
+@bp.get("/projects/<project_id>/reflow/drafts")
+@auth.login_required
+def list_reflow_drafts(project_id: str):
+    conn = db.get_db()
+    return ok(
+        reflow_service.list_drafts(
+            conn,
+            int(_user()["id"]),
+            project_id,
+            include_deleted=(request.args.get("include_deleted") or "") in {"1", "true", "yes"},
+        )
+    )
+
+
+@bp.post("/projects/<project_id>/reflow/drafts")
+@auth.login_required
+def save_reflow_draft(project_id: str):
+    payload = request.get_json(silent=True) or {}
+    conn = db.get_db()
+    draft = reflow_service.save_draft(
+        conn,
+        int(_user()["id"]),
+        project_id,
+        name=str(payload.get("name") or ""),
+        mode=str(payload.get("mode") or "revision"),
+        dataset_id=payload.get("dataset_id"),
+        selections=payload.get("selections") or [],
+        strategy=str(payload.get("strategy") or "even"),
+        ratios=payload.get("ratios"),
+        seed=int(payload.get("seed") or 0),
+        session_id=payload.get("session_id") or None,
+        draft_id=payload.get("draft_id") or None,
+    )
+    return ok({"draft": draft})
+
+
+@bp.post("/projects/<project_id>/reflow/drafts/<draft_id>/finalize")
+@auth.login_required
+def finalize_reflow_draft(project_id: str, draft_id: str):
+    conn = db.get_db()
+    return ok(reflow_service.finalize_draft(conn, int(_user()["id"]), project_id, draft_id))
+
+
+@bp.post("/projects/<project_id>/reflow/drafts/<draft_id>/delete")
+@auth.login_required
+def delete_reflow_draft(project_id: str, draft_id: str):
+    conn = db.get_db()
+    return ok(reflow_service.delete_draft(conn, int(_user()["id"]), project_id, draft_id))
+
+
+@bp.post("/projects/<project_id>/reflow/drafts/<draft_id>/restore")
+@auth.login_required
+def restore_reflow_draft(project_id: str, draft_id: str):
+    conn = db.get_db()
+    return ok(reflow_service.restore_draft(conn, int(_user()["id"]), project_id, draft_id))
+
+
+@bp.post("/projects/<project_id>/datasets/<dataset_id>/resplit")
+@auth.login_required
+def resplit_dataset(project_id: str, dataset_id: str):
+    payload = request.get_json(silent=True) or {}
+    conn = db.get_db()
+    return ok(
+        {
+            "dataset": reflow_service.resplit(
+                conn,
+                int(_user()["id"]),
+                project_id,
+                dataset_id,
+                strategy=str(payload.get("strategy") or "even"),
+                ratios=payload.get("ratios"),
+                seed=int(payload.get("seed") or 0),
+                request_key=str(payload.get("request_key") or ""),
+                session_id=payload.get("session_id") or None,
+            )
+        }
+    )
+
+
+@bp.post("/projects/<project_id>/datasets/<dataset_id>/delete")
+@auth.login_required
+def delete_dataset(project_id: str, dataset_id: str):
+    conn = db.get_db()
+    return ok(dataset_service.soft_delete(conn, int(_user()["id"]), project_id, dataset_id))
+
+
+@bp.post("/projects/<project_id>/datasets/<dataset_id>/restore")
+@auth.login_required
+def restore_dataset(project_id: str, dataset_id: str):
+    conn = db.get_db()
+    return ok(dataset_service.restore(conn, int(_user()["id"]), project_id, dataset_id))

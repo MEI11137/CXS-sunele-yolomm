@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -26,8 +27,27 @@ from backend.services import storage
 from backend.vision import runtime as vision_runtime
 
 
-def public(row: sqlite3.Row | dict) -> dict:
+def public(row: sqlite3.Row | dict, labels: dict[int, str] | None = None) -> dict:
+    """记录对外结构。
+
+    ``labels`` 是**目标数据集**口径的类别名；给了就按 ``class_id`` 重写展示名，
+    旧记录（写入时存的是权重自带名）也能正确显示中文类别。
+    """
     data = dict(row)
+    boxes = _loads(data.get("boxes"), [])
+    summary = _loads(data.get("class_summary"), {})
+    if labels:
+        for box in boxes:
+            try:
+                key = int(box.get("class_id"))
+            except (TypeError, ValueError):
+                continue
+            if key in labels:
+                box["class_name"] = labels[key]
+        summary = {}
+        for box in boxes:
+            name = str(box.get("class_name") or "")
+            summary[name] = summary.get(name, 0) + 1
     project_id = data["project_id"]
     record_id = data["id"]
     return {
@@ -35,12 +55,14 @@ def public(row: sqlite3.Row | dict) -> dict:
         "project_id": project_id,
         "session_id": data.get("session_id"),
         "job_id": data.get("job_id"),
+        "flow_id": data.get("flow_id") or data.get("job_id"),
+        "deleted_at": data.get("deleted_at"),
         "model_id": data["model_id"],
         "dataset_id": data.get("dataset_id"),
         "status": data["status"],
         "confidence": float(data["confidence"] or 0),
-        "boxes": _loads(data.get("boxes"), []),
-        "class_summary": _loads(data.get("class_summary"), {}),
+        "boxes": boxes,
+        "class_summary": summary,
         "hit_count": int(data.get("hit_count") or 0),
         "rgb_asset_id": data["rgb_asset_id"],
         "x_asset_id": data.get("x_asset_id"),
@@ -61,6 +83,31 @@ def public(row: sqlite3.Row | dict) -> dict:
         ),
         "request_key": data["request_key"],
     }
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def public_with_labels(conn, user_id: int, project_id: str, row) -> dict:
+    """单条记录：带上目标数据集类别名。"""
+    labels = _labels_by_model(conn, user_id, project_id, {str(row["model_id"])}).get(str(row["model_id"]))
+    return public(row, labels)
+
+
+def _labels_by_model(conn, user_id: int, project_id: str, model_ids: set[str]) -> dict[str, dict[int, str]]:
+    if not model_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in model_ids)
+    rows = conn.execute(
+        f"SELECT * FROM models WHERE project_id = ? AND owner_id = ? AND id IN ({placeholders})",
+        (str(project_id), int(user_id), *model_ids),
+    ).fetchall()
+    return {str(row["id"]): model_service.labels_for(conn, row) for row in rows}
 
 
 def _loads(raw: Any, fallback: Any) -> Any:
@@ -101,6 +148,7 @@ def list_for_project(
     date_to: str | None = None,
     limit: int = 20,
     before: str | None = None,
+    deleted: str = "exclude",
 ) -> dict:
     """分页 + 筛选。日期按**本地日期**解释，并在返回里给出换算后的 UTC 边界。"""
     bounds = timeutil.day_bounds(date_from, date_to)
@@ -115,6 +163,11 @@ def list_for_project(
     if session_id:
         clauses.append("session_id = ?")
         params.append(str(session_id))
+    mode = str(deleted or "exclude").lower()
+    if mode == "exclude":
+        clauses.append("deleted_at IS NULL")
+    elif mode == "only":
+        clauses.append("deleted_at IS NOT NULL")
     if has_hits is True:
         clauses.append("hit_count > 0")
     elif has_hits is False:
@@ -134,12 +187,15 @@ def list_for_project(
         (*params, limit + 1),
     ).fetchall()
     page = rows[:limit]
+    labels_by_model = _labels_by_model(conn, user_id, project_id, {row["model_id"] for row in page})
     total = conn.execute(
         f"SELECT COUNT(*) FROM detections WHERE {' AND '.join(clauses[:4])}",
         tuple(params[:4]),
     ).fetchone()[0]
     return {
-        "records": [public(row) for row in page],
+        "records": [
+            public(row, labels_by_model.get(str(row["model_id"]))) for row in page
+        ],
         "has_more": len(rows) > limit,
         "next_before": page[-1]["id"] if len(rows) > limit and page else None,
         "total_in_range": int(total),
@@ -166,6 +222,7 @@ def run_detection(
     session_id: str | None = None,
     turn_id: str | None = None,
     job_id: str | None = None,
+    flow_id: str | None = None,
 ) -> dict:
     key = str(request_key or "").strip()
     if not key:
@@ -180,16 +237,24 @@ def run_detection(
     rgb = asset_service.get_owned(conn, user_id, project_id, rgb_asset_id)
     if rgb["kind"] != "image":
         raise ApiError(409, "NOT_AN_IMAGE", "RGB 输入必须是图片资产")
-    # 权重缺失要在**建记录之前**就报错：否则会留下一条永远 running 的孤儿记录，
-    # 页面上看起来像“检测卡住了”，而不是“文件没了”。
+    # 读取并校验 SHA：文件被换掉就明确拒绝，不能“路径相同”就算同一来源。
+    asset_service.read_bytes(conn, user_id, project_id, str(rgb_asset_id))
+    # 权重要在**建记录之前**确认“还是导入时那份”：用户可能用文件工具替换过它。
+    # 只看路径存在会把新文件当旧模型用，记录的类别表与指纹都会失真。
+    root = storage.project_root(conn, user_id, project_id)
     try:
-        storage.resolve_rel(
-            storage.project_root(conn, user_id, project_id), model["weight_rel"], must_exist=True
-        )
+        weight_path = storage.resolve_rel(root, model["weight_rel"], must_exist=True)
     except ApiError:
         raise ApiError(
             409, "MODEL_WEIGHT_MISSING", "模型权重文件已不存在，请重新导入或重新发布该模型"
         ) from None
+    recorded = str(model["weight_sha256"] or "")
+    if recorded and _sha256(weight_path) != recorded:
+        raise ApiError(
+            409,
+            "MODEL_WEIGHT_CHANGED",
+            "模型权重文件在导入后被修改过，不能沿用旧的类别表与指纹；请重新导入并发布该模型",
+        )
     confidence = max(0.01, min(float(confidence or 0.25), 0.99))
 
     x_row = None
@@ -220,9 +285,9 @@ def run_detection(
         conn.execute(
             """
             INSERT INTO detections
-                (id, project_id, owner_id, session_id, turn_id, job_id, request_key, model_id,
+                (id, project_id, owner_id, session_id, turn_id, job_id, flow_id, request_key, model_id,
                  dataset_id, rgb_asset_id, x_asset_id, x_origin, confidence, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
             """,
             (
                 record_id,
@@ -231,6 +296,7 @@ def run_detection(
                 session_id,
                 turn_id,
                 job_id,
+                str(flow_id or job_id or "") or None,
                 key,
                 str(model_id),
                 model["dataset_id"],
@@ -281,9 +347,12 @@ def run_detection(
 def _infer(conn, user_id: int, project_id: str, model, rgb, x_row, confidence: float, record_id: str) -> dict:
     root = storage.project_root(conn, user_id, project_id)
     rgb_path = asset_service.path_of(conn, user_id, project_id, rgb["id"])
-    x_path = (
-        asset_service.path_of(conn, user_id, project_id, x_row["id"]) if x_row is not None else None
-    )
+    # 推理前再按字节校验一次（含 X 配图），避免“刚校验完就被替换”。
+    asset_service.read_bytes(conn, user_id, project_id, str(rgb["id"]))
+    x_path = None
+    if x_row is not None:
+        asset_service.read_bytes(conn, user_id, project_id, str(x_row["id"]))
+        x_path = asset_service.path_of(conn, user_id, project_id, x_row["id"])
     weight_path = storage.resolve_rel(root, model["weight_rel"], must_exist=True)
     inputs = vision_runtime.resolve_inputs(
         model_mode=str(model["model_mode"]),
@@ -298,7 +367,11 @@ def _infer(conn, user_id: int, project_id: str, model, rgb, x_row, confidence: f
         confidence=confidence,
     )
     mapping = _loads(model["class_map"], {})
-    labels = model_service.class_labels(model)
+    labels = model_service.labels_for(conn, model)
+    # native 名称以模型登记时的类别表为准（推理结果里的 names 可能缺失）。
+    native_names = {
+        int(item["index"]): str(item["name"]) for item in _loads(model["classes"], [])
+    }
     boxes: list[dict] = []
     for item in output.boxes:
         native_id = int(item["class_id"])
@@ -308,6 +381,9 @@ def _infer(conn, user_id: int, project_id: str, model, rgb, x_row, confidence: f
                 "class_id": dataset_id,
                 "native_class_id": native_id,
                 "class_name": labels.get(dataset_id, item.get("class_name") or str(dataset_id)),
+                "native_class_name": native_names.get(
+                    native_id, item.get("class_name") or str(native_id)
+                ),
                 "confidence": item["confidence"],
                 "bbox": item["bbox"],
             }

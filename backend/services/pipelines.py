@@ -136,6 +136,7 @@ def run_detection_batch(conn, job, payload_override: dict | None = None) -> dict
                 session_id=job["session_id"],
                 turn_id=job["turn_id"],
                 job_id=str(job["id"]),
+                flow_id=str(job["id"]),
             )
         except ApiError as exc:
             code = _error_code(exc)
@@ -206,6 +207,8 @@ def run_detection_batch(conn, job, payload_override: dict | None = None) -> dict
         "paused": len(items) - done - failed,
         "total": len(items),
         "pause_reason": pause_reason,
+        "flow_id": str(job["id"]),
+        "record_ids": [item["record_id"] for item in results if item.get("record_id")],
     }
 
 
@@ -437,7 +440,7 @@ def build_queue(conn, user_id: int, project_id: str, record_ids: list[str]) -> l
         f"SELECT * FROM detections WHERE project_id = ? AND owner_id = ? AND id IN ({placeholders})",
         (str(project_id), int(user_id), *[str(item) for item in record_ids]),
     ).fetchall()
-    items = [detection_service.public(row) for row in rows]
+    items = [detection_service.public_with_labels(conn, user_id, project_id, row) for row in rows]
     items.sort(key=lambda item: (item["hit_count"], item["confidence"]), reverse=True)
     return [
         {
@@ -446,10 +449,14 @@ def build_queue(conn, user_id: int, project_id: str, record_ids: list[str]) -> l
             "classes": item["class_summary"],
             "status": item["status"],
             "created_at_local": item["created_at_local"],
+            "flow_id": item.get("flow_id"),
             "page": {
-                "name": "records",
+                "name": "reviewQueue",
                 "params": {"projectId": project_id},
-                "query": {"record": item["id"]},
+                "query": {
+                    "flow": item.get("flow_id") or "",
+                    "record_ids": item["id"],
+                },
             },
         }
         for item in items

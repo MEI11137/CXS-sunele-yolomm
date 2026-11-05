@@ -68,8 +68,9 @@ SERVICES: dict[str, dict] = {
     "ai_review": {"registered": True, "note": "用本人当前连接做看图核查，结论仅供参考"},
     "datasets": {"registered": True, "note": "ZIP/目录导入，逐样本校验后登记"},
     "models": {"registered": True, "note": "PT 导入与项目内发布，类别映射显式确认"},
-    "review": {"registered": False, "note": "人工复核在 WB17-04 接入，本轮不可调用"},
-    "feedback": {"registered": False, "note": "数据回流在 WB17-04 接入，本轮不可调用"},
+    "review": {"registered": True, "note": "复核草稿可改；提交/驳回只能用户本人在页面做"},
+    "feedback": {"registered": True, "note": "已确认且未回流的记录可加入反馈池"},
+    "reflow": {"registered": True, "note": "回原修订 / 另建数据集，生成真实文件"},
     "training": {"registered": False, "note": "训练评估在 WB17-05 接入，本轮不可调用"},
 }
 
@@ -411,6 +412,9 @@ def _open_page(ctx: ToolContext) -> dict:
             "params": {"projectId": ctx.actor.project_id, "sessionId": ctx.actor.session_id},
         },
         "records": {"name": "records", "params": {"projectId": ctx.actor.project_id}},
+        "review": {"name": "records", "params": {"projectId": ctx.actor.project_id}},
+        "inspect": {"name": "inspect", "params": {"projectId": ctx.actor.project_id}},
+        "reflow": {"name": "reflow", "params": {"projectId": ctx.actor.project_id}},
         "datasets": {"name": "datasets", "params": {"projectId": ctx.actor.project_id}},
         "models": {"name": "models", "params": {"projectId": ctx.actor.project_id}},
         "assets": {"name": "assets", "params": {"projectId": ctx.actor.project_id}},
@@ -418,9 +422,57 @@ def _open_page(ctx: ToolContext) -> dict:
         "trash": {"name": "trash", "params": {}},
     }
     if page not in routes:
-        raise ToolError("BAD_PAGE", "只能打开项目、会话、记录、数据集、模型、资产、设置或回收站页面")
-    ctx.emit("ui.navigate", {"page": page, "route": routes[page]})
-    return {"opened": page, "note": "已在用户界面发起跳转"}
+        raise ToolError("BAD_PAGE", "只能打开项目、会话、记录、复核、巡检、回流、数据集、模型、资产、设置或回收站页面")
+    route = dict(routes[page])
+    record_id = str(ctx.args.get("record_id") or "").strip()
+    if page == "review" and record_id:
+        route = {
+            "name": "review",
+            "params": {"projectId": ctx.actor.project_id, "recordId": record_id},
+        }
+    elif record_id and page == "records":
+        route = dict(route)
+        route["query"] = {"record": record_id}
+    ctx.emit("ui.navigate", {"page": page, "route": route})
+    result: dict = {"opened": page, "note": "已在用户界面发起跳转"}
+    if page == "review" and record_id:
+        result.update(_wait_for_review(ctx, record_id))
+    return result
+
+
+def _wait_for_review(ctx: ToolContext, record_id: str) -> dict:
+    """打开复核页时登记等待，用户本人提交后同一会话自动接上。
+
+    已有已提交结论的记录不登记：那样等待项永远等不到提交，只会变成噪声。
+    """
+    from backend.services import followups as followup_service
+    from backend.services import review as review_service
+
+    current = review_service.effective_review(ctx.conn, record_id, int(ctx.actor.user_id))
+    if current is not None:
+        return {
+            "waiting": False,
+            "reason": "该记录已有提交过的人工结论；如要再改，请在页面上先重开复核。",
+        }
+    instruction = str(ctx.args.get("instruction") or "").strip()
+    if not instruction:
+        row = ctx.conn.execute(
+            "SELECT content FROM messages WHERE session_id = ? AND role = 'user'"
+            " ORDER BY id DESC LIMIT 1",
+            (str(ctx.actor.session_id),),
+        ).fetchone()
+        instruction = str(row["content"])[:1000] if row is not None else ""
+    registered = followup_service.register(
+        ctx.conn, ctx.actor, record_id, instruction=instruction, payload={"page": "review"}
+    )
+    return {
+        "waiting": True,
+        "followup_id": registered.get("followup_id"),
+        "note": (
+            "已登记等待本人提交。请结束本轮：用户提交后系统会在本会话自动继续，"
+            "不需要他再发消息。不要把“我已建议”说成“人工已确认”。"
+        ),
+    }
 
 
 def _ask_user(ctx: ToolContext) -> dict:
@@ -493,6 +545,10 @@ def _connection_status(ctx: ToolContext) -> dict:
 
 
 _PATH = {"type": "string", "maxLength": 1000}
+# 标识符统一为 `<3 位前缀>_<16 位十六进制>`（见 security.new_id），前后两段工具清单共用。
+_ID = {"type": "string", "pattern": "^[a-z]{3}_[0-9a-f]{16}$"}
+_REQUEST_KEY = {"type": "string", "pattern": "^[A-Za-z0-9:_-]{6,80}$"}
+_REL = {"type": "string", "minLength": 1, "maxLength": 400}
 
 register(
     ToolSpec(
@@ -754,15 +810,25 @@ register(
     ToolSpec(
         name="hx_open_page",
         title="在界面上打开页面",
-        description="让用户界面跳到项目、当前会话、设置或回收站。只能跳这四处。",
+        description=(
+            "让用户界面跳到本项目页面。传 record_id + page=review 打开该记录的人工复核页；"
+            "这时系统会登记“等待本人提交”，用户提交后本会话会自动接上，你不用让他回来说“我提交了”。"
+            "page=records 打开记录页并定位记录；也可以打开巡检、回流、数据集、模型、设置或回收站。"
+        ),
         risk=policy.RISK_READ,
         schema={
             "type": "object",
             "properties": {
                 "page": {
                     "type": "string",
-                    "pattern": "^(project|session|records|datasets|models|assets|settings|trash)$",
-                }
+                    "pattern": "^(project|session|records|review|inspect|reflow|datasets|models|assets|settings|trash)$",
+                },
+                "record_id": _ID,
+                "instruction": {
+                    "type": "string",
+                    "maxLength": 1000,
+                    "description": "用户对提交之后要做什么的原始要求（回流去向等），用于自动接力；照原话写，不要补充。",
+                },
             },
             "required": ["page"],
         },
@@ -852,6 +918,75 @@ def _emit_job(ctx: ToolContext, job: dict, *, page: str, note: str = "") -> None
             "note": note,
         },
     )
+
+
+def _dataset_audit(ctx: ToolContext) -> dict:
+    """只读体检：样本清单 + 身份匹配 + 重复/泄漏/标注冲突。"""
+    from backend.services import datasets as dataset_service
+    from backend.services import identity as identity_service
+
+    dataset_id = str(ctx.args.get("dataset_id") or "")
+    limit = max(1, min(int(ctx.args.get("sample_limit") or 20), 200))
+    report = _service(
+        lambda: identity_service.dataset_report(
+            ctx.conn, int(ctx.actor.user_id), ctx.actor.project_id, dataset_id
+        )
+    )
+    dataset = _service(
+        lambda: dataset_service.get_owned(
+            ctx.conn, int(ctx.actor.user_id), ctx.actor.project_id, dataset_id
+        )
+    )
+    rows = ctx.conn.execute(
+        "SELECT * FROM dataset_samples WHERE dataset_id = ? ORDER BY split, stem LIMIT ?",
+        (dataset_id, limit),
+    ).fetchall()
+
+    def modality(x_rel) -> str:
+        text = str(x_rel or "")
+        for folder, name in (
+            ("images_edge", "edge"),
+            ("images_depth", "depth"),
+            ("images_ir", "ir"),
+        ):
+            if folder in text:
+                return f"rgb+{name}"
+        return "rgb"
+
+    samples = [
+        {
+            "id": row["id"],
+            "split": row["split"],
+            "stem": row["stem"],
+            "modality": modality(row["x_rel"]),
+            "x_rel": row["x_rel"],
+            "sha256": row["sha256"],
+            "pixel_sha256": row["pixel_sha256"],
+            "origin_record_id": row["origin_record_id"],
+            "review_version_id": row["review_version_id"],
+        }
+        for row in rows
+    ]
+    matches = []
+    record_ids = [str(item) for item in (ctx.args.get("record_ids") or [])][:50]
+    if record_ids:
+        matches = _service(
+            lambda: identity_service.match_records(
+                ctx.conn,
+                int(ctx.actor.user_id),
+                ctx.actor.project_id,
+                dataset_id,
+                record_ids,
+            )
+        )
+    return {
+        "dataset": dataset_service.public(dataset),
+        "samples": samples,
+        "truncated": len(rows) >= limit,
+        "report": report,
+        "matches": matches,
+        "note": "只读检查：不会自动删除、合并或改写任何样本；歧义要由用户明确选择。",
+    }
 
 
 def _list_datasets(ctx: ToolContext) -> dict:
@@ -1102,9 +1237,6 @@ def _review_records(ctx: ToolContext) -> dict:
 
 # ---- 业务工具清单 ----------------------------------------------------------
 
-_ID = {"type": "string", "pattern": "^[a-z]{3}_[0-9a-f]{16}$"}
-_REQUEST_KEY = {"type": "string", "pattern": "^[A-Za-z0-9:_-]{6,80}$"}
-_REL = {"type": "string", "minLength": 1, "maxLength": 400}
 
 register(
     ToolSpec(
@@ -1114,6 +1246,28 @@ register(
         risk=policy.RISK_READ,
         schema={"type": "object", "properties": {}, "required": []},
         handler=_list_datasets,
+    )
+)
+register(
+    ToolSpec(
+        name="hx_dataset_audit",
+        title="只读检查数据集（样本/身份/重复/泄漏/标注冲突）",
+        description=(
+            "列出数据集样本（模态、划分、身份指纹），并给出只读检查结论：重复组、跨划分泄漏、"
+            "标注冲突、缺失身份。可选 record_ids 做“这些记录和数据集里哪些样本是同一张图”的匹配。"
+            "只读：不会删改或合并任何样本。"
+        ),
+        risk=policy.RISK_READ,
+        schema={
+            "type": "object",
+            "properties": {
+                "dataset_id": _ID,
+                "sample_limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                "record_ids": {"type": "array", "items": _ID, "maxItems": 50},
+            },
+            "required": ["dataset_id"],
+        },
+        handler=_dataset_audit,
     )
 )
 register(
@@ -1339,5 +1493,334 @@ register(
         },
         handler=_review_records,
         summary=lambda args: f"AI 核查 {len(args.get('record_ids') or [])} 条记录",
+    )
+)
+
+
+# --------------------------------------------------------------------------- 人工复核与回流
+
+
+def _review_state(ctx: ToolContext) -> dict:
+    from backend.services import review as review_service
+
+    state = _service(
+        lambda: review_service.state(
+            ctx.conn, ctx.actor.user_id, ctx.actor.project_id, str(ctx.args.get("record_id") or "")
+        )
+    )
+    return {
+        "record_id": state["record"]["id"],
+        "queue": state["queue"],
+        "pending": state["pending"],
+        "class_options": state["class_options"],
+        "latest": state["latest_submitted"],
+        "draft": state["draft"],
+        "ai_review": state.get("ai_review"),
+        "human_status": state.get("human_status"),
+        "flow_id": state["record"].get("flow_id"),
+        "image": state["image"],
+        "note": "人工确认只能由用户本人在复核页提交；你只能读状态、解释 AI 建议、按口述改草稿。",
+    }
+
+
+def _review_queue(ctx: ToolContext) -> dict:
+    from backend.services import review as review_service
+
+    result = _service(
+        lambda: review_service.queue(
+            ctx.conn,
+            ctx.actor.user_id,
+            ctx.actor.project_id,
+            view=str(ctx.args.get("view") or "pending"),
+            record_ids=ctx.args.get("record_ids"),
+            limit=int(ctx.args.get("limit") or 20),
+        )
+    )
+    return {
+        "view": result["view"],
+        "counts": result["counts"],
+        "items": [
+            {
+                "record_id": item["id"],
+                "hit_count": item["hit_count"],
+                "bucket": item["bucket"],
+                "latest": item.get("review"),
+                "created_at_local": item["created_at_local"],
+            }
+            for item in result["items"]
+        ],
+        "flow_ids": result["flow_ids"],
+    }
+
+
+def _save_review_draft(ctx: ToolContext) -> dict:
+    from backend.services import review as review_service
+
+    record_id = str(ctx.args.get("record_id") or "")
+    user_id = ctx.actor.user_id
+    project_id = ctx.actor.project_id
+    # 没有显式给基线时，先读当前最新版本（草稿也算）再写：Agent 和页面走同一条
+    # 乐观锁规则，别人在这两次调用之间改过草稿就会 409，不会静默覆盖。
+    if ctx.args.get("base_version") is None:
+        current = _service(
+            lambda: review_service.state(ctx.conn, user_id, project_id, record_id)
+        )
+        base_version = int((current.get("latest") or {}).get("version") or 0)
+    else:
+        base_version = int(ctx.args.get("base_version") or 0)
+    state = _service(
+        lambda: review_service.save_draft(
+            ctx.conn,
+            user_id,
+            project_id,
+            record_id,
+            boxes=ctx.args.get("boxes") or [],
+            note=str(ctx.args.get("note") or ""),
+            base_version=base_version,
+        )
+    )
+    return {
+        "draft": state["draft"],
+        "note": "草稿已保存，但还没有提交；最终确认必须由用户本人在页面点提交。",
+    }
+
+
+def _record_admin(ctx: ToolContext) -> dict:
+    from backend.services import records as record_service
+
+    action = str(ctx.args.get("action") or "").lower()
+    ids = [str(item) for item in (ctx.args.get("record_ids") or [])]
+    if not ids:
+        raise ToolError("RECORD_IDS_REQUIRED", "需要 record_ids")
+    if action == "delete":
+        return _service(
+            lambda: record_service.soft_delete(
+                ctx.conn, ctx.actor.user_id, ctx.actor.project_id, ids
+            )
+        )
+    if action == "restore":
+        return _service(
+            lambda: record_service.restore(
+                ctx.conn, ctx.actor.user_id, ctx.actor.project_id, ids
+            )
+        )
+    raise ToolError("BAD_ACTION", "action 只能是 delete 或 restore")
+
+
+def _add_feedback(ctx: ToolContext) -> dict:
+    from backend.services import records as record_service
+
+    feedback, created = _service(
+        lambda: record_service.add_feedback(
+            ctx.conn,
+            ctx.actor.user_id,
+            ctx.actor.project_id,
+            str(ctx.args.get("record_id") or ""),
+            note=str(ctx.args.get("note") or ""),
+            request_key=str(ctx.args.get("request_key") or ""),
+        )
+    )
+    return {"feedback": feedback, "created": created}
+
+
+def _reflow_preview(ctx: ToolContext) -> dict:
+    from backend.services import reflow as reflow_service
+
+    return _service(
+        lambda: reflow_service.preview(
+            ctx.conn,
+            ctx.actor.user_id,
+            ctx.actor.project_id,
+            mode=str(ctx.args.get("mode") or "revision"),
+            dataset_id=ctx.args.get("dataset_id"),
+            selections=ctx.args.get("selections") or [],
+            strategy=str(ctx.args.get("strategy") or "even"),
+            ratios=ctx.args.get("ratios"),
+            seed=int(ctx.args.get("seed") or 0),
+        )
+    )
+
+
+def _reflow_apply(ctx: ToolContext) -> dict:
+    from backend.services import reflow as reflow_service
+
+    return _service(
+        lambda: reflow_service.apply(
+            ctx.conn,
+            ctx.actor.user_id,
+            ctx.actor.project_id,
+            mode=str(ctx.args.get("mode") or "revision"),
+            dataset_id=ctx.args.get("dataset_id"),
+            selections=ctx.args.get("selections") or [],
+            name=str(ctx.args.get("name") or ""),
+            strategy=str(ctx.args.get("strategy") or "even"),
+            ratios=ctx.args.get("ratios"),
+            seed=int(ctx.args.get("seed") or 0),
+            request_key=str(ctx.args.get("request_key") or ""),
+            session_id=ctx.actor.session_id,
+        )
+    )
+
+
+_SELECTIONS = {
+    "type": "array",
+    "maxItems": 200,
+    "items": {
+        "type": "object",
+        "properties": {
+            "record_id": _ID,
+            "action": {"type": "string", "enum": ["replace", "append", "exclude"]},
+            "split": {"type": "string", "enum": ["train", "val", "test"]},
+            "review_version_id": {"type": "string"},
+            "target_sample_id": {"type": "string", "description": "身份歧义时由用户明确指定的父数据集样本 ID"},
+        },
+        "required": ["record_id", "action"],
+    },
+}
+
+register(
+    ToolSpec(
+        name="hx_review_state",
+        title="查看记录的人工复核状态",
+        description=(
+            "返回这条记录的复核队列、最近已提交版本、草稿、目标数据集类别下拉。"
+            "只读；不要把 AI 建议说成人工已确认。"
+        ),
+        risk=policy.RISK_READ,
+        schema={
+            "type": "object",
+            "properties": {"record_id": _ID},
+            "required": ["record_id"],
+        },
+        handler=_review_state,
+    )
+)
+register(
+    ToolSpec(
+        name="hx_review_queue",
+        title="列出待复核 / 已驳回 / 已确认记录",
+        description="按视图列出真实记录 ID 与计数；驳回后的记录不再出现在待复核。",
+        risk=policy.RISK_READ,
+        schema={
+            "type": "object",
+            "properties": {
+                "view": {"type": "string", "enum": ["pending", "draft", "rejected", "confirmed"]},
+                "record_ids": {"type": "array", "maxItems": 100},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            },
+            "required": [],
+        },
+        handler=_review_queue,
+    )
+)
+register(
+    ToolSpec(
+        name="hx_save_review_draft",
+        title="保存复核草稿（不能提交）",
+        description=(
+            "按用户口述修改标注草稿；草稿不等于人工结论。最终确认/驳回只能由用户本人在页面提交。"
+            "boxes 用原图像素坐标 [x1,y1,x2,y2]。"
+        ),
+        risk=policy.RISK_WRITE,
+        schema={
+            "type": "object",
+            "properties": {
+                "record_id": _ID,
+                "boxes": {"type": "array", "maxItems": 200},
+                "note": {"type": "string", "maxLength": 1000},
+                "base_version": {"type": "integer", "minimum": 0},
+            },
+            "required": ["record_id", "boxes"],
+        },
+        handler=_save_review_draft,
+    )
+)
+register(
+    ToolSpec(
+        name="hx_record_admin",
+        title="删除或恢复识别记录（软删除）",
+        description=(
+            "只改记录的 deleted_at，不删除原图、结果图或数据集文件；只作用于给出的 record_ids，"
+            "逐项返回结果。"
+        ),
+        risk=policy.RISK_WRITE,
+        schema={
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["delete", "restore"]},
+                "record_ids": {"type": "array", "minItems": 1, "maxItems": 100},
+            },
+            "required": ["action", "record_ids"],
+        },
+        handler=_record_admin,
+    )
+)
+register(
+    ToolSpec(
+        name="hx_add_feedback",
+        title="把已确认记录加入反馈池",
+        description=(
+            "只有本人已确认且该版本尚未回流时才能加入；同一版本重复加入返回同一条，不重复。"
+        ),
+        risk=policy.RISK_WRITE,
+        schema={
+            "type": "object",
+            "properties": {
+                "record_id": _ID,
+                "note": {"type": "string", "maxLength": 500},
+                "request_key": _REQUEST_KEY,
+            },
+            "required": ["record_id"],
+        },
+        handler=_add_feedback,
+    )
+)
+register(
+    ToolSpec(
+        name="hx_reflow_preview",
+        title="预览数据回流计划",
+        description=(
+            "只算不写：返回替换/追加/冲突计数与逐条匹配。有冲突时不要调用 apply，先把歧义交给用户选。"
+        ),
+        risk=policy.RISK_READ,
+        schema={
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["revision", "new"]},
+                "dataset_id": {"type": "string"},
+                "selections": _SELECTIONS,
+                "strategy": {"type": "string", "enum": ["even", "ratio", "manual"]},
+                "ratios": {"type": "object"},
+                "seed": {"type": "integer"},
+            },
+            "required": ["mode", "selections"],
+        },
+        handler=_reflow_preview,
+    )
+)
+register(
+    ToolSpec(
+        name="hx_reflow_apply",
+        title="执行数据回流（生成真实数据集文件）",
+        description=(
+            "在项目工作区 datasets/<新ID>/ 生成 images/、配图目录、labels/、data.yaml、manifest 与 ZIP。"
+            "同一 request_key 不会生成两份。有冲突会拒绝整批写入。"
+        ),
+        risk=policy.RISK_WRITE,
+        schema={
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["revision", "new"]},
+                "dataset_id": {"type": "string"},
+                "selections": _SELECTIONS,
+                "name": {"type": "string", "maxLength": 60},
+                "strategy": {"type": "string", "enum": ["even", "ratio", "manual"]},
+                "ratios": {"type": "object"},
+                "seed": {"type": "integer"},
+                "request_key": _REQUEST_KEY,
+            },
+            "required": ["mode", "selections", "request_key"],
+        },
+        handler=_reflow_apply,
     )
 )

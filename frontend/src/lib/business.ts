@@ -38,6 +38,8 @@ const KIND_LABELS: Record<string, string> = {
   dataset_import: '数据集导入',
   model_import: '模型导入',
   training: '训练',
+  review_notice: '人工复核',
+  reflow_notice: '数据回流',
 }
 
 const STATUS_LABELS: Record<string, string> = {
@@ -180,6 +182,18 @@ export function buildCards(events: JobEvent[], jobs: BusinessJob[] = []): Busine
         const status = event.type.slice('job.'.length)
         card.status = status
         card.summary = jobStatusLabel(status)
+        break
+      }
+      case 'review.submitted': {
+        card.status = 'done'
+        card.summary = asString(payload.summary) || '人工复核已提交'
+        const recordId = asString(payload.record_id)
+        if (recordId && !card.recordIds.includes(recordId)) card.recordIds.push(recordId)
+        break
+      }
+      case 'reflow.done': {
+        card.status = 'done'
+        card.summary = asString(payload.summary) || '数据回流完成'
         break
       }
       case 'job.summary': {

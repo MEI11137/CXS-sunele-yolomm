@@ -103,6 +103,29 @@ class TurnRunner:
             )
         finally:
             self._slots.release()
+            self._settle_followups(turn_id)
+
+    def _settle_followups(self, turn_id: str) -> None:
+        """轮次收尾后处理“人工提交接力”：标完成，并把期间攒下的等待项接上。
+
+        放在这里而不是各自的 finish 分支里，是因为取消/失败/正常结束都要做同一件事；
+        任何异常都不能影响已经落库的轮次结果。
+        """
+        from backend.services import followups
+
+        try:
+            conn = self._connect()
+        except Exception:
+            return
+        try:
+            turn = store.get(conn, turn_id)
+            session_id = str(turn["session_id"])
+            followups.finish_turn(conn, turn_id)
+            followups.drain(conn, session_id, start=self.start)
+        except Exception:
+            logging.getLogger(__name__).exception("接力收尾失败 turn=%s", turn_id)
+        finally:
+            conn.close()
 
     def _mark_failed_direct(self, turn_id: str, code: str, message: str) -> None:
         """兜底：运行器自身崩了也要把轮次落成失败，不能让界面一直转圈。"""
@@ -469,6 +492,14 @@ class TurnRunner:
         return parts
 
     def _prompt_text(self, conn, turn) -> str:
+        # 人工提交接力：turns.kind 仍用既有允许值 continuation，
+        # 用幂等键前缀区分来源，避免为一个新来源再重建 turns 表。
+        if str(turn["request_id"]).startswith("review-followup:"):
+            from backend.services import followups
+
+            text = followups.prompt_for(conn, str(turn["request_id"]))
+            if text:
+                return text
         if turn["kind"] == "continuation":
             row = conn.execute(
                 "SELECT * FROM actions WHERE session_id = ? AND status = 'done' "

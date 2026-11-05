@@ -55,8 +55,20 @@ def public(row: sqlite3.Row | dict) -> dict:
         "sample_count": int(data["sample_count"]),
         "split_counts": _loads(data["split_counts"], {}),
         "status": data["status"],
+        "deleted_at": data.get("deleted_at"),
         "notes": data["notes"],
         "created_at": data["created_at"],
+        "parent_dataset_id": data.get("parent_dataset_id"),
+        "kind": data.get("kind") or "import",
+        "seed": data.get("seed"),
+        "split_strategy": data.get("split_strategy") or "source",
+        "manifest_rel": data.get("manifest_rel"),
+        "export_rel": data.get("export_rel"),
+        "export_url": (
+            f"/api/projects/{data['project_id']}/datasets/{data['id']}/export"
+            if data.get("export_rel")
+            else None
+        ),
     }
 
 
@@ -70,21 +82,52 @@ def _loads(raw: Any, fallback: Any) -> Any:
 
 def get_owned(conn, user_id: int, project_id: str, dataset_id: str) -> sqlite3.Row:
     row = conn.execute(
+        "SELECT * FROM datasets WHERE id = ? AND project_id = ? AND owner_id = ? AND deleted_at IS NULL",
+        (str(dataset_id), str(project_id), int(user_id)),
+    ).fetchone()
+    if row is None:
+        raise ApiError(404, "DATASET_NOT_FOUND", "数据集不存在、已删除或不属于当前项目")
+    return row
+
+
+def list_for_project(
+    conn, user_id: int, project_id: str, *, limit: int = 50, deleted: str = "exclude"
+) -> dict:
+    mode = str(deleted or "exclude").lower()
+    clause = "deleted_at IS NULL" if mode != "only" else "deleted_at IS NOT NULL"
+    rows = conn.execute(
+        f"SELECT * FROM datasets WHERE project_id = ? AND owner_id = ? AND {clause} "
+        "ORDER BY created_at DESC LIMIT ?",
+        (str(project_id), int(user_id), max(1, min(int(limit), 200))),
+    ).fetchall()
+    return {"datasets": [public(row) for row in rows]}
+
+
+def soft_delete(conn, user_id: int, project_id: str, dataset_id: str) -> dict:
+    row = get_owned(conn, user_id, project_id, dataset_id)
+    if row["deleted_at"]:
+        return {"dataset_id": str(dataset_id), "status": "unchanged"}
+    conn.execute(
+        "UPDATE datasets SET deleted_at = ? WHERE id = ? AND project_id = ? AND owner_id = ?",
+        (security.now_iso(), str(dataset_id), str(project_id), int(user_id)),
+    )
+    conn.commit()
+    return {"dataset_id": str(dataset_id), "status": "deleted", "note": "只移入回收站；目录与文件保留。"}
+
+
+def restore(conn, user_id: int, project_id: str, dataset_id: str) -> dict:
+    row = conn.execute(
         "SELECT * FROM datasets WHERE id = ? AND project_id = ? AND owner_id = ?",
         (str(dataset_id), str(project_id), int(user_id)),
     ).fetchone()
     if row is None:
         raise ApiError(404, "DATASET_NOT_FOUND", "数据集不存在或不属于当前项目")
-    return row
-
-
-def list_for_project(conn, user_id: int, project_id: str, *, limit: int = 50) -> dict:
-    rows = conn.execute(
-        "SELECT * FROM datasets WHERE project_id = ? AND owner_id = ? "
-        "ORDER BY created_at DESC LIMIT ?",
-        (str(project_id), int(user_id), max(1, min(int(limit), 200))),
-    ).fetchall()
-    return {"datasets": [public(row) for row in rows]}
+    conn.execute(
+        "UPDATE datasets SET deleted_at = NULL WHERE id = ? AND project_id = ? AND owner_id = ?",
+        (str(dataset_id), str(project_id), int(user_id)),
+    )
+    conn.commit()
+    return {"dataset_id": str(dataset_id), "status": "restored"}
 
 
 def samples(conn, user_id: int, project_id: str, dataset_id: str, *, split: str | None = None, limit: int = 200) -> dict:
@@ -110,6 +153,11 @@ def samples(conn, user_id: int, project_id: str, dataset_id: str, *, split: str 
                 "width": row["width"],
                 "height": row["height"],
                 "boxes": _loads(row["boxes"], []),
+                "sha256": row["sha256"],
+                "pixel_sha256": row["pixel_sha256"],
+                "origin_sample_key": row["origin_sample_key"],
+                "origin_record_id": row["origin_record_id"],
+                "review_version_id": row["review_version_id"],
             }
             for row in rows
         ]
@@ -237,8 +285,9 @@ def _insert_dataset(
     conn.executemany(
         """
         INSERT INTO dataset_samples
-            (id, dataset_id, split, stem, rgb_rel, x_rel, label_rel, width, height, boxes, class_ids, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, dataset_id, split, stem, rgb_rel, x_rel, label_rel, width, height, boxes,
+             class_ids, created_at, sha256, pixel_sha256, origin_sample_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -254,6 +303,9 @@ def _insert_dataset(
                 json.dumps(item["boxes"], ensure_ascii=False),
                 json.dumps(item["class_ids"], ensure_ascii=False),
                 now,
+                item.get("sha256"),
+                item.get("pixel_sha256"),
+                item.get("origin_sample_key"),
             )
             for item in scanned["samples"]
         ],
@@ -357,6 +409,10 @@ def _scan(raw: Path, *, secondary: str | None, classes: list[str] | None, projec
             width, height = _image_size(image_path)
             label_path = base / "labels" / split / f"{stem}.txt"
             boxes, class_ids = _read_label(label_path, len(names))
+            # 身份按真实字节 + 解码像素登记；同名/大小/时间都不参与判定。
+            from backend.services import identity as identity_service
+
+            identity = identity_service.identity_of_bytes(image_path.read_bytes())
             if not boxes:
                 background += 1
             x_path: Path | None = None
@@ -385,6 +441,9 @@ def _scan(raw: Path, *, secondary: str | None, classes: list[str] | None, projec
                     "height": height,
                     "boxes": boxes,
                     "class_ids": class_ids,
+                    "sha256": identity["sha256"],
+                    "pixel_sha256": identity["pixel_sha256"],
+                    "origin_sample_key": f"{split}/{image_path.name}",
                 }
             )
             if len(samples) > MAX_SAMPLES:
@@ -527,5 +586,7 @@ __all__ = [
     "get_owned",
     "list_for_project",
     "public",
+    "restore",
     "samples",
+    "soft_delete",
 ]

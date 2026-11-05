@@ -314,8 +314,16 @@ export interface DatasetSummary {
   sample_count: number
   split_counts: Record<string, number>
   status: string
+  deleted_at: string | null
   notes: string
   created_at: string
+  parent_dataset_id: string | null
+  kind: 'import' | 'revision' | 'new'
+  seed: number | null
+  split_strategy: string
+  manifest_rel: string | null
+  export_rel: string | null
+  export_url: string | null
 }
 
 export interface DatasetSample {
@@ -327,7 +335,12 @@ export interface DatasetSample {
   label_rel: string | null
   width: number
   height: number
-  boxes: number[][]
+  boxes: Record<string, unknown>[]
+  sha256?: string | null
+  pixel_sha256?: string | null
+  origin_sample_key?: string | null
+  origin_record_id?: string | null
+  review_version_id?: string | null
 }
 
 export interface ModelClass {
@@ -381,6 +394,8 @@ export interface DetectionRecord {
   project_id: string
   session_id: string | null
   job_id: string | null
+  flow_id: string | null
+  deleted_at: string | null
   model_id: string
   dataset_id: string | null
   status: 'running' | 'done' | 'failed' | 'paused'
@@ -400,6 +415,10 @@ export interface DetectionRecord {
   result_url: string | null
   request_key: string
   latest_review?: ReviewSummary | null
+  human_status?: 'pending' | 'draft' | 'confirmed' | 'rejected'
+  bucket?: string
+  draft?: ReviewVersion | null
+  review?: ReviewVersion | null
 }
 
 export interface RecordFiltersState {
@@ -454,4 +473,130 @@ export interface InspectionQueueItem {
   status: string
   created_at_local: string
   page: { name: string; params: Record<string, string>; query: Record<string, string> }
+}
+
+// --------------------------------------------------------------------- 人工复核 / 回流
+
+export interface ReviewVersion {
+  id: string
+  detection_id: string
+  version: number
+  status: 'draft' | 'confirmed' | 'rejected'
+  outcome: 'defect' | 'no_defect' | null
+  boxes: DetectionBox[]
+  class_table: { index: number; name: string }[]
+  image_width: number
+  image_height: number
+  model_id: string | null
+  dataset_id: string | null
+  note: string
+  reject_reason: string | null
+  created_at: string
+  updated_at: string
+  submitted_at: string | null
+}
+
+export interface ReviewClassOption {
+  index: number
+  name: string
+  native_class_id: number | null
+  native_class_name: string | null
+  source: 'dataset' | 'model'
+}
+
+export interface ReviewState {
+  record: DetectionRecord
+  ai_review?: ReviewSummary | null
+  human_status: 'pending' | 'draft' | 'confirmed' | 'rejected'
+  class_options: ReviewClassOption[]
+  versions: ReviewVersion[]
+  draft: ReviewVersion | null
+  latest: ReviewVersion | null
+  latest_submitted: ReviewVersion | null
+  latest_confirmed: ReviewVersion | null
+  latest_rejected: ReviewVersion | null
+  pending: boolean
+  queue: 'pending' | 'draft' | 'rejected' | 'confirmed'
+  image: {
+    width: number
+    height: number
+    rgb_url: string
+    x_url: string | null
+    x_modality: string | null
+    result_url: string | null
+  }
+}
+
+export interface FeedbackSummary {
+  id: string
+  detection_id: string
+  review_version_id: string
+  dataset_id: string | null
+  status: 'pending' | 'reflowed' | 'void'
+  note: string
+  created_at: string
+  reflowed_at: string | null
+  review: { version: number; outcome: string | null; box_count: number; image: { width: number; height: number } } | null
+}
+
+export interface DatasetReport {
+  dataset_id: string
+  sample_count: number
+  duplicate_groups: { identity: string; samples: { id: string; split: string; stem: string }[] }[]
+  cross_split_leakage: { identity: string; splits: string[]; stems: string[] }[]
+  annotation_conflicts: { identity: string; stems: string[]; variants: number }[]
+  identity_missing: number
+  identity_derived?: number
+  identity_problems?: { sample_id: string; split: string; stem: string; code: string; message: string }[]
+  identity_states?: Record<string, number>
+  note: string
+}
+
+export interface RecordMatch {
+  record_id: string
+  status: 'new' | 'unique' | 'ambiguous' | 'candidate' | 'missing'
+  identity?: { sha256: string; pixel_sha256: string; width: number; height: number }
+  matches: { sample_id: string; split: string; stem: string; matched_by?: string }[]
+  note?: string
+}
+
+export interface ReflowDraft {
+  id: string
+  name: string
+  mode: 'revision' | 'new'
+  parent_dataset_id: string | null
+  strategy: 'even' | 'ratio' | 'manual'
+  ratios: Record<string, number>
+  seed: number
+  selections: { record_id: string; action: string; split?: string; review_version_id?: string; target_sample_id?: string }[]
+  plan: ReflowPlan
+  status: 'editing' | 'ready' | 'failed' | 'finalized' | 'deleted'
+  error: { code: string; message: string } | null
+  dataset_id: string | null
+  created_at: string
+  updated_at: string
+  finalized_at: string | null
+  deleted_at: string | null
+}
+
+export interface ReflowPlan {
+  mode: 'revision' | 'new'
+  dataset_id: string | null
+  parent_dataset_id: string | null
+  counts: { replace: number; append: number; excluded: number; kept: number; conflicts: number }
+  items: {
+    record_id: string
+    action: string
+    split: string | null
+    stem: string | null
+    outcome: string | null
+    boxes: number
+    target_sample_id?: string | null
+    matches: { sample_id: string; split: string; stem: string }[]
+  }[]
+  conflicts: { record_id: string; code: string; message: string; matches?: { sample_id: string; split: string; stem: string }[] }[]
+  classes: string[]
+  splits?: Record<string, number>
+  note?: string
+  signature?: string
 }

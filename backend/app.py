@@ -37,6 +37,7 @@ from backend.routes.meta import bp as meta_bp  # noqa: E402
 from backend.routes.models import bp as models_bp  # noqa: E402
 from backend.routes.projects import bp as projects_bp  # noqa: E402
 from backend.routes.records import bp as records_bp  # noqa: E402
+from backend.routes.reviews import bp as reviews_bp  # noqa: E402
 from backend.routes.sessions import bp as sessions_bp  # noqa: E402
 from backend.services import aireview as aireview_service  # noqa: E402
 from backend.services import jobs as job_service  # noqa: E402
@@ -119,6 +120,7 @@ def create_app(
         datasets_bp,
         models_bp,
         records_bp,
+        reviews_bp,
         agent_bp,
     ):
         app.register_blueprint(blueprint, url_prefix="/api")

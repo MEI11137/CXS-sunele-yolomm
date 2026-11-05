@@ -274,6 +274,10 @@ def create_turn(session_id: str):
         (json.dumps({"source": "web", "request_id": request_id, "turn_id": turn["id"]}), message["id"]),
     )
     conn.commit()
+    # 用户发了新消息 = 新目标：上一条等待人工提交的接力作废，避免旧目标被再次唤醒。
+    from backend.services import followups as followup_service
+
+    followup_service.cancel_session(conn, str(session["id"]), "用户开始了新的目标")
     _runtime().runner.start(turn["id"])
     return ok(
         {
@@ -374,6 +378,10 @@ def stop_turn(turn_id: str):
     if turn["status"] in store.TERMINAL_STATUSES:
         return ok({"stopped": False, "already": True, "turn": store.turn_public(turn)})
     changed = store.request_stop(conn, turn["id"])
+    # 停止 = 撤销“继续动手”的资格：这条会话里等人工提交的接力也不能再自动开新轮。
+    from backend.services import followups as followup_service
+
+    followup_service.cancel_session(conn, str(turn["session_id"]), "用户停止了本轮任务")
     store.append_event(
         conn, turn["id"], turn["session_id"], "notice",
         {"level": "info", "message": "已请求停止，等待引擎确认实际状态…"},

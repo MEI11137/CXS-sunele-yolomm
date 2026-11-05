@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import secrets
@@ -105,8 +106,12 @@ class StubProvider:
 
 
 class BusinessBase(unittest.TestCase):
+    # 需要真实轮次的应用级集成（人工提交后的会话接力）把它打开，用假引擎跑；
+    # 其余业务用例保持默认，不启动引擎进程。
+    fake_engine = False
+
     def setUp(self):
-        self.harness = Harness()
+        self.harness = Harness(fake_engine=self.fake_engine)
         self.alice = self.harness.create_user("alice", role="admin")
         self.root = self.harness.make_dir("alice-root")
         self.root_row = self.harness.add_root(self.root, grant_to=["alice"])
@@ -182,7 +187,9 @@ class BusinessBase(unittest.TestCase):
     def make_model(self, *, mode: str = "single", secondary: str | None = None) -> dict:
         weight = self.root / "weights" / "best.pt"
         weight.parent.mkdir(parents=True, exist_ok=True)
-        weight.write_bytes(b"not-a-real-weight")  # 只在被“加载”时才需要是真权重
+        payload = b"not-a-real-weight"  # 只在被“加载”时才需要是真权重
+        weight.write_bytes(payload)
+        weight_sha = hashlib.sha256(payload).hexdigest()
         conn = self.conn()
         try:
             model_id = f"mdl_{secrets.token_hex(8)}"
@@ -204,7 +211,7 @@ class BusinessBase(unittest.TestCase):
                     "single" if mode == "single" else "multimodal",
                     secondary,
                     "weights/best.pt",
-                    "sha-not-checked-in-fixture",
+                    weight_sha,
                     json.dumps(classes, ensure_ascii=False),
                     json.dumps({"0": 0, "1": 1}),
                     "2026-11-05T00:00:00Z",
@@ -422,6 +429,67 @@ class DetectionTest(BusinessBase):
         vision_runtime._DETECTOR_FACTORY = lambda path, mode: FakeDetector()
         self.detector_calls = calls
         return calls
+
+    def test_target_dataset_class_names_follow_mapping(self):
+        """非恒等映射：展示名必须来自目标数据集，并保留 native 追溯。"""
+        boxes = np.array([[3.0, 4.0, 20.0, 24.0, 0.9, 0], [30.0, 10.0, 50.0, 30.0, 0.5, 1]])
+        self._install(boxes)
+        model = self.make_model()
+        conn = self.conn()
+        try:
+            dataset_id = f"dst_{secrets.token_hex(8)}"
+            conn.execute(
+                "INSERT INTO datasets (id, project_id, owner_id, name, modalities, classes, root_rel,"
+                " source, status, created_at) VALUES (?, ?, ?, '中文类别集', ?, ?,"
+                " 'datasets/x', 'local', 'ready', '2026-11-05T00:00:00Z')",
+                (
+                    dataset_id,
+                    self.project["id"],
+                    int(self.alice["id"]),
+                    json.dumps(["rgb"]),
+                    json.dumps(["鸟粪污渍", "裂纹"], ensure_ascii=False),
+                ),
+            )
+            conn.execute(
+                "UPDATE models SET dataset_id = ?, classes = ?, class_map = ? WHERE id = ?",
+                (
+                    dataset_id,
+                    json.dumps(
+                        [
+                            {"index": 0, "name": "single_hotspot"},
+                            {"index": 1, "name": "large_area_hotspot"},
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    json.dumps({"0": 1, "1": 0}),
+                    model["id"],
+                ),
+            )
+            conn.commit()
+            refreshed = dict(
+                conn.execute("SELECT * FROM models WHERE id = ?", (model["id"],)).fetchone()
+            )
+        finally:
+            conn.close()
+
+        rgb = self.upload_asset(png_bytes(), "rgb.png", role="rgb")
+        record = self.detect(refreshed, rgb["id"], key="mapping-1")
+        self.assertEqual(record["status"], "done", record)
+        first, second = record["boxes"]
+        self.assertEqual((first["native_class_id"], first["native_class_name"]), (0, "single_hotspot"))
+        self.assertEqual((first["class_id"], first["class_name"]), (1, "裂纹"))
+        self.assertEqual((second["class_id"], second["class_name"]), (0, "鸟粪污渍"))
+        self.assertEqual(record["class_summary"], {"裂纹": 1, "鸟粪污渍": 1})
+
+        conn = self.conn()
+        try:
+            page = detection_service.list_for_project(
+                conn, self.alice["id"], self.project["id"], limit=5
+            )
+        finally:
+            conn.close()
+        self.assertEqual(page["records"][0]["boxes"][0]["class_name"], "裂纹")
+        self.assertEqual(page["records"][0]["class_summary"].get("裂纹"), 1)
 
     def test_ndarray_and_torch_boxes_normalise_the_same(self):
         try:
@@ -1156,6 +1224,54 @@ class StorageGuardTest(unittest.TestCase):
             conn.close()
         ids = {row["id"] for row in page["assets"] + following["assets"]}
         self.assertEqual(ids, {first["id"], second["id"]})
+
+    def test_unreviewed_symbol_is_not_imported(self) -> None:
+        """未审核符号必须“连 import 都不发生”，不是 import 之后再拒绝。"""
+        try:
+            import torch
+        except Exception:  # pragma: no cover
+            self.skipTest("本机没有 torch")
+        import sys
+        import zipfile
+
+        from backend.vision import safe_weight
+
+        sandbox = self.h.make_dir("import-probe")
+        package = f"hx17_probe_{secrets.token_hex(4)}"
+        marker_file = sandbox / "imported.txt"
+        pkg_dir = sandbox / package
+        pkg_dir.mkdir()
+        (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+        (pkg_dir / "evil.py").write_text(
+            "from pathlib import Path\n"
+            f"Path({str(marker_file)!r}).write_text('imported')\n"
+            "class Probe://n    pass\n",
+            encoding="utf-8",
+        )
+
+        base = sandbox / "base.pt"
+        torch.save({"model": 1}, base)
+        crafted = sandbox / "crafted.pt"
+        payload = b"\x80\x02c" + f"{package}.evil\nProbe\n".encode("utf-8") + b")R."
+        with zipfile.ZipFile(base) as source:
+            entries = {name: source.read(name) for name in source.namelist()}
+        target = next(name for name in entries if name.endswith("data.pkl"))
+        entries[target] = payload
+        with zipfile.ZipFile(crafted, "w") as output:
+            for name, blob in entries.items():
+                output.writestr(name, blob)
+
+        sys.path.insert(0, str(sandbox))
+        try:
+            with self.assertRaises(vision_runtime.VisionError) as ctx:
+                vision_runtime.inspect_weight(crafted)
+        finally:
+            sys.path.remove(str(sandbox))
+        self.assertEqual(ctx.exception.code, "VISION_WEIGHT_UNTRUSTED")
+        self.assertIn("ALLOWED_SYMBOLS", ctx.exception.message)
+        self.assertFalse(marker_file.exists(), "未审核符号的模块不能被执行/导入")
+        self.assertNotIn(f"{package}.evil", sys.modules)
+        self.assertTrue(safe_weight.ALLOWED_SYMBOLS)
 
     def test_untrusted_weight_is_rejected_without_running_pickle(self) -> None:
         try:

@@ -135,7 +135,12 @@ export const useBusinessStore = defineStore('business', () => {
 
   async function loadRecords(
     projectId: string,
-    params: Partial<RecordFiltersState> & { session_id?: string; before?: string; limit?: number } = {},
+    params: Partial<RecordFiltersState> & {
+      session_id?: string
+      before?: string
+      limit?: number
+      deleted?: string
+    } = {},
     silent = false,
   ): Promise<void> {
     if (!silent) loading.value = true
@@ -149,10 +154,10 @@ export const useBusinessStore = defineStore('business', () => {
     }
   }
 
-  async function loadDatasets(projectId: string): Promise<void> {
+  async function loadDatasets(projectId: string, deleted = 'exclude'): Promise<void> {
     loading.value = true
     try {
-      datasets[projectId] = (await api.listDatasets(projectId)).datasets
+      datasets[projectId] = (await api.listDatasets(projectId, deleted)).datasets
     } catch (failure) {
       error.value = errorMessage(failure)
     } finally {

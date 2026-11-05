@@ -496,9 +496,9 @@ class CapabilitiesTest(unittest.TestCase):
 
     def test_services_report_not_available(self):
         data = body(api(self.client, "GET", "/api/agent/capabilities"))["data"]
-        # WB17-03 已接入的服务必须如实报告为可用。
-        for name in ("detection", "ai_review", "datasets", "models"):
+        # 已接入的服务必须如实报告为可用（WB17-03 检测/核查，WB17-04 复核/反馈/回流）。
+        for name in ("detection", "ai_review", "datasets", "models", "review", "feedback", "reflow"):
             self.assertTrue(data["services"][name]["available"], name)
         # 还没接入的一律保持不可用，不能“先声明后实现”。
-        for name in ("review", "feedback", "training"):
+        for name in ("training",):
             self.assertFalse(data["services"][name]["available"], name)

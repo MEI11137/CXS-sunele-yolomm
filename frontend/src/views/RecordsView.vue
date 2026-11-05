@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import * as api from '@/api/business'
+import { errorMessage } from '@/api/http'
 import { useBusinessStore } from '@/stores/business'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { recordStatusLabel, recordsSummary, reviewLine, verdictLabel } from '@/lib/business'
@@ -28,6 +30,7 @@ const filters = computed<RecordFiltersState>(() => business.filtersFor(projectId
 const models = computed(() => business.models[projectId.value] ?? [])
 const selected = ref<string[]>([])
 const openRecordId = ref('')
+const showDeleted = ref(false)
 const openRecord = computed(() => records.value.find((item) => item.id === openRecordId.value) ?? null)
 
 const appliedBounds = computed(() => {
@@ -41,8 +44,12 @@ const appliedBounds = computed(() => {
 
 onMounted(async () => {
   if (!business.models[projectId.value]) await business.loadModels(projectId.value)
-  await business.loadRecords(projectId.value, { ...filters.value })
+  await business.loadRecords(projectId.value, { ...filters.value, deleted: deletedParam() })
 })
+
+function deletedParam(): string {
+  return showDeleted.value ? 'only' : 'exclude'
+}
 
 // 进入页面时如果 URL 带了 record 参数（助手给的队列定位），直接打开那一条。
 watch(
@@ -60,14 +67,14 @@ watch(
 
 async function reload(): Promise<void> {
   selected.value = []
-  await business.loadRecords(projectId.value, { ...filters.value })
+  await business.loadRecords(projectId.value, { ...filters.value, deleted: deletedParam() })
 }
 
 async function loadMore(): Promise<void> {
   const cursor = page.value?.next_before
   if (!cursor) return
   const previous = records.value
-  await business.loadRecords(projectId.value, { ...filters.value, before: cursor })
+  await business.loadRecords(projectId.value, { ...filters.value, before: cursor, deleted: deletedParam() })
   const incoming = business.records[projectId.value]?.records ?? []
   const seen = new Set(previous.map((item) => item.id))
   business.records[projectId.value] = {
@@ -89,6 +96,57 @@ function toggleAll(): void {
 
 async function reviewOne(record: DetectionRecord): Promise<void> {
   await business.reviewSelected(projectId.value, [record.id])
+}
+
+function openReview(record: DetectionRecord): void {
+  void router.push({ name: 'review', params: { projectId: projectId.value, recordId: record.id } })
+}
+
+async function addFeedbackOne(record: DetectionRecord): Promise<void> {
+  try {
+    const data = await api.addFeedback(projectId.value, record.id)
+    business.notice = data.created ? '已加入反馈池' : '这个复核版本已在反馈池里'
+  } catch (failure) {
+    business.error = errorMessage(failure)
+  }
+}
+
+async function feedbackChecked(): Promise<void> {
+  let ok = 0
+  for (const id of selected.value) {
+    try {
+      await api.addFeedback(projectId.value, id)
+      ok += 1
+    } catch (failure) {
+      business.error = `${id}：${errorMessage(failure)}`
+    }
+  }
+  business.notice = `已加入反馈 ${ok}/${selected.value.length} 条`
+}
+
+async function deleteChecked(): Promise<void> {
+  try {
+    const data = await api.deleteRecords(projectId.value, [...selected.value])
+    business.notice = `已删除 ${data.deleted} 条（软删除，文件保留）`
+    await reload()
+  } catch (failure) {
+    business.error = errorMessage(failure)
+  }
+}
+
+async function restoreChecked(): Promise<void> {
+  try {
+    const data = await api.restoreRecords(projectId.value, [...selected.value])
+    business.notice = `已恢复 ${data.restored} 条`
+    await reload()
+  } catch (failure) {
+    business.error = errorMessage(failure)
+  }
+}
+
+async function toggleDeleted(): Promise<void> {
+  showDeleted.value = !showDeleted.value
+  await reload()
 }
 
 async function reviewChecked(): Promise<void> {
@@ -125,6 +183,18 @@ watch(records, (list) => {
       <div class="header-actions">
         <button class="ghost small" type="button" :disabled="business.loading" @click="reload">
           刷新
+        </button>
+        <button class="ghost small" type="button" :disabled="!selected.length" @click="feedbackChecked">
+          加入反馈（{{ selected.length }}）
+        </button>
+        <button class="ghost small" type="button" :disabled="!selected.length" @click="deleteChecked">
+          删除所选
+        </button>
+        <button class="ghost small" type="button" :disabled="!selected.length" @click="restoreChecked">
+          恢复所选
+        </button>
+        <button class="ghost small" type="button" @click="toggleDeleted">
+          {{ showDeleted ? '只看在用' : '看已删除' }}
         </button>
         <button
           class="primary small"
@@ -247,6 +317,8 @@ watch(records, (list) => {
             </td>
             <td class="row-actions">
               <button class="ghost small" type="button" @click="openRecordId = record.id">详情</button>
+              <button class="ghost small" type="button" @click="openReview(record)">人工复核</button>
+              <button class="ghost small" type="button" @click="addFeedbackOne(record)">加入反馈</button>
               <button
                 class="ghost small"
                 type="button"

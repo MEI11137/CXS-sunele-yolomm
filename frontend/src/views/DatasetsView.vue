@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import * as api from '@/api/business'
 import { errorMessage } from '@/api/http'
 import { formatBytes } from '@/lib/business'
 import { useBusinessStore } from '@/stores/business'
-import type { DatasetSample, DatasetSummary } from '@/types'
+import type { DatasetSample, DatasetSummary, ReflowDraft } from '@/types'
 
 /**
  * 数据集页：导入（目录 / 上传的 ZIP）+ 查看每个划分的真实样本。
@@ -15,6 +15,7 @@ import type { DatasetSample, DatasetSummary } from '@/types'
  */
 
 const route = useRoute()
+const router = useRouter()
 const business = useBusinessStore()
 
 const projectId = computed(() => String(route.params.projectId ?? ''))
@@ -39,12 +40,69 @@ const active = computed<DatasetSummary | null>(
 )
 const samples = ref<DatasetSample[]>([])
 const sampleSplit = ref('')
+const showDeleted = ref(false)
+const drafts = ref<ReflowDraft[]>([])
+const showDraftTrash = ref(false)
+
+async function reloadDatasets(): Promise<void> {
+  await business.loadDatasets(projectId.value, showDeleted.value ? 'only' : 'exclude')
+  drafts.value = (await api.listReflowDrafts(projectId.value, showDraftTrash.value)).drafts
+}
 
 onMounted(async () => {
-  await business.loadDatasets(projectId.value)
+  await reloadDatasets()
   await loadArchives()
   await refreshCandidates()
 })
+
+async function toggleDeleted(): Promise<void> {
+  showDeleted.value = !showDeleted.value
+  await reloadDatasets()
+}
+
+async function resplit(datasetId: string): Promise<void> {
+  try {
+    const data = await api.resplitDataset(projectId.value, datasetId, {
+      strategy: 'even',
+      seed: 7,
+      request_key: `resplit:${datasetId}:${Date.now()}`,
+    })
+    business.notice = `已生成重新划分版本：${data.dataset.name}`
+    await reloadDatasets()
+  } catch (failure) {
+    business.error = errorMessage(failure)
+  }
+}
+
+async function removeDataset(datasetId: string): Promise<void> {
+  await api.deleteDataset(projectId.value, datasetId)
+  await reloadDatasets()
+}
+
+async function restoreDataset(datasetId: string): Promise<void> {
+  await api.restoreDataset(projectId.value, datasetId)
+  await reloadDatasets()
+}
+
+async function finalizeDraft(draftId: string): Promise<void> {
+  try {
+    const data = await api.finalizeReflowDraft(projectId.value, draftId)
+    business.notice = data.note || `已定稿：${data.dataset.name}`
+    await reloadDatasets()
+  } catch (failure) {
+    business.error = errorMessage(failure)
+  }
+}
+
+async function removeDraft(draftId: string): Promise<void> {
+  await api.deleteReflowDraft(projectId.value, draftId)
+  await reloadDatasets()
+}
+
+async function restoreDraft(draftId: string): Promise<void> {
+  await api.restoreReflowDraft(projectId.value, draftId)
+  await reloadDatasets()
+}
 
 async function loadArchives(): Promise<void> {
   try {
@@ -109,7 +167,7 @@ async function submit(): Promise<void> {
   if (ok) {
     form.value.name = ''
     form.value.classes = ''
-    await business.loadDatasets(projectId.value)
+    await reloadDatasets()
   }
 }
 
@@ -150,9 +208,10 @@ watch(sampleSplit, () => void loadSamples())
         </p>
       </div>
       <div class="header-actions">
-        <button class="ghost small" type="button" @click="business.loadDatasets(projectId)">
-          刷新
+        <button class="ghost small" type="button" @click="toggleDeleted">
+          {{ showDeleted ? '看正式数据集' : '看回收站' }}
         </button>
+        <button class="ghost small" type="button" @click="reloadDatasets">刷新</button>
       </div>
     </header>
 
@@ -173,16 +232,67 @@ watch(sampleSplit, () => void loadSamples())
           <span class="mono">
             {{ Object.entries(dataset.split_counts).map(([key, value]) => `${key}:${value}`).join(' ') }}
           </span>
-          <span>来源</span><span>{{ dataset.source === 'local' ? '项目目录' : '上传压缩包' }}</span>
+          <span>来源</span>
+          <span>
+            {{ dataset.kind === 'revision' ? '回原修订' : dataset.kind === 'new' ? '另建数据集' : dataset.source === 'local' ? '项目目录' : '上传压缩包' }}
+          </span>
+          <span>版本</span><span class="mono">{{ dataset.kind }}</span>
         </div>
         <p v-if="dataset.notes" class="hint">{{ dataset.notes }}</p>
         <div class="card-actions">
           <button class="ghost small" type="button" @click="openDetail(dataset)">查看样本</button>
+          <a
+            v-if="dataset.export_url"
+            class="button ghost small"
+            :href="api.datasetExportUrl(dataset.project_id, dataset.id)"
+            download
+          >导出 ZIP</a>
+          <button v-if="!showDeleted" class="ghost small" type="button" @click="resplit(dataset.id)">重新划分</button>
+          <button v-if="!showDeleted" class="ghost small" type="button" @click="removeDataset(dataset.id)">移到回收站</button>
+          <button v-else class="ghost small" type="button" @click="restoreDataset(dataset.id)">恢复</button>
         </div>
       </article>
       <p v-if="!datasets.length" class="empty-hint">
-        还没有数据集。可以把一个含 data.yaml 的 YOLO 目录导入，或上传打包好的 ZIP。
+        {{ showDeleted ? '回收站里没有数据集。' : '还没有数据集。可以导入 YOLO 目录，或从「数据回流」定稿一个草稿。' }}
       </p>
+    </div>
+
+    <div class="card">
+      <p class="card-head">
+        待整理草稿
+        <button class="link small" type="button" @click="showDraftTrash = !showDraftTrash; reloadDatasets()">
+          {{ showDraftTrash ? '看在用草稿' : '看草稿回收站' }}
+        </button>
+      </p>
+      <p class="hint">草稿只保存计划；点「定稿」才会生成目录、标签、清单与 ZIP。</p>
+      <table v-if="drafts.length" class="table">
+        <thead><tr><th>名称</th><th>方式</th><th>状态</th><th>冲突</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr v-for="draft in drafts" :key="draft.id">
+            <td>{{ draft.name }}</td>
+            <td>{{ draft.mode === 'revision' ? '回原修订' : '另建数据集' }}</td>
+            <td>{{ draft.status }}<span v-if="draft.error" class="form-error"> · {{ draft.error.code }}</span></td>
+            <td>{{ draft.plan?.counts?.conflicts ?? 0 }}</td>
+            <td class="inline-form">
+              <button
+                v-if="draft.status === 'ready'"
+                class="primary small"
+                type="button"
+                @click="finalizeDraft(draft.id)"
+              >定稿</button>
+              <button
+                v-if="draft.status === 'failed' || draft.status === 'editing'"
+                class="ghost small"
+                type="button"
+                @click="router.push({ name: 'reflow', params: { projectId } })"
+              >去修改</button>
+              <button v-if="draft.status !== 'deleted'" class="ghost small" type="button" @click="removeDraft(draft.id)">删除</button>
+              <button v-else class="ghost small" type="button" @click="restoreDraft(draft.id)">恢复</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-else class="empty-hint">这里没有草稿。到「数据回流」预览并保存一份。</p>
     </div>
 
     <div class="card">
