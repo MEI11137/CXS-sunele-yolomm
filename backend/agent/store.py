@@ -32,6 +32,14 @@ EVENT_LIMIT = 500
 # --------------------------------------------------------------------------- 轮次
 
 
+def _json_list(raw: object) -> list:
+    try:
+        value = json.loads(str(raw or "[]"))
+    except ValueError:
+        return []
+    return value if isinstance(value, list) else []
+
+
 def turn_public(row: sqlite3.Row | dict) -> dict:
     data = dict(row)
     return {
@@ -50,6 +58,7 @@ def turn_public(row: sqlite3.Row | dict) -> dict:
         "finished_at": data.get("finished_at"),
         "created_at": data["created_at"],
         "updated_at": data["updated_at"],
+        "attachments": _json_list(data.get("attachment_ids")),
     }
 
 
@@ -87,6 +96,7 @@ def create(
     model: str,
     fingerprint: str,
     kind: str = "user",
+    attachments: list[str] | None = None,
 ) -> tuple[sqlite3.Row, bool]:
     """幂等创建：同一 (session, request_id) 只存在一轮。返回 (row, created)。"""
     existing = by_request(conn, session_id, request_id)
@@ -98,9 +108,9 @@ def create(
         conn.execute(
             """
             INSERT INTO turns (id, session_id, project_id, owner_id, request_id, kind, mode,
-                               provider, model, connection_fingerprint, status,
+                               provider, model, connection_fingerprint, attachment_ids, status,
                                created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
             """,
             (
                 turn_id,
@@ -113,6 +123,7 @@ def create(
                 provider,
                 model,
                 fingerprint,
+                json.dumps([str(item) for item in (attachments or [])], ensure_ascii=False),
                 now,
                 now,
             ),

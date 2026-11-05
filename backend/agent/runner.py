@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import threading
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from backend import db
+from backend.errors import ApiError
 from backend.agent import engine as engine_module
 from backend.agent import identity, policy, prompt, store
 
@@ -36,6 +38,9 @@ MAX_ASSISTANT_CHARS = 40000
 # 失败一次就换重试，最终拿不到确定答案时必须让本轮失败，绝不能当成空历史继续。
 BASELINE_READ_ATTEMPTS = 3
 BASELINE_READ_BACKOFF = 0.25
+# 这几类失效的**真实范围是项目**（项目被删、目录绑定解除、目录授权被收回）：
+# 命中时同项目其他会话的引擎也一起隔离；会话级/连接级失效只影响本会话这一台。
+PROJECT_SCOPE_CODES = frozenset({"PROJECT_CLOSED", "GRANT_REVOKED", "NO_PROJECT_ROOT"})
 
 _ABORTED = "MessageAbortedError"
 
@@ -160,6 +165,14 @@ class TurnRunner:
                 return
 
             actor = self._actor(conn, turn, project, connection, model, root, fingerprint)
+            # 附件要在发 prompt **之前**按真实内容准备好：图片必须带真实字节（data URI），
+            # 只给路径等于让模型“猜图”。模型没有经过验证的视觉能力时宁可不发这一轮，
+            # 也不能把图片塞给一个纯文本模型。
+            try:
+                attachments = self._attachments(conn, turn, model)
+            except ApiError as exc:
+                self._fail(conn, turn, exc.code, exc.msg)
+                return
             try:
                 engine_session, recreated = self._prepare_engine_session(
                     conn, instance, session, fingerprint
@@ -188,6 +201,7 @@ class TurnRunner:
                     text=prompt_text,
                     system=prompt.build(actor),
                     model=model,
+                    attachments=attachments,
                 )
             except engine_module.EngineUnavailable as exc:
                 self._fail(conn, turn, exc.code, self._engine_message(exc))
@@ -409,6 +423,51 @@ class TurnRunner:
             "缺少的信息可以重新只读确认一次。\n\n"
         )
 
+    def _attachments(self, conn, turn, model: str) -> list[dict]:
+        """把本轮带的图片资产变成引擎可用的 file part（真实字节，不是路径）。
+
+        * 归属与项目边界由资产服务按当前用户重新校验（不信任前端传来的路径）；
+        * SHA 与登记时不一致直接报错，不把换过的文件当原图发出去；
+        * 只有当前模型有正向视觉证据时才允许发图，否则如实失败。
+        """
+        try:
+            ids = json.loads(turn["attachment_ids"] or "[]")
+        except (ValueError, TypeError, KeyError):
+            ids = []
+        if not isinstance(ids, list) or not ids:
+            return []
+        from backend.services import assets as asset_service
+
+        owner_id = int(turn["owner_id"])
+        project_id = str(turn["project_id"])
+        if not identity.verified_vision(conn, owner_id, model):
+            raise ApiError(
+                409,
+                "VISION_UNVERIFIED",
+                f"当前模型（{model}）没有通过图像能力验证，不能发送图片；"
+                "请先在设置页检查连接，或去掉附件后重发",
+            )
+        parts: list[dict] = []
+        for asset_id in ids:
+            try:
+                row, data = asset_service.read_bytes(conn, owner_id, project_id, str(asset_id))
+            except ApiError as exc:
+                raise ApiError(
+                    exc.status, exc.code, f"附件不可用：{exc.msg}"
+                ) from None
+            if str(row["kind"]) != "image":
+                raise ApiError(409, "NOT_AN_IMAGE", "附件里只有图片可以发给模型")
+            encoded = base64.b64encode(data).decode("ascii")
+            parts.append(
+                {
+                    "type": "file",
+                    "mime": str(row["mime"]),
+                    "filename": str(row["filename"]),
+                    "url": f"data:{row['mime']};base64,{encoded}",
+                }
+            )
+        return parts
+
     def _prompt_text(self, conn, turn) -> str:
         if turn["kind"] == "continuation":
             row = conn.execute(
@@ -473,6 +532,13 @@ class TurnRunner:
                 if reason is not None:
                     code, message = reason
                     self._abort_and_settle(instance, engine_session)
+                    if code in PROJECT_SCOPE_CODES:
+                        # 项目没了/目录授权被收回：这是**项目级**失效，同项目其他会话的引擎
+                        # 也一起隔离（包括本会话这台——它的工具令牌也绑定在被收回的目录上，
+                        # 留着只会在下一轮以失效身份继续跑）。存储保留，授权恢复后历史还在。
+                        self._manager.quarantine_project(
+                            int(turn["owner_id"]), str(turn["project_id"])
+                        )
                     self._fail(conn, turn, code, message)
                     return
 
@@ -509,12 +575,17 @@ class TurnRunner:
             except engine_module.EngineUnavailable:
                 engine_errors += 1
                 if engine_errors >= MAX_ENGINE_ERRORS:
-                    self._manager.stop_project(int(turn["owner_id"]), str(turn["project_id"]))
+                    # 读不到消息只说明**这一台**引擎/这一个会话不可用：
+                    # 同一项目的其他会话是独立进程、独立存储，没有理由跟着一起死。
+                    # 这里只隔离本会话这台引擎（保留私有存储，历史还能接着用），
+                    # 项目级失效（删项目/撤目录授权）由 _context_invalid 判定后整项目处理。
+                    self._manager.quarantine(instance)
                     self._fail(
                         conn,
                         turn,
                         "ENGINE_LOST",
-                        "引擎进程失去响应，本轮已终止；已完成的工具结果保留，可重新发送",
+                        "本会话的引擎进程失去响应，本轮已终止；已完成的工具结果保留，可重新发送。"
+                        "同项目的其他会话不受影响。",
                     )
                     return
                 time.sleep(1.0)

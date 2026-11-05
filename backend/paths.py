@@ -24,6 +24,36 @@ from backend.errors import ApiError
 _DRIVE_RELATIVE = re.compile(r"^[A-Za-z]:(?![\\/])")
 _DEVICE_PREFIXES = ("\\\\.\\", "\\\\?\\", "//./", "//?/")
 
+# 服务端私有根：数据库、密钥、引擎运行目录与日志。
+# 业务文件服务（storage）与 Agent 文件工具（fsops）共用这一份列表，
+# 避免出现“工具挡住了、业务接口又能写进去”的双重标准。
+_PRIVATE_ROOTS: list[Path] = []
+
+
+def configure_private(roots) -> None:
+    """登记服务端私有目录；命中即拒绝，与目录授权范围无关。"""
+    resolved: list[Path] = []
+    for item in roots or []:
+        if not item:
+            continue
+        try:
+            resolved.append(Path(os.path.realpath(str(item))))
+        except OSError:
+            continue
+    _PRIVATE_ROOTS[:] = resolved
+
+
+def private_roots() -> list[Path]:
+    return list(_PRIVATE_ROOTS)
+
+
+def is_private(path: str | os.PathLike[str]) -> bool:
+    """真实路径是否落在任一私有根内（符号链接/联接按真实落点判断）。"""
+    if not _PRIVATE_ROOTS:
+        return False
+    real = Path(os.path.realpath(str(path)))
+    return any(is_within(real, root) for root in _PRIVATE_ROOTS)
+
 
 def clean_input(raw: str | os.PathLike[str] | None) -> str:
     text = str(raw if raw is not None else "").strip()

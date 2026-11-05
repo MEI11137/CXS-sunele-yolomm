@@ -1500,3 +1500,88 @@ button:disabled {
     min-height: 460px;
   }
 }
+
+/* ---------------- 业务（WB17-03） ---------------- */
+
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 4px 0;
+}
+
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px 3px 3px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 12px;
+  background: var(--panel);
+}
+
+.attachment-chip img {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.assistant.dragging {
+  outline: 2px dashed var(--accent);
+  outline-offset: -6px;
+}
+
+.business-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0;
+}
+
+.business-cards-title {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.business-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px 10px;
+  background: var(--panel);
+}
+
+.business-card summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 12.5px;
+  list-style: none;
+}
+
+.business-card summary::-webkit-details-marker {
+  display: none;
+}
+
+.business-summary {
+  color: var(--text-secondary);
+}
+
+.business-items {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+}
+
+.business-links {
+  margin-top: 2px;
+  border-top: 1px dashed var(--border);
+  padding-top: 4px;
+}

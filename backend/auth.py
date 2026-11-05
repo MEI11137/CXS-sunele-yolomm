@@ -22,6 +22,9 @@ from backend.errors import ApiError, forbidden, unauthorized
 SESSION_COOKIE = "hx17_session"
 CSRF_COOKIE = "hx17_csrf"
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+# 只有这一个已鉴权路由接受 multipart（文件上传）；其它写接口仍然必须是 JSON。
+# 用 endpoint（蓝图.视图）而不是路径前缀，避免以后新增路由被顺带放宽。
+MULTIPART_ENDPOINTS = {"assets.upload_asset"}
 
 
 def _settings():
@@ -180,8 +183,11 @@ def _same_origin(origin: str) -> bool:
 
 def _guard_state_changing() -> None:
     # 只收 JSON：简单的跨站表单无法伪造 Content-Type，天然挡掉一类 CSRF。
+    # 文件上传是唯一例外，且仍然要过后面的 CSRF 双提交与 Origin 校验。
     if request.content_length and not request.is_json:
-        raise ApiError(415, "UNSUPPORTED_MEDIA_TYPE", "请求体必须是 application/json")
+        allowed = request.mimetype == "multipart/form-data" and request.endpoint in MULTIPART_ENDPOINTS
+        if not allowed:
+            raise ApiError(415, "UNSUPPORTED_MEDIA_TYPE", "请求体必须是 application/json")
 
     if request.cookies.get(SESSION_COOKIE):
         expected = request.cookies.get(CSRF_COOKIE) or ""

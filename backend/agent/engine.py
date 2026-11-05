@@ -276,6 +276,24 @@ class EngineManager:
             same_storage = self.storage_key(candidate.spec) == self.storage_key(spec)
             self._dispose(candidate, remove_dir=not same_storage)
 
+    def quarantine_project(self, user_id: int, project_id: str) -> int:
+        """隔离一个项目内的所有引擎（项目级失效：删项目、目录绑定解除、授权被收回）。
+
+        只用于**整个项目**都失效的场景；单个会话的引擎故障必须走 :meth:`quarantine`，
+        否则会把同项目里正常工作的其它会话一起打断。存储一律保留：撤权恢复后历史还在。
+        """
+        with self._lock:
+            targets = [
+                item
+                for item in list(self._instances.values())
+                if item.spec.user_id == int(user_id)
+                and item.spec.project_id == str(project_id)
+            ]
+            for item in targets:
+                self._instances.pop(item.spec.key(), None)
+                self._dispose(item, remove_dir=False)
+            return len(targets)
+
     def stop_user(self, user_id: int) -> int:
         with self._lock:
             targets = [item for item in self._instances.values() if item.spec.user_id == int(user_id)]
@@ -628,14 +646,30 @@ class EngineManager:
         return session_id
 
     def prompt_async(
-        self, instance: EngineInstance, session_id: str, *, text: str, system: str, model: str
+        self,
+        instance: EngineInstance,
+        session_id: str,
+        *,
+        text: str,
+        system: str,
+        model: str,
+        attachments: list[dict] | None = None,
     ) -> None:
+        """下发一轮 prompt。
+
+        ``attachments`` 是**已经校验过的**图片 part（真实字节的 data URI），
+        由调用方（运行器）按资产归属与视觉能力检查后构造；这里不再做二次判断，
+        但也不会接受文件路径当图片——引擎需要的是内容本身。
+        """
+        parts: list[dict] = [{"type": "text", "text": text}]
+        for item in attachments or []:
+            parts.append(dict(item))
         self._request(
             instance,
             "POST",
             f"/session/{session_id}/prompt_async",
             json_body={
-                "parts": [{"type": "text", "text": text}],
+                "parts": parts,
                 "model": {"providerID": "hx17", "modelID": model},
                 "system": system,
             },

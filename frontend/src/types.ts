@@ -278,3 +278,180 @@ export interface SessionTurns {
   active: Turn | null
   actions: AgentAction[]
 }
+
+// --------------------------------------------------------------------- 业务（WB17-03）
+// 字段与后端 public() 一一对应：不猜、不补后端没有的字段。
+
+export interface AssetSummary {
+  id: string
+  project_id: string
+  kind: 'image' | 'archive' | 'weight' | 'document'
+  role: string | null
+  origin: string
+  filename: string
+  mime: string
+  size: number
+  sha256: string
+  width: number | null
+  height: number | null
+  source_path: string | null
+  parent_id: string | null
+  created_at: string
+  /** 上传时所在会话（用于追溯“这张图是哪次对话带来的”） */
+  meta: Record<string, unknown>
+  url: string
+}
+
+export interface DatasetSummary {
+  id: string
+  project_id: string
+  name: string
+  modalities: string[]
+  secondary_modality: string | null
+  classes: string[]
+  root_rel: string
+  source: string
+  sample_count: number
+  split_counts: Record<string, number>
+  status: string
+  notes: string
+  created_at: string
+}
+
+export interface DatasetSample {
+  id: string
+  split: string
+  stem: string
+  rgb_rel: string
+  x_rel: string | null
+  label_rel: string | null
+  width: number
+  height: number
+  boxes: number[][]
+}
+
+export interface ModelClass {
+  index: number
+  name: string
+}
+
+export interface ModelSummary {
+  id: string
+  project_id: string
+  name: string
+  family: string
+  model_mode: 'single' | 'multimodal'
+  secondary_modality: string | null
+  dataset_id: string | null
+  weight_sha256: string
+  weight_size: number
+  classes: ModelClass[]
+  class_map: Record<string, number>
+  status: 'imported' | 'published' | 'archived'
+  published_at: string | null
+  notes: string
+  created_at: string
+}
+
+export interface ReviewSummary {
+  id: string
+  detection_id: string
+  status: 'running' | 'done' | 'failed' | 'interrupted'
+  verdict: string | null
+  confidence: number | null
+  summary: string
+  findings: { items?: { kind: string; note: string }[] }
+  model: string
+  provider: string
+  created_at: string
+  finished_at: string | null
+  error: { code: string; message: string } | null
+}
+
+export interface DetectionBox {
+  class_id: number
+  class_name: string
+  confidence: number
+  /** [x1, y1, x2, y2]，像素坐标（原图尺寸内） */
+  bbox: number[]
+}
+
+export interface DetectionRecord {
+  id: string
+  project_id: string
+  session_id: string | null
+  job_id: string | null
+  model_id: string
+  dataset_id: string | null
+  status: 'running' | 'done' | 'failed' | 'paused'
+  confidence: number
+  boxes: DetectionBox[]
+  class_summary: Record<string, number>
+  hit_count: number
+  rgb_asset_id: string
+  x_asset_id: string | null
+  x_origin: string
+  created_at: string
+  /** 本地时区的展示时间（后端换算，前端不自己猜时区） */
+  created_at_local: string
+  finished_at: string | null
+  error: { code: string; message: string } | null
+  image_url: string
+  result_url: string | null
+  request_key: string
+  latest_review?: ReviewSummary | null
+}
+
+export interface RecordFiltersState {
+  status: string
+  model_id: string
+  has_hits: boolean | null
+  date_from: string
+  date_to: string
+}
+
+export interface RecordPage {
+  records: DetectionRecord[]
+  has_more: boolean
+  next_before: string | null
+  total_in_range: number
+  filters: {
+    status: string | null
+    model_id: string | null
+    session_id: string | null
+    has_hits: boolean | null
+    applied: Record<string, unknown>
+  }
+}
+
+export interface BusinessJob {
+  id: string
+  project_id: string
+  session_id: string | null
+  kind: string
+  status: 'queued' | 'running' | 'done' | 'failed' | 'partial' | 'interrupted'
+  progress: Record<string, unknown>
+  result: Record<string, unknown>
+  error: { code: string; message: string } | null
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+}
+
+export interface JobEvent {
+  seq: number
+  job_id: string
+  session_id: string | null
+  type: string
+  payload: Record<string, unknown>
+  created_at: string
+}
+
+export interface InspectionQueueItem {
+  record_id: string
+  hit_count: number
+  classes: Record<string, number>
+  status: string
+  created_at_local: string
+  page: { name: string; params: Record<string, string>; query: Record<string, string> }
+}

@@ -64,7 +64,10 @@ TOOLS: dict[str, ToolSpec] = {}
 
 # 未来能力：登记但标记为未接入，任何界面与模型提示都不得说成可用。
 SERVICES: dict[str, dict] = {
-    "detection": {"registered": False, "note": "检测能力在 WB17-03 接入，本轮不可调用"},
+    "detection": {"registered": True, "note": "真实 YOLO/YOLOMM 推理，结果写入识别记录"},
+    "ai_review": {"registered": True, "note": "用本人当前连接做看图核查，结论仅供参考"},
+    "datasets": {"registered": True, "note": "ZIP/目录导入，逐样本校验后登记"},
+    "models": {"registered": True, "note": "PT 导入与项目内发布，类别映射显式确认"},
     "review": {"registered": False, "note": "人工复核在 WB17-04 接入，本轮不可调用"},
     "feedback": {"registered": False, "note": "数据回流在 WB17-04 接入，本轮不可调用"},
     "training": {"registered": False, "note": "训练评估在 WB17-05 接入，本轮不可调用"},
@@ -407,11 +410,15 @@ def _open_page(ctx: ToolContext) -> dict:
             "name": "session",
             "params": {"projectId": ctx.actor.project_id, "sessionId": ctx.actor.session_id},
         },
+        "records": {"name": "records", "params": {"projectId": ctx.actor.project_id}},
+        "datasets": {"name": "datasets", "params": {"projectId": ctx.actor.project_id}},
+        "models": {"name": "models", "params": {"projectId": ctx.actor.project_id}},
+        "assets": {"name": "assets", "params": {"projectId": ctx.actor.project_id}},
         "settings": {"name": "settings", "params": {}},
         "trash": {"name": "trash", "params": {}},
     }
     if page not in routes:
-        raise ToolError("BAD_PAGE", "只能打开项目、会话、设置或回收站页面")
+        raise ToolError("BAD_PAGE", "只能打开项目、会话、记录、数据集、模型、资产、设置或回收站页面")
     ctx.emit("ui.navigate", {"page": page, "route": routes[page]})
     return {"opened": page, "note": "已在用户界面发起跳转"}
 
@@ -751,7 +758,12 @@ register(
         risk=policy.RISK_READ,
         schema={
             "type": "object",
-            "properties": {"page": {"type": "string", "pattern": "^(project|session|settings|trash)$"}},
+            "properties": {
+                "page": {
+                    "type": "string",
+                    "pattern": "^(project|session|records|datasets|models|assets|settings|trash)$",
+                }
+            },
             "required": ["page"],
         },
         handler=_open_page,
@@ -802,5 +814,530 @@ register(
         risk=policy.RISK_READ,
         schema={"type": "object", "properties": {}, "required": []},
         handler=_connection_status,
+    )
+)
+
+
+# ---- 业务：资产 / 数据集 / 模型 / 检测 / 核查 -------------------------------
+
+
+def _service(call: Callable[[], Any]) -> Any:
+    """调用业务服务并把它抛的业务错误翻成工具错误。
+
+    业务服务与工具层是**同一套**实现（网页与 Agent 共用），但两边错误类型不同：
+    服务抛 ``ApiError``、工具层认 ``ToolError``。这里保留机器码、中文说明与结构化 details，
+    既不吞错也不另造一套文案——否则模型会把“类别没对上”看成“工具坏了”。
+    """
+    from backend.errors import ApiError
+
+    try:
+        return call()
+    except ApiError as error:
+        raise ToolError(
+            error.code,
+            error.msg,
+            status=error.status,
+            details=error.details,
+        ) from error
+
+
+def _emit_job(ctx: ToolContext, job: dict, *, page: str, note: str = "") -> None:
+    ctx.emit(
+        "business.job",
+        {
+            "job_id": job["id"],
+            "kind": job["kind"],
+            "status": job["status"],
+            "page": page,
+            "note": note,
+        },
+    )
+
+
+def _list_datasets(ctx: ToolContext) -> dict:
+    from backend.services import datasets as dataset_service
+
+    return _service(
+        lambda: dataset_service.list_for_project(
+            ctx.conn, int(ctx.actor.user_id), ctx.actor.project_id
+        )
+    )
+
+
+def _import_dataset(ctx: ToolContext) -> dict:
+    from backend.services import datasets as dataset_service
+
+    dataset = _service(
+        lambda: dataset_service.import_dataset(
+            ctx.conn,
+            int(ctx.actor.user_id),
+            ctx.actor.project_id,
+            name=str(ctx.args.get("name") or ""),
+            modalities=[str(item) for item in (ctx.args.get("modalities") or ["rgb"])],
+            secondary_modality=ctx.args.get("secondary_modality"),
+            classes=ctx.args.get("classes"),
+            asset_id=ctx.args.get("asset_id"),
+            rel_path=ctx.args.get("rel_path"),
+        )
+    )
+    ctx.emit("datasets.changed", {"action": "imported", "dataset_id": dataset["id"]})
+    return {"dataset": dataset}
+
+
+def _list_models(ctx: ToolContext) -> dict:
+    from backend.services import models as model_service
+
+    return _service(
+        lambda: model_service.list_for_project(
+            ctx.conn, int(ctx.actor.user_id), ctx.actor.project_id
+        )
+    )
+
+
+def _import_model(ctx: ToolContext) -> dict:
+    from backend.services import models as model_service
+
+    model = _service(
+        lambda: model_service.import_model(
+            ctx.conn,
+            int(ctx.actor.user_id),
+            ctx.actor.project_id,
+            name=str(ctx.args.get("name") or ""),
+            family=str(ctx.args.get("family") or ""),
+            model_mode=ctx.args.get("model_mode"),
+            secondary_modality=ctx.args.get("secondary_modality"),
+            dataset_id=ctx.args.get("dataset_id"),
+            class_map=ctx.args.get("class_map"),
+            asset_id=ctx.args.get("asset_id"),
+            rel_path=ctx.args.get("rel_path"),
+            notes=str(ctx.args.get("notes") or ""),
+        )
+    )
+    ctx.emit("models.changed", {"action": "imported", "model_id": model["id"]})
+    return {
+        "model": model,
+        "note": (
+            "导入完成但未发布。类别映射已经落在模型上；如果用户已明确要发布，直接调 hx_publish_model，"
+            "不要为“再确认一次”额外开一轮对话。缺映射时会返回 NEED_CLASS_MAPPING，那时再问用户要映射。"
+            if model["status"] != "published"
+            else ""
+        ),
+    }
+
+
+def _publish_model(ctx: ToolContext) -> dict:
+    from backend.services import models as model_service
+
+    model = _service(
+        lambda: model_service.publish(
+            ctx.conn,
+            int(ctx.actor.user_id),
+            ctx.actor.project_id,
+            str(ctx.args.get("model_id") or ""),
+        )
+    )
+    ctx.emit("models.changed", {"action": "published", "model_id": model["id"]})
+    return {"model": model}
+
+
+def _register_asset(ctx: ToolContext) -> dict:
+    from backend.services import assets as asset_service
+
+    asset = _service(
+        lambda: asset_service.register_local(
+            ctx.conn,
+            int(ctx.actor.user_id),
+            ctx.actor.project_id,
+            str(ctx.args.get("rel_path") or ""),
+            role=ctx.args.get("role"),
+        )
+    )
+    return {"asset": asset}
+
+
+def _detect_images(ctx: ToolContext) -> dict:
+    from backend.services import pipelines
+
+    rgb_ids = ctx.args.get("rgb_asset_ids") or []
+    if not rgb_ids:
+        raise ToolError("NO_IMAGES", "需要 rgb_asset_ids（先用 hx_list_files 或 hx_register_asset 拿到）")
+    x_ids = ctx.args.get("x_asset_ids") or []
+    items = [
+        {"rgb_asset_id": str(asset_id), "x_asset_id": (str(x_ids[index]) if index < len(x_ids) else None)}
+        for index, asset_id in enumerate(rgb_ids)
+    ]
+    job, created = _service(
+        lambda: pipelines.start_detection_batch(
+            ctx.conn,
+            int(ctx.actor.user_id),
+            ctx.actor.project_id,
+            model_id=str(ctx.args.get("model_id") or ""),
+            items=items,
+            request_key=str(ctx.args.get("request_key") or ""),
+            confidence=float(ctx.args.get("confidence") or 0.25),
+            session_id=ctx.actor.session_id,
+            turn_id=ctx.actor.turn_id,
+        )
+    )
+    _emit_job(ctx, job, page="records")
+    return {
+        "job": job,
+        "created": created,
+        "note": "检测在后台进行；用 hx_job_status 查询（每次等待不超过 10 秒），不要重复提交同一请求键。",
+    }
+
+
+def _inspect_directory(ctx: ToolContext) -> dict:
+    from backend.services import pipelines
+
+    job, created = _service(
+        lambda: pipelines.start_inspection(
+            ctx.conn,
+            int(ctx.actor.user_id),
+            ctx.actor.project_id,
+            model_id=str(ctx.args.get("model_id") or ""),
+            directory=str(ctx.args.get("directory") or "."),
+            request_key=str(ctx.args.get("request_key") or ""),
+            confidence=float(ctx.args.get("confidence") or 0.25),
+            limit=int(ctx.args.get("limit") or 20),
+            review=bool(ctx.args.get("review")),
+            x_directory=ctx.args.get("x_directory"),
+            session_id=ctx.actor.session_id,
+            turn_id=ctx.actor.turn_id,
+            # 本轮真正下发给引擎的模型：核查阶段沿用它，不按偏好重新解析。
+            review_model=ctx.actor.model,
+        )
+    )
+    _emit_job(ctx, job, page="records", note="巡检作业已启动")
+    return {
+        "job": job,
+        "created": created,
+        "note": (
+            "这是服务端的确定性巡检流程（发现→检测→按需核查→生成人工队列），不是另起一个规划器。"
+            "用 hx_job_status 查询进度；不要在对话里重复发起。"
+        ),
+    }
+
+
+def _job_status(ctx: ToolContext) -> dict:
+    import time as _time
+
+    from backend.services import jobs as job_service
+
+    job_id = str(ctx.args.get("job_id") or "").strip()
+    if not job_id:
+        raise ToolError("JOB_ID_REQUIRED", "需要 job_id")
+    wait_seconds = min(float(ctx.args.get("wait_seconds") or 0), 10.0)
+    deadline = _time.monotonic() + wait_seconds
+    while True:
+        try:
+            row = job_service.get_owned(ctx.conn, int(ctx.actor.user_id), ctx.actor.project_id, job_id)
+        except KeyError:
+            return {
+                "job_id": job_id,
+                "status": "unknown",
+                "note": "没有这个作业。不要凭猜测重复提交，先向用户确认。",
+            }
+        payload = job_service.public(row)
+        if payload["status"] in job_service.TERMINAL or _time.monotonic() >= deadline:
+            return {
+                "job": payload,
+                "note": (
+                    "作业仍在进行；稍后再查同一个 job_id。"
+                    if payload["status"] not in job_service.TERMINAL
+                    else "作业已结束，结果在 job.result 里。"
+                ),
+            }
+        _time.sleep(0.5)
+
+
+def _list_records(ctx: ToolContext) -> dict:
+    from backend.services import detection as detection_service
+
+    result = _service(
+        lambda: detection_service.list_for_project(
+            ctx.conn,
+            int(ctx.actor.user_id),
+            ctx.actor.project_id,
+            status=ctx.args.get("status"),
+            model_id=ctx.args.get("model_id"),
+            has_hits=ctx.args.get("has_hits"),
+            date_from=ctx.args.get("date_from"),
+            date_to=ctx.args.get("date_to"),
+            limit=int(ctx.args.get("limit") or 20),
+        )
+    )
+    result["note"] = (
+        "日期按本地日期解释；filters.applied 给出换算后的 UTC 边界。"
+        "记录 ID 是真实主键，页面与工具返回的是同一批数据。"
+    )
+    return result
+
+
+def _review_records(ctx: ToolContext) -> dict:
+    from backend.services import aireview
+
+    record_ids = [str(item) for item in (ctx.args.get("record_ids") or [])]
+    if not record_ids:
+        raise ToolError("NO_RECORDS", "需要 record_ids；只选一条就只传一条，不要默认核查全部")
+    job, created = _service(
+        lambda: aireview.start_batch(
+            ctx.conn,
+            int(ctx.actor.user_id),
+            ctx.actor.project_id,
+            record_ids=record_ids,
+            request_key=str(ctx.args.get("request_key") or ""),
+            session_id=ctx.actor.session_id,
+            turn_id=ctx.actor.turn_id,
+            model=ctx.actor.model,
+        )
+    )
+    _emit_job(ctx, job, page="records", note="AI 核查已启动")
+    return {
+        "job": job,
+        "created": created,
+        "note": "核查会真实调用本人当前连接（会计费）；不要重复提交同一请求键。结论仅供参考，不等于人工复核。",
+    }
+
+
+# ---- 业务工具清单 ----------------------------------------------------------
+
+_ID = {"type": "string", "pattern": "^[a-z]{3}_[0-9a-f]{16}$"}
+_REQUEST_KEY = {"type": "string", "pattern": "^[A-Za-z0-9:_-]{6,80}$"}
+_REL = {"type": "string", "minLength": 1, "maxLength": 400}
+
+register(
+    ToolSpec(
+        name="hx_list_datasets",
+        title="列出项目数据集",
+        description="返回本项目已登记的数据集（模态、类别表、样本数、划分统计）。只看得到当前项目。",
+        risk=policy.RISK_READ,
+        schema={"type": "object", "properties": {}, "required": []},
+        handler=_list_datasets,
+    )
+)
+register(
+    ToolSpec(
+        name="hx_import_dataset",
+        title="导入数据集",
+        description=(
+            "从项目目录或已上传的 ZIP 导入 YOLO 数据集（RGB 或 RGB+X）。会逐样本校验图片可解码、"
+            "标签为 5 列且类别索引与归一化框都在范围内；缺 data.yaml 时可以给 classes 生成，"
+            "但不会猜真实类别名。同一服务网页导入也在用。"
+        ),
+        risk=policy.RISK_WRITE,
+        requires_root=True,
+        schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "minLength": 1, "maxLength": 60},
+                "rel_path": _REL,
+                "asset_id": _ID,
+                "modalities": {"type": "array", "maxItems": 2},
+                "secondary_modality": {"type": "string", "pattern": "^(ir|edge|depth)$"},
+                "classes": {"type": "array", "maxItems": 200},
+            },
+            "required": ["name"],
+        },
+        handler=_import_dataset,
+        summary=lambda args: f"导入数据集 {args.get('name')}（{args.get('rel_path') or args.get('asset_id')}）",
+    )
+)
+register(
+    ToolSpec(
+        name="hx_list_models",
+        title="列出项目模型",
+        description="返回本项目的模型（家族、单/双模态、绑定数据集、发布状态、类别映射摘要）。",
+        risk=policy.RISK_READ,
+        schema={"type": "object", "properties": {}, "required": []},
+        handler=_list_models,
+    )
+)
+register(
+    ToolSpec(
+        name="hx_import_model",
+        title="导入模型权重",
+        description=(
+            "登记本地或已上传的 .pt 权重并校验可用性与类别索引。family=yolo 为单模态、yolomm 为双模态。"
+            "类别名对齐必须显式：名称不一致时会返回 NEED_CLASS_MAPPING 与两份类别清单，"
+            "由你在对话里问用户后用 class_map 重试，不允许靠翻译猜。"
+        ),
+        risk=policy.RISK_WRITE,
+        requires_root=True,
+        schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "minLength": 1, "maxLength": 60},
+                "family": {"type": "string", "pattern": "^(yolo|yolomm)$"},
+                "model_mode": {"type": "string", "pattern": "^(single|dual)$"},
+                "secondary_modality": {"type": "string", "pattern": "^(ir|edge|depth)$"},
+                "dataset_id": _ID,
+                "rel_path": _REL,
+                "asset_id": _ID,
+                "class_map": {"type": "object"},
+                "notes": {"type": "string", "maxLength": 500},
+            },
+            "required": ["name", "family"],
+        },
+        handler=_import_model,
+        summary=lambda args: f"导入模型 {args.get('name')}（{args.get('family')}）",
+    )
+)
+register(
+    ToolSpec(
+        name="hx_publish_model",
+        title="发布模型到本项目",
+        description=(
+            "把已导入的模型发布为**当前项目**可用。必须已完成类别映射并绑定数据集；"
+            "不会替换其他项目或全局模型。发布后检测才有可用模型。"
+        ),
+        risk=policy.RISK_WRITE,
+        schema={"type": "object", "properties": {"model_id": _ID}, "required": ["model_id"]},
+        handler=_publish_model,
+        summary=lambda args: f"发布模型 {args.get('model_id')}",
+    )
+)
+register(
+    ToolSpec(
+        name="hx_register_asset",
+        title="登记项目内文件为资产",
+        description=(
+            "把项目目录里已有的图片/ZIP/PT 登记为资产（不搬动、不改字节），返回真实类型与 SHA。"
+            "路径由服务端按项目根解析，绝对路径与越界路径会被拒绝。"
+        ),
+        risk=policy.RISK_WRITE,
+        requires_root=True,
+        schema={
+            "type": "object",
+            "properties": {
+                "rel_path": _REL,
+                "role": {"type": "string", "pattern": "^(rgb|ir|edge|depth|weight|dataset)$"},
+            },
+            "required": ["rel_path"],
+        },
+        handler=_register_asset,
+        summary=lambda args: f"登记资产 {args.get('rel_path')}",
+    )
+)
+register(
+    ToolSpec(
+        name="hx_detect_images",
+        title="批量检测图片",
+        description=(
+            "用已发布模型对若干已登记图片做检测（后台作业，逐张独立，单张失败不丢其他结果）。"
+            "双模态模型必须给出配套的 x_asset_ids；缺图会明确报错，不会用 RGB 冒充红外。"
+            "request_key 保证重复提交不产生重复记录。"
+        ),
+        risk=policy.RISK_WRITE,
+        schema={
+            "type": "object",
+            "properties": {
+                "model_id": _ID,
+                "rgb_asset_ids": {"type": "array", "maxItems": 50},
+                "x_asset_ids": {"type": "array", "maxItems": 50},
+                "confidence": {"type": "number", "minimum": 0.01, "maximum": 0.99},
+                "request_key": _REQUEST_KEY,
+            },
+            "required": ["model_id", "rgb_asset_ids", "request_key"],
+        },
+        handler=_detect_images,
+        summary=lambda args: f"检测 {len(args.get('rgb_asset_ids') or [])} 张图",
+    )
+)
+register(
+    ToolSpec(
+        name="hx_inspect_directory",
+        title="按目录巡检",
+        description=(
+            "在项目目录里发现图片（含 images/ + images_ir/ 配对），按用户给定的置信度、数量上限与"
+            "已消歧的参数做：准备资产 → 检测 → 按需 AI 核查 → 生成本轮人工队列，并给出页面位置。"
+            "这是同一个后台作业流程，不另起规划器；参数齐了就**直接提交**，不要再用一轮对话"
+            "确认计划或征求“是否继续”。"
+        ),
+        risk=policy.RISK_WRITE,
+        requires_root=True,
+        schema={
+            "type": "object",
+            "properties": {
+                "model_id": _ID,
+                "directory": _REL,
+                "x_directory": _REL,
+                "confidence": {"type": "number", "minimum": 0.01, "maximum": 0.99},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                "review": {"type": "boolean"},
+                "request_key": _REQUEST_KEY,
+            },
+            "required": ["model_id", "directory", "request_key"],
+        },
+        handler=_inspect_directory,
+        summary=lambda args: f"巡检目录 {args.get('directory')}（上限 {args.get('limit') or 20} 张）",
+    )
+)
+register(
+    ToolSpec(
+        name="hx_job_status",
+        title="查询业务作业状态",
+        description=(
+            "按 job_id 查询检测/巡检/核查作业的真实状态与结果，最多等待 10 秒（短于 MCP 超时）。"
+            "返回 unknown 表示没有该作业，不要重复提交；running 只说明还没结束，不代表失败。"
+            "原目标还有已授权的后续步骤时，可以连续调用做有界等待，拿到 true 结果后继续做，"
+            "不要把这一轮结束在“跑完再告诉我”。"
+        ),
+        risk=policy.RISK_READ,
+        schema={
+            "type": "object",
+            "properties": {
+                "job_id": _ID,
+                "wait_seconds": {"type": "number", "minimum": 0, "maximum": 10},
+            },
+            "required": ["job_id"],
+        },
+        handler=_job_status,
+    )
+)
+register(
+    ToolSpec(
+        name="hx_list_records",
+        title="列出识别记录",
+        description=(
+            "分页列出本项目的检测记录，支持状态/模型/是否有命中/本地日期区间筛选，并返回真实 record_id、"
+            "命中数、置信度与时间（UTC 与本地各一份），便于和页面上的记录对应。"
+        ),
+        risk=policy.RISK_READ,
+        schema={
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "pattern": "^(running|done|failed|paused)$"},
+                "model_id": _ID,
+                "has_hits": {"type": "boolean"},
+                "date_from": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+                "date_to": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            },
+            "required": [],
+        },
+        handler=_list_records,
+    )
+)
+register(
+    ToolSpec(
+        name="hx_review_records",
+        title="让 AI 核查指定记录",
+        description=(
+            "对用户**明确选中**的 1-20 条记录调用本人当前连接做看图核查。必须传 record_ids；"
+            "不会因为点开某条记录就核查全部。核查真实发图（RGB + 配套图），会计费，不要重复提交。"
+            "结论只写入 AI 建议，不等于人工复核。"
+        ),
+        risk=policy.RISK_WRITE,
+        schema={
+            "type": "object",
+            "properties": {
+                "record_ids": {"type": "array", "maxItems": 20},
+                "request_key": _REQUEST_KEY,
+            },
+            "required": ["record_ids", "request_key"],
+        },
+        handler=_review_records,
+        summary=lambda args: f"AI 核查 {len(args.get('record_ids') or [])} 条记录",
     )
 )

@@ -248,13 +248,280 @@ SCHEMA_V5 = """
 ALTER TABLE engine_sessions ADD COLUMN storage_key TEXT NOT NULL DEFAULT '';
 """
 
+# v6：业务资产、数据集、模型、识别记录、AI 核查与后台作业。
+#
+# 设计要点：
+# * 所有业务行都带 ``project_id`` + ``owner_id``，查询一律双条件，别人的数据按“不存在”处理；
+# * 资产保存**原始字节**的 SHA 与真实类型；图片不是 project_file，单独一张表；
+# * ``detections`` / ``jobs`` 上的 ``(project_id, request_key)`` 唯一索引是幂等的最终保证：
+#   重试拿到的是同一条记录/同一个作业，而不是第二份计费与第二份产物；
+# * ``job_events`` 是**会话级**的：聊天轮次结束后，业务作业仍能通过它把结果推回界面。
+SCHEMA_V6 = """
+CREATE TABLE IF NOT EXISTS assets (
+    id          TEXT    PRIMARY KEY,
+    project_id  TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    owner_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_id  TEXT,
+    kind        TEXT    NOT NULL CHECK (kind IN ('image', 'archive', 'weight', 'document')),
+    role        TEXT    NOT NULL DEFAULT 'image'
+                CHECK (role IN ('rgb', 'ir', 'edge', 'x', 'image', 'archive', 'weight')),
+    origin      TEXT    NOT NULL DEFAULT 'upload'
+                CHECK (origin IN ('upload', 'local', 'derived')),
+    filename    TEXT    NOT NULL,
+    rel_path    TEXT    NOT NULL,
+    mime        TEXT    NOT NULL,
+    size        INTEGER NOT NULL,
+    sha256      TEXT    NOT NULL,
+    width       INTEGER,
+    height      INTEGER,
+    source_path TEXT,
+    parent_id   TEXT,
+    meta        TEXT    NOT NULL DEFAULT '{}',
+    created_at  TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_assets_project ON assets(project_id, owner_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_assets_sha ON assets(sha256);
+
+CREATE TABLE IF NOT EXISTS datasets (
+    id                 TEXT    PRIMARY KEY,
+    project_id         TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    owner_id           INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name               TEXT    NOT NULL,
+    modalities         TEXT    NOT NULL DEFAULT '["rgb"]',
+    secondary_modality TEXT,
+    classes            TEXT    NOT NULL DEFAULT '[]',
+    root_rel           TEXT    NOT NULL,
+    source             TEXT    NOT NULL CHECK (source IN ('upload', 'local')),
+    source_asset_id    TEXT,
+    sample_count       INTEGER NOT NULL DEFAULT 0,
+    split_counts       TEXT    NOT NULL DEFAULT '{}',
+    status             TEXT    NOT NULL CHECK (status IN ('ready', 'failed')),
+    notes              TEXT    NOT NULL DEFAULT '',
+    created_at         TEXT    NOT NULL,
+    UNIQUE (project_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_datasets_project ON datasets(project_id, owner_id, created_at);
+
+CREATE TABLE IF NOT EXISTS dataset_samples (
+    id         TEXT    PRIMARY KEY,
+    dataset_id TEXT    NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    split      TEXT    NOT NULL,
+    stem       TEXT    NOT NULL,
+    rgb_rel    TEXT    NOT NULL,
+    x_rel      TEXT,
+    label_rel  TEXT,
+    width      INTEGER,
+    height     INTEGER,
+    boxes      TEXT    NOT NULL DEFAULT '[]',
+    class_ids  TEXT    NOT NULL DEFAULT '[]',
+    created_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_samples_dataset ON dataset_samples(dataset_id, split);
+
+CREATE TABLE IF NOT EXISTS models (
+    id                 TEXT    PRIMARY KEY,
+    project_id         TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    owner_id           INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name               TEXT    NOT NULL,
+    family             TEXT    NOT NULL CHECK (family IN ('yolo', 'yolomm')),
+    model_mode         TEXT    NOT NULL CHECK (model_mode IN ('single', 'multimodal')),
+    secondary_modality TEXT,
+    dataset_id         TEXT,
+    weight_rel         TEXT    NOT NULL,
+    weight_sha256      TEXT    NOT NULL,
+    weight_size        INTEGER NOT NULL DEFAULT 0,
+    classes            TEXT    NOT NULL DEFAULT '[]',
+    class_map          TEXT    NOT NULL DEFAULT '{}',
+    status             TEXT    NOT NULL CHECK (status IN ('imported', 'published', 'failed', 'archived')),
+    published_at       TEXT,
+    notes              TEXT    NOT NULL DEFAULT '',
+    created_at         TEXT    NOT NULL,
+    UNIQUE (project_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_models_project ON models(project_id, owner_id, status);
+
+CREATE TABLE IF NOT EXISTS detections (
+    id             TEXT    PRIMARY KEY,
+    project_id     TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    owner_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_id     TEXT,
+    turn_id        TEXT,
+    job_id         TEXT,
+    request_key    TEXT    NOT NULL,
+    model_id       TEXT    NOT NULL,
+    dataset_id     TEXT,
+    rgb_asset_id   TEXT    NOT NULL,
+    x_asset_id     TEXT,
+    x_origin       TEXT    NOT NULL DEFAULT 'none',
+    confidence     REAL    NOT NULL DEFAULT 0.25,
+    status         TEXT    NOT NULL CHECK (status IN ('queued', 'running', 'done', 'failed', 'paused')),
+    boxes          TEXT    NOT NULL DEFAULT '[]',
+    class_summary  TEXT    NOT NULL DEFAULT '{}',
+    hit_count      INTEGER NOT NULL DEFAULT 0,
+    image_rel      TEXT,
+    result_rel     TEXT,
+    error_code     TEXT,
+    error_message  TEXT,
+    created_at     TEXT    NOT NULL,
+    finished_at    TEXT,
+    UNIQUE (project_id, request_key)
+);
+CREATE INDEX IF NOT EXISTS idx_detections_project ON detections(project_id, owner_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_detections_status ON detections(project_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS ai_reviews (
+    id                     TEXT    PRIMARY KEY,
+    project_id             TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    owner_id               INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    detection_id           TEXT    NOT NULL,
+    job_id                 TEXT,
+    provider               TEXT    NOT NULL DEFAULT '',
+    model                  TEXT    NOT NULL DEFAULT '',
+    connection_fingerprint TEXT    NOT NULL DEFAULT '',
+    status                 TEXT    NOT NULL CHECK (status IN ('running', 'done', 'failed')),
+    verdict                TEXT
+                           CHECK (verdict IS NULL OR verdict IN
+                                  ('consistent', 'possible_false_positive',
+                                   'possible_missed_detection', 'needs_human_review')),
+    confidence             REAL,
+    summary                TEXT    NOT NULL DEFAULT '',
+    findings               TEXT    NOT NULL DEFAULT '{}',
+    error_code             TEXT,
+    error_message          TEXT,
+    created_at             TEXT    NOT NULL,
+    finished_at            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_detection ON ai_reviews(detection_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_reviews_project ON ai_reviews(project_id, created_at);
+
+CREATE TABLE IF NOT EXISTS jobs (
+    id            TEXT    PRIMARY KEY,
+    project_id    TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    owner_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_id    TEXT,
+    turn_id       TEXT,
+    kind          TEXT    NOT NULL,
+    request_key   TEXT    NOT NULL,
+    status        TEXT    NOT NULL CHECK (status IN ('queued', 'running', 'done', 'failed', 'partial')),
+    payload       TEXT    NOT NULL DEFAULT '{}',
+    progress      TEXT    NOT NULL DEFAULT '{}',
+    result        TEXT    NOT NULL DEFAULT '{}',
+    error_code    TEXT,
+    error_message TEXT,
+    created_at    TEXT    NOT NULL,
+    started_at    TEXT,
+    finished_at   TEXT,
+    UNIQUE (project_id, request_key)
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project_id, owner_id, created_at);
+
+CREATE TABLE IF NOT EXISTS job_events (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id     TEXT    NOT NULL,
+    project_id TEXT    NOT NULL,
+    owner_id   INTEGER NOT NULL,
+    session_id TEXT,
+    type       TEXT    NOT NULL,
+    payload    TEXT    NOT NULL DEFAULT '{}',
+    created_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_job_events_project ON job_events(project_id, seq);
+CREATE INDEX IF NOT EXISTS idx_job_events_session ON job_events(session_id, seq);
+"""
+
 # 只允许向后追加；已发布的脚本不得修改。
+# v7：轮次记录本轮带的附件资产（图片）。放在 turns 上而不是消息 meta 里，
+# 是因为运行器发起 prompt 时必须先拿到“这一轮到底带了哪几张图”，
+# 并且附件归属/项目边界要跟着轮次一起可审计。
+SCHEMA_V7 = """
+ALTER TABLE turns ADD COLUMN attachment_ids TEXT NOT NULL DEFAULT '[]';
+"""
+
+# v8：作业与核查的“中断”状态 + 在途核查的原子认领。
+#
+# 为什么需要重建表：SQLite 不能修改已有 CHECK 约束，而 queued/running 在服务重启后
+# 既不是成功也不是业务失败，必须能表达成“结果未知”。用重建而不是把中断塞进 failed，
+# 是因为“失败”会被误读成“模型给出了否定结论”。
+#
+# 认领键选 (detection_id, model, connection_fingerprint)：同一张图、同一个模型、
+# 同一份连接配置，在途只允许一条核查。换模型或换连接属于另一次核查，不共享认领。
+SCHEMA_V8 = """
+ALTER TABLE ai_reviews RENAME TO ai_reviews_v7;
+CREATE TABLE ai_reviews (
+    id                     TEXT    PRIMARY KEY,
+    project_id             TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    owner_id               INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    detection_id           TEXT    NOT NULL,
+    job_id                 TEXT,
+    provider               TEXT    NOT NULL DEFAULT '',
+    model                  TEXT    NOT NULL DEFAULT '',
+    connection_fingerprint TEXT    NOT NULL DEFAULT '',
+    status                 TEXT    NOT NULL CHECK (status IN ('running', 'done', 'failed', 'interrupted')),
+    verdict                TEXT
+                           CHECK (verdict IS NULL OR verdict IN
+                                  ('consistent', 'possible_false_positive',
+                                   'possible_missed_detection', 'needs_human_review')),
+    confidence             REAL,
+    summary                TEXT    NOT NULL DEFAULT '',
+    findings               TEXT    NOT NULL DEFAULT '{}',
+    error_code             TEXT,
+    error_message          TEXT,
+    created_at             TEXT    NOT NULL,
+    finished_at            TEXT
+);
+INSERT INTO ai_reviews
+    (id, project_id, owner_id, detection_id, job_id, provider, model, connection_fingerprint,
+     status, verdict, confidence, summary, findings, error_code, error_message, created_at, finished_at)
+SELECT
+    id, project_id, owner_id, detection_id, job_id, provider, model, connection_fingerprint,
+    status, verdict, confidence, summary, findings, error_code, error_message, created_at, finished_at
+FROM ai_reviews_v7;
+DROP TABLE ai_reviews_v7;
+CREATE INDEX idx_reviews_detection ON ai_reviews(detection_id, created_at);
+CREATE INDEX idx_reviews_project ON ai_reviews(project_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_reviews_active
+    ON ai_reviews(detection_id, model, connection_fingerprint) WHERE status = 'running';
+
+ALTER TABLE jobs RENAME TO jobs_v7;
+CREATE TABLE jobs (
+    id            TEXT    PRIMARY KEY,
+    project_id    TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    owner_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_id    TEXT,
+    turn_id       TEXT,
+    kind          TEXT    NOT NULL,
+    request_key   TEXT    NOT NULL,
+    status        TEXT    NOT NULL CHECK (status IN ('queued', 'running', 'done', 'failed', 'partial', 'interrupted')),
+    payload       TEXT    NOT NULL DEFAULT '{}',
+    progress      TEXT    NOT NULL DEFAULT '{}',
+    result        TEXT    NOT NULL DEFAULT '{}',
+    error_code    TEXT,
+    error_message TEXT,
+    created_at    TEXT    NOT NULL,
+    started_at    TEXT,
+    finished_at   TEXT,
+    UNIQUE (project_id, request_key)
+);
+INSERT INTO jobs
+    (id, project_id, owner_id, session_id, turn_id, kind, request_key, status, payload, progress,
+     result, error_code, error_message, created_at, started_at, finished_at)
+SELECT
+    id, project_id, owner_id, session_id, turn_id, kind, request_key, status, payload, progress,
+    result, error_code, error_message, created_at, started_at, finished_at
+FROM jobs_v7;
+DROP TABLE jobs_v7;
+CREATE INDEX idx_jobs_project ON jobs(project_id, owner_id, created_at);
+"""
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, SCHEMA_V1),
     (2, SCHEMA_V2),
     (3, SCHEMA_V3),
     (4, SCHEMA_V4),
     (5, SCHEMA_V5),
+    (6, SCHEMA_V6),
+    (7, SCHEMA_V7),
+    (8, SCHEMA_V8),
 )
 
 

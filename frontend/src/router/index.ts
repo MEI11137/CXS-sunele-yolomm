@@ -34,6 +34,32 @@ const router = createRouter({
       meta: { title: '会话' },
     },
     {
+      // 手动图片巡检：不经过对话也能跑一次真实检测（同一个检测服务）。
+      path: '/projects/:projectId/inspect',
+      name: 'inspect',
+      component: () => import('@/views/InspectView.vue'),
+      meta: { title: '图片巡检', dock: true },
+    },
+    {
+      // 业务页把对话停靠到右侧，任何一页都不会“把助手弄丢”。
+      path: '/projects/:projectId/records',
+      name: 'records',
+      component: () => import('@/views/RecordsView.vue'),
+      meta: { title: '识别记录', dock: true },
+    },
+    {
+      path: '/projects/:projectId/datasets',
+      name: 'datasets',
+      component: () => import('@/views/DatasetsView.vue'),
+      meta: { title: '数据集', dock: true },
+    },
+    {
+      path: '/projects/:projectId/models',
+      name: 'models',
+      component: () => import('@/views/ModelsView.vue'),
+      meta: { title: '模型', dock: true },
+    },
+    {
       path: '/trash',
       name: 'trash',
       component: () => import('@/views/TrashView.vue'),

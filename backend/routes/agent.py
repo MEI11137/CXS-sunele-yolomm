@@ -27,6 +27,8 @@ bp = Blueprint("agent", __name__)
 
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 CONTENT_MAX = 8000
+# 一轮最多带 4 张图：再多既烧 token 也超出“看几张就能判断”的实际需要。
+MAX_ATTACHMENTS = 4
 
 
 def _user() -> dict:
@@ -186,6 +188,13 @@ def create_turn(session_id: str):
     if len(content) > CONTENT_MAX:
         raise ApiError(400, "VALIDATION", f"单条消息不能超过 {CONTENT_MAX} 个字符")
 
+    # 附件只接受**已经上传的图片资产**：前端传来的路径一律不认，
+    # 归属、项目边界、类型与 SHA 都由资产服务按当前用户重新校验。
+    raw_assets = payload.get("asset_ids") or []
+    if not isinstance(raw_assets, list) or len(raw_assets) > MAX_ATTACHMENTS:
+        raise ApiError(400, "VALIDATION", f"最多附带 {MAX_ATTACHMENTS} 张图片")
+    asset_ids = [str(item) for item in raw_assets if str(item).strip()]
+
     existing = store.by_request(conn, session["id"], request_id)
     if existing is not None:
         return ok(
@@ -214,12 +223,31 @@ def create_turn(session_id: str):
     model = identity.effective_model(conn, user_id, connection)
     fingerprint = identity.connection_fingerprint(connection)
 
+    if asset_ids:
+        from backend.services import assets as asset_service
+
+        if not identity.verified_vision(conn, user_id, model):
+            raise ApiError(
+                409,
+                "VISION_UNVERIFIED",
+                f"当前模型（{model}）没有通过图像能力验证，不能带图片对话；"
+                "请先在设置页检查连接，或先去掉图片",
+            )
+        for asset_id in asset_ids:
+            row = asset_service.get_owned(conn, user_id, project["id"], asset_id)
+            if str(row["kind"]) != "image":
+                raise ApiError(409, "NOT_AN_IMAGE", "附件只支持图片；ZIP/PT 请用业务工具导入")
+
     message = sessions.append_message(
         conn,
         session_id=session["id"],
         role="user",
         content=content,
-        meta={"source": "web", "request_id": request_id},
+        meta={
+            "source": "web",
+            "request_id": request_id,
+            "asset_ids": asset_ids,
+        },
     )
     try:
         turn, created = store.create(
@@ -232,6 +260,7 @@ def create_turn(session_id: str):
             provider=str(connection["provider"]),
             model=model,
             fingerprint=fingerprint,
+            attachments=asset_ids,
         )
     except Exception:
         conn.execute("DELETE FROM messages WHERE id = ?", (message["id"],))

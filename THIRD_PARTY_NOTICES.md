@@ -17,16 +17,40 @@
 说明：前端 `package-lock.json` 复用自本机已验证的 v1.6 前端构建基础（同一套锁定版本），
 仅用于锁定依赖版本，没有复制 v1.6 的业务源码。
 
-## 运行时依赖（Python，见 backend/requirements.txt）
+## 运行时依赖（Python 基础，见 backend/requirements.txt）
 
-| 组件 | 用途 | 许可 |
+| 组件 | 用途 | 许可（本机安装包元数据原文） |
 | --- | --- | --- |
 | Flask | HTTP 框架 | BSD-3-Clause |
-| itsdangerous | 会话令牌的签名与篡改检测（Flask 已依赖，显式声明） | BSD-3-Clause |
+| itsdangerous | 会话令牌的签名与篡改检测（**项目实际鉴权方式**；未使用 PyJWT） | BSD-3-Clause |
 | cryptography | 个人连接 API Key 的 AES-256-GCM 加密 | Apache-2.0 / BSD-3-Clause |
 | requests | “检查连接”与引擎/网关的本地调用（超时受限、无重试） | Apache-2.0 |
 | mcp | 私有 stdio 工具桥的服务端 SDK；检查脚本另用其客户端 SDK 做真实握手 | MIT |
 | anyio | mcp 的运行时依赖（显式声明，避免离线环境漏装） | MIT |
+| Pillow | 资产按真实内容判定（`Image.open` + `verify()`），导入期即依赖 | MIT-CMU |
+| PyYAML | `data.yaml` 的解析与生成 | MIT |
+
+许可文本位置：pip 安装后位于对应 `*.dist-info/licenses/LICENSE`（例如
+`pyyaml-6.0.3.dist-info/licenses/LICENSE`）；本仓库不复制这些文本，部署时随包分发。
+
+## 运行时依赖（Python 视觉，**可选**，见 backend/requirements-vision.txt）
+
+这一组只在跑真实推理/权重检查时需要，**不在基础依赖里、不静默安装、不自动下载**。
+
+| 组件 | 用途 | 许可（本机安装包元数据原文） |
+| --- | --- | --- |
+| torch | 张量运行时与权重反序列化 | `Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND MIT`（多许可组合，逐项以包内 `LICENSE` 为准） |
+| torchvision | vendor YOLO 的图像算子依赖 | BSD |
+| numpy | 数值计算 | `BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0` |
+| opencv-python | 图像解码/编码（中文路径按字节读取后 `imdecode`） | Apache 2.0（OpenCV 本体；opencv-python 打包脚本为 MIT） |
+| matplotlib | vendor ultralytics 的绘图依赖 | Matplotlib License（PSF 风格，见包内 `LICENSE`） |
+| pandas | vendor ultralytics 的数据依赖 | BSD-3-Clause |
+| scipy | vendor ultralytics 的数值依赖 | BSD-3-Clause |
+| tqdm | 进度条 | `MPL-2.0 AND MIT` |
+| psutil | 进程/内存信息 | BSD-3-Clause |
+| einops | vendor 中 mamba 模块依赖 | MIT |
+| timm | vendor 中主干网络依赖 | Apache-2.0 |
+| ultralytics-thop | vendor 统计参数量/FLOPs | **AGPL-3.0** |
 
 ## 外部程序（不入库，按许可单独引入）
 
@@ -49,11 +73,28 @@
   本工程自有的注入变量统一 `HX17_` 前缀（如 `HX17_GATEWAY_URL`、`HX17_TOOL_TOKEN`），与引擎变量不混用。
 - 边界：不读本机全局 `~/.config/opencode` 的认证与配置，不使用全局凭据，只注入当前用户本人的个人连接。
 
-## 计划引入（尚未加入本工程）
+### vendor 定制 YOLO（ultralytics 派生，AGPL-3.0）— 已引入
 
-| 组件 | 用途 | 状态 |
-| --- | --- | --- |
-| vendor 定制 YOLO（ultralytics 派生） | 检测与训练 | 后续阶段以第三方组件方式明确来源与许可 |
+- 位置：`backend/vendor/ultralytics`（`__version__ = "8.3.163"`，见该目录 `__init__.py`）。
+  交付内容为 **1301 个源文件**（不含 `__pycache__`，约 9.8MB）；本机运行后会生成
+  `__pycache__`，不属于交付内容，也不应入库。
+- 来源：原工程 CXSDet-YOLOmm 的 `web-flask/vendor/ultralytics`（合作方提供），**源码逐字节复制、未做任何修改**；
+  交付时的 `best.pt` 是用这套代码训练并保存的，反序列化依赖它的类定义。
+- 本工程对该目录的**唯一新增**是补齐上游许可证文本 `backend/vendor/ultralytics/LICENSE`
+  （AGPL-3.0 原文，来源 `https://www.gnu.org/licenses/agpl-3.0.txt`，
+  SHA-256 `0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0`，34523 字节，未做任何改动）。
+  合作方提供的原始副本里没有随附 LICENSE 文件，这里补齐是为了让许可文本随代码实际分发，而不是只在文档里转述。
+- 用途：真实推理（`YOLO` 单模态 / `YOLOMM` 双模态）。v1.7 通过 `backend/vision/runtime.py`
+  把该目录放在 `sys.path` 首位后导入，**禁止回落到 pip 安装的 ultralytics**：
+  两者类定义与算子不同，混用会静默加载出与训练时不一致的权重行为。机器上没有 pip 版
+  `ultralytics` 也能运行（实测本机即如此）。
+- 许可：**AGPL-3.0**。这是强传染性许可：若本工程对外提供服务，需按 AGPL 的要求提供对应源码；
+  内部使用则需遵守其分发条款。本工程不修改上游源码，仅作为独立目录引用。
+- 权重反序列化：`backend/vision/safe_weight.py` 只放行已知安全类型（torch/ultralytics 的
+  `nn.Module` 子类、张量重建函数、纯数据类型），并给 vendor 内部的 `torch.load(weights_only=False)`
+  挂同一道闸门；详见 `docs/workbuddy-development/WB17-03.md`。
+- 同批依赖见上表「Python 视觉（可选）」，由部署方按 `backend/requirements-vision.txt` 安装，
+  本仓库不打包这些二进制。
 
 ## 未包含内容
 

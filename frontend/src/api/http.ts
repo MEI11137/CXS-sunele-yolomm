@@ -4,17 +4,27 @@ import type { ApiEnvelope } from '@/types'
 export class ApiError extends Error {
   readonly status: number
   readonly code: string
+  /** 后端在 data 里给的结构化细节（例如类别映射需要的两份清单），没有就是 null。 */
+  readonly details: unknown
 
-  constructor(status: number, message: string, code = '') {
+  constructor(status: number, message: string, code = '', details: unknown = null) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.code = code
+    this.details = details
   }
 }
 
 // 生产同源，开发靠 vite 代理；都走 /api，不在业务代码里写端口。
-const BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? '/api'
+// 允许测试/嵌入式宿主通过 globalThis.__HX17_API_BASE__ 指定绝对地址（浏览器里保持默认）。
+const OVERRIDE = (globalThis as { __HX17_API_BASE__?: string }).__HX17_API_BASE__
+const BASE = OVERRIDE || '/api'
+
+/** 业务适配器需要自己发请求时（例如 multipart 上传）用它拼地址，别手写 `/api` 前缀。 */
+export function apiUrl(path: string): string {
+  return BASE + path
+}
 
 function readCookie(name: string): string {
   const prefix = `${name}=`
@@ -66,6 +76,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       response.status,
       envelope?.msg || `请求失败（HTTP ${response.status}）`,
       envelope?.error ?? '',
+      (envelope as { data?: unknown } | null)?.data ?? null,
     )
   }
   return envelope.data

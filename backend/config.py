@@ -21,7 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIRNAME = "var"
 DEFAULT_PORT = 5080
 DEFAULT_SESSION_HOURS = 12
-STAGE = "WB17-02"
+STAGE = "WB17-03"
 
 # OpenCode 引擎：版本与可执行文件都可用环境变量覆盖，便于换机/换版本；
 # 默认值只对应本机已核验的组合（1.19.4 + E:/OpenCode/bin/opencode.exe）。
@@ -41,11 +41,16 @@ FEATURES: dict[str, bool] = {
     "agent_tools": True,
     # 命令执行能力本轮不开放：无法在不引入 OS 沙箱的前提下证明范围。
     "agent_shell": False,
-    # 以下仍未实现，任何页面都不得宣称可用。
-    "detection": False,
+    # WB17-03 接入：资产、数据集、模型、检测记录、AI 核查均为真实实现。
+    "assets": True,
+    "detection": True,
+    "ai_review": True,
+    "datasets": True,
+    "models": True,
+    "business_jobs": True,
+    # 人工复核与数据回流在 WB17-04；训练在 WB17-05。未实现就不宣称。
     "review": False,
-    "datasets": False,
-    "models": False,
+    "feedback": False,
     "training": False,
 }
 

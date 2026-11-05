@@ -1,0 +1,30 @@
+# 海巡智检 v1.7 — 可选：真实视觉推理依赖（WB17-03）
+#
+# 只在需要跑 YOLO / YOLOMM 真实推理与权重检查时安装。基础业务（账号、项目、会话、
+# 文件、上传、AI 核查的请求编排）不依赖这些包。
+#
+# 安装：python -m pip install -r backend/requirements-vision.txt
+#
+# 三条硬约束（与 backend/vision/runtime.py 一致）：
+# 1. 服务端**不会**自动安装、自动下载模型或静默降级。缺包时报 VISION_DEPENDENCY_MISSING，
+#    缺权重时报 VISION_WEIGHT_MISSING，不会伪造空结果。
+# 2. torch / torchvision 必须与部署机的 CUDA 驱动或 CPU 环境匹配，所以只写最低版本，
+#    实际版本由部署方决定（本机实测见 docs/workbuddy-development/WB17-03.md）。
+# 3. ultralytics 不从 PyPI 安装：推理只用 backend/vendor/ultralytics（AGPL-3.0）。
+#    这里列出的 einops / timm / ultralytics-thop 是它运行时 import 的依赖。
+
+torch>=2.2
+torchvision>=0.17
+numpy>=1.24
+opencv-python>=4.8
+Pillow>=10,<13
+PyYAML>=6.0,<7.0
+matplotlib>=3.7
+pandas>=2.0
+scipy>=1.10
+tqdm>=4.66
+psutil>=5.9
+requests>=2.31
+einops>=0.7
+timm>=0.9
+ultralytics-thop>=2.0

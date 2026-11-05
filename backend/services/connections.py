@@ -740,12 +740,19 @@ def server_credentials(conn: sqlite3.Connection, user_id: int, *, key: bytes) ->
     """仅供服务端（后续 Agent 引擎 / AI 核查）取用当前用户凭据。
 
     不得经任何 HTTP 路由返回；调用方负责不落日志、不回显。
+
+    返回里带 ``fingerprint``（provider/base_url/model/Key 指纹的摘要）：
+    调用方可以把它与「作业创建时的快照」比对，避免用户在这两步之间换了连接，
+    却把旧模型配到新地址/新 Key 上发出去。
     """
+    from backend.agent import identity  # 延迟导入：identity 依赖 store，避免模块级循环
+
     row = get_row(conn, user_id)
     return {
         "provider": row["provider"],
         "base_url": row["base_url"],
         "model": row["model"],
+        "fingerprint": identity.connection_fingerprint(row),
         "api_key": crypto.decrypt_text(row["key_cipher"], key, aad=_aad(user_id)),
     }
 

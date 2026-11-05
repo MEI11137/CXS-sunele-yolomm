@@ -42,30 +42,19 @@ _RESERVED_NAMES = {
     *(f"lpt{index}" for index in range(1, 10)),
 }
 
-# 服务端私有根：数据库、密钥、引擎运行目录与日志、回收站。由网关在启动时注入。
-_PRIVATE_ROOTS: list[Path] = []
-
-
+# 服务端私有根由 :mod:`backend.paths` 统一登记：业务文件服务与文件工具共用一份规则，
+# 不会出现“工具挡住了、业务接口还能写”的缺口。
 def configure_private(roots) -> None:
     """登记服务端私有目录；命中即拒绝，与目录授权范围无关。"""
-    resolved: list[Path] = []
-    for item in roots:
-        if not item:
-            continue
-        try:
-            resolved.append(Path(os.path.realpath(str(item))))
-        except OSError:
-            continue
-    _PRIVATE_ROOTS[:] = resolved
+    paths.configure_private(roots)
 
 
 def _private_roots() -> list[Path]:
-    return list(_PRIVATE_ROOTS)
+    return paths.private_roots()
 
 
 def _is_private(path: Path) -> bool:
-    real = Path(os.path.realpath(str(path)))
-    return any(paths.is_within(real, root) for root in _PRIVATE_ROOTS)
+    return paths.is_private(path)
 
 
 def _reject_unsupported(text: str) -> None:

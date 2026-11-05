@@ -3,10 +3,13 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ChatTimeline from './ChatTimeline.vue'
 import { turnStatusLabel } from '@/lib/timeline'
+import { uploadAsset } from '@/api/business'
+import { errorMessage } from '@/api/http'
 import { useAgentStore } from '@/stores/agent'
+import { useBusinessStore } from '@/stores/business'
 import { useConnectionStore } from '@/stores/connection'
 import { useWorkspaceStore } from '@/stores/workspace'
-import type { PermissionMode } from '@/types'
+import type { AssetSummary, PermissionMode } from '@/types'
 
 const props = withDefaults(
   defineProps<{
@@ -21,13 +24,34 @@ const router = useRouter()
 const workspace = useWorkspaceStore()
 const connection = useConnectionStore()
 const agent = useAgentStore()
+const business = useBusinessStore()
 
 const input = ref('')
 const textarea = ref<HTMLTextAreaElement | null>(null)
 const timeline = ref<InstanceType<typeof ChatTimeline> | null>(null)
+/** 输入法组词中：这时的 Enter 是在选字，不能当成发送。 */
+const composing = ref(false)
+const attachments = ref<AssetSummary[]>([])
+const attachmentError = ref('')
+const uploading = ref(false)
+const dragging = ref(false)
+const filePicker = ref<HTMLInputElement | null>(null)
 
-const sessionId = computed(() => String(route.params.sessionId ?? ''))
 const projectId = computed(() => String(route.params.projectId ?? ''))
+/**
+ * 当前要跟谁对话。
+ *
+ * 业务页（识别记录/数据集/模型）的路由里没有 sessionId，但右侧助手**不能因此变空**：
+ * 依次回退到“上次正在看的会话”“该项目最新的会话”，保证切到业务页还能继续问。
+ */
+const sessionId = computed(() => {
+  const fromRoute = String(route.params.sessionId ?? '')
+  if (fromRoute) return fromRoute
+  const stored = workspace.currentSessionId
+  const list = workspace.sessionsByProject[projectId.value] ?? []
+  if (stored && list.some((item) => item.id === stored)) return stored
+  return list[0]?.id ?? ''
+})
 const session = computed(() => {
   if (!sessionId.value) return null
   return (workspace.sessionsByProject[projectId.value] ?? []).find((item) => item.id === sessionId.value) ?? null
@@ -74,9 +98,16 @@ watch(
     void workspace.loadMessages(value)
     void agent.resumeSession(value)
     void agent.refreshSessionActions(value)
+    // 业务进度按**会话**监听：与这一轮是否结束无关。
+    // 长任务常常比对话更久，关掉监听会让用户以为任务丢了。
+    business.watchSession(projectId.value, value)
+    void business.refreshJobs(projectId.value, value)
+    void business.loadRecords(projectId.value, { session_id: value }, true)
   },
   { immediate: true },
 )
+
+const cards = computed(() => (sessionId.value ? business.cardsFor(sessionId.value) : []))
 
 onMounted(() => {
   void connection.load()
@@ -84,11 +115,78 @@ onMounted(() => {
   void agent.loadPreferences()
 })
 
+/** Enter 发送、Shift+Enter 换行；输入法组词期间一律不发送。 */
+function onEnter(event: KeyboardEvent): void {
+  if (composing.value || event.isComposing) return
+  void send()
+}
+
 async function send(): Promise<void> {
   const text = input.value.trim()
   if (!text || !sessionId.value) return
-  const ok = await agent.send(sessionId.value, text)
-  if (ok) input.value = ''
+  const ok = await agent.send(
+    sessionId.value,
+    text,
+    attachments.value.map((item) => item.id),
+  )
+  if (ok) {
+    input.value = ''
+    attachments.value = []
+    attachmentError.value = ''
+  }
+}
+
+async function addFiles(files: FileList | File[] | null | undefined): Promise<void> {
+  if (!files || !sessionId.value) return
+  attachmentError.value = ''
+  const images = Array.from(files).filter((file) => file.type.startsWith('image/'))
+  if (!images.length) {
+    attachmentError.value = '只支持图片；ZIP/PT 请在数据集或模型页导入'
+    return
+  }
+  uploading.value = true
+  try {
+    for (const file of images.slice(0, 4 - attachments.value.length)) {
+      const asset = await uploadAsset(projectId.value, file, { sessionId: sessionId.value })
+      if (!attachments.value.some((item) => item.id === asset.id)) {
+        attachments.value = [...attachments.value, asset]
+      }
+    }
+  } catch (failure) {
+    attachmentError.value = errorMessage(failure)
+  } finally {
+    uploading.value = false
+    if (filePicker.value) filePicker.value.value = ''
+  }
+}
+
+function onPick(event: Event): void {
+  void addFiles((event.target as HTMLInputElement).files)
+}
+
+function onPaste(event: ClipboardEvent): void {
+  const items = event.clipboardData?.items
+  if (!items) return
+  const files: File[] = []
+  for (const item of items) {
+    if (item.kind === 'file') {
+      const file = item.getAsFile()
+      if (file) files.push(file)
+    }
+  }
+  if (files.length) {
+    event.preventDefault()
+    void addFiles(files)
+  }
+}
+
+function onDrop(event: DragEvent): void {
+  dragging.value = false
+  void addFiles(event.dataTransfer?.files)
+}
+
+function removeAttachment(assetId: string): void {
+  attachments.value = attachments.value.filter((item) => item.id !== assetId)
 }
 
 async function stop(): Promise<void> {
@@ -114,7 +212,14 @@ function navigate(target: unknown): void {
 </script>
 
 <template>
-  <aside class="assistant" :class="props.variant === 'center' ? 'assistant-center' : 'assistant-dock'" aria-label="海巡助手">
+  <aside
+    class="assistant"
+    :class="[props.variant === 'center' ? 'assistant-center' : 'assistant-dock', { dragging }]"
+    aria-label="海巡助手"
+    @dragover.prevent="dragging = true"
+    @dragleave="dragging = false"
+    @drop.prevent="onDrop"
+  >
     <header class="assistant-header">
       <div class="assistant-title">
         <span aria-hidden="true">✳</span><strong>海巡助手</strong>
@@ -142,6 +247,7 @@ function navigate(target: unknown): void {
         :messages="workspace.messages"
         :turn="turn"
         :events="events"
+        :business-cards="cards"
         :poll-issue="turn ? agent.issueFor(turn.id) : ''"
         @pick="pick"
         @navigate="navigate"
@@ -191,6 +297,15 @@ function navigate(target: unknown): void {
     </section>
 
     <footer class="assistant-input">
+      <div v-if="attachments.length || uploading || attachmentError" class="attachments">
+        <span v-for="asset in attachments" :key="asset.id" class="attachment-chip">
+          <img :src="asset.url" :alt="asset.filename" />
+          <span class="mono">{{ asset.filename }}</span>
+          <button class="link small" type="button" @click="removeAttachment(asset.id)">移除</button>
+        </span>
+        <span v-if="uploading" class="hint">上传中…</span>
+        <span v-if="attachmentError" class="form-error">{{ attachmentError }}</span>
+      </div>
       <textarea
         ref="textarea"
         v-model="input"
@@ -204,7 +319,10 @@ function navigate(target: unknown): void {
         "
         :disabled="!session || running"
         aria-label="发送给海巡助手的消息"
-        @keydown.enter.exact.prevent="send"
+        @keydown.enter.exact.prevent="onEnter"
+        @compositionstart="composing = true"
+        @compositionend="composing = false"
+        @paste="onPaste"
       ></textarea>
       <p v-if="blockedReason" class="hint form-error">{{ blockedReason }}</p>
       <div class="assistant-actions">
@@ -229,6 +347,18 @@ function navigate(target: unknown): void {
             <option v-if="!agent.models.length" value="">未配置个人连接</option>
             <option v-for="item in agent.models" :key="item" :value="item">{{ item }}</option>
           </select>
+        </label>
+        <label class="button ghost small">
+          {{ uploading ? '上传中…' : '图片' }}
+          <input
+            ref="filePicker"
+            type="file"
+            accept="image/*"
+            multiple
+            hidden
+            :disabled="uploading || !session"
+            @change="onPick"
+          />
         </label>
         <span class="hint assistant-runtime">{{ runtimeLine }}</span>
         <button class="primary" type="button" :disabled="!canSend" @click="send">

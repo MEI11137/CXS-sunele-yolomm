@@ -272,6 +272,12 @@ class ToolGateway:
                 )
             self._require_grant(conn, int(turn["owner_id"]), str(root_path))
 
+            # 模型以**本轮**下发给引擎的那个为准（turn.model），不是连接的当前值：
+            # 偏好刚改过时两者可能不同，业务作业若按连接解析就会出现“聊天用 B、核查用 A”，
+            # 而视觉证据只对其中一个成立。连接里的值只作旧数据的兜底。
+            provider = str(turn["provider"] or (connection["provider"] if connection is not None else ""))
+            model = str(turn["model"] or (connection["model"] if connection is not None else ""))
+
             return Actor(
                 user_id=int(turn["owner_id"]),
                 username=str(session["username"]),
@@ -282,8 +288,8 @@ class ToolGateway:
                 mode=policy.normalize_mode(turn["mode"]),
                 root_path=Path(str(root_path)),
                 connection_fingerprint=current,
-                provider=str(connection["provider"]) if connection is not None else "",
-                model=str(connection["model"]) if connection is not None else "",
+                provider=provider,
+                model=model,
             )
         finally:
             conn.close()

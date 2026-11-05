@@ -21,19 +21,26 @@ if str(_ROOT) not in sys.path:
 from flask import Flask, jsonify, request  # noqa: E402
 from werkzeug.exceptions import HTTPException  # noqa: E402
 
-from backend import auth, config, db, security  # noqa: E402
+from backend import auth, config, db, paths, security  # noqa: E402
 from backend.agent import store as turn_store  # noqa: E402
 from backend.agent.runtime import AgentRuntime  # noqa: E402
 from backend.errors import ApiError  # noqa: E402
 from backend.routes.admin import bp as admin_bp  # noqa: E402
 from backend.routes.agent import bp as agent_bp  # noqa: E402
+from backend.routes.assets import bp as assets_bp  # noqa: E402
 from backend.routes.auth import bp as auth_bp  # noqa: E402
 from backend.routes.connections import bp as connections_bp  # noqa: E402
+from backend.routes.datasets import bp as datasets_bp  # noqa: E402
 from backend.routes.directories import bp as directories_bp  # noqa: E402
 from backend.routes.health import bp as health_bp  # noqa: E402
 from backend.routes.meta import bp as meta_bp  # noqa: E402
+from backend.routes.models import bp as models_bp  # noqa: E402
 from backend.routes.projects import bp as projects_bp  # noqa: E402
+from backend.routes.records import bp as records_bp  # noqa: E402
 from backend.routes.sessions import bp as sessions_bp  # noqa: E402
+from backend.services import aireview as aireview_service  # noqa: E402
+from backend.services import jobs as job_service  # noqa: E402
+from backend.vision import runtime as vision_runtime  # noqa: E402
 
 DIST_DIR = _ROOT / "frontend" / "dist"
 
@@ -80,8 +87,19 @@ def create_app(
             code="SERVER_RESTART",
             message="服务端重启，本轮已中断，没有生成最终回答；请重新发送。",
         )
+        # 业务作业与 AI 核查同理：未完成的一律标中断/结果未知。
+        # 尤其**不能自动重发**核查——那次请求可能已经计费。
+        aireview_service.interrupted(conn)
+        job_service.interrupted(conn)
     finally:
         conn.close()
+
+    # 业务后台作业与视觉运行时都只吃工厂阶段的配置快照，请求期间不再读环境变量。
+    job_service.configure(settings)
+    vision_runtime.configure(settings)
+    # 服务端私有区在工厂阶段就登记：业务文件服务与文件工具共用同一份规则，
+    # 不依赖“先起过一次 Agent 网关”这种时序巧合。
+    paths.configure_private([settings.data_dir, settings.secret_dir])
 
     runtime = AgentRuntime(settings, spawner=engine_spawner)
     runtime.start()
@@ -97,6 +115,10 @@ def create_app(
         sessions_bp,
         directories_bp,
         connections_bp,
+        assets_bp,
+        datasets_bp,
+        models_bp,
+        records_bp,
         agent_bp,
     ):
         app.register_blueprint(blueprint, url_prefix="/api")

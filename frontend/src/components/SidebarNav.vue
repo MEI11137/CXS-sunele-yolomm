@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive } from 'vue'
+import { computed, reactive, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useAgentStore } from '@/stores/agent'
@@ -26,6 +26,10 @@ function sessionLink(projectId: string, sessionId: string) {
   return { name: 'session', params: { projectId, sessionId } }
 }
 
+function businessLink(name: 'inspect' | 'records' | 'datasets' | 'models', projectId: string) {
+  return { name, params: { projectId } }
+}
+
 async function toggle(projectId: string): Promise<void> {
   expanded[projectId] = !expanded[projectId]
   if (expanded[projectId] && !workspace.sessionsByProject[projectId]) {
@@ -38,8 +42,28 @@ function isCurrentProject(id: string): boolean {
 }
 
 function isCurrentSession(id: string): boolean {
-  return route.params.sessionId === id
+  // 业务页没有 sessionId 时，仍然高亮“正在看的那个会话”，
+  // 否则用户从对话切到复核页就再也找不到自己在哪一轮里。
+  return (
+    route.params.sessionId === id ||
+    (!route.params.sessionId && workspace.currentSessionId === id)
+  )
 }
+
+function isCurrentBusiness(name: string): boolean {
+  return route.name === name
+}
+
+// 当前项目自动展开：进入某个项目的任何页面时，侧栏都应当显示它的会话列表。
+watch(
+  () => String(route.params.projectId ?? ''),
+  (projectId) => {
+    if (!projectId) return
+    expanded[projectId] = true
+    if (!workspace.sessionsByProject[projectId]) void workspace.loadSessions(projectId)
+  },
+  { immediate: true },
+)
 
 async function logout(): Promise<void> {
   await auth.logout()
@@ -96,6 +120,40 @@ async function logout(): Promise<void> {
             </button>
             <RouterLink class="project-item" :to="projectLink(project.id)">{{ project.name }}</RouterLink>
           </div>
+          <ul v-if="expanded[project.id]" class="session-list business-links">
+            <li>
+              <RouterLink
+                class="session-item"
+                :class="{ active: isCurrentBusiness('inspect') }"
+                :to="businessLink('inspect', project.id)"
+                >图片巡检</RouterLink
+              >
+            </li>
+            <li>
+              <RouterLink
+                class="session-item"
+                :class="{ active: isCurrentBusiness('records') }"
+                :to="businessLink('records', project.id)"
+                >识别记录</RouterLink
+              >
+            </li>
+            <li>
+              <RouterLink
+                class="session-item"
+                :class="{ active: isCurrentBusiness('datasets') }"
+                :to="businessLink('datasets', project.id)"
+                >数据集</RouterLink
+              >
+            </li>
+            <li>
+              <RouterLink
+                class="session-item"
+                :class="{ active: isCurrentBusiness('models') }"
+                :to="businessLink('models', project.id)"
+                >模型</RouterLink
+              >
+            </li>
+          </ul>
           <ul v-if="expanded[project.id]" class="session-list">
             <li v-for="session in workspace.sessionsByProject[project.id] ?? []" :key="session.id">
               <RouterLink

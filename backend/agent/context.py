@@ -35,13 +35,20 @@ class ToolError(Exception):
     """工具层错误：稳定机器码 + 给人看的中文说明。
 
     不允许把上游正文、完整进程环境或凭据写进 message。
+
+    ``details`` 只放**结构化、非敏感**的补充信息（例如权重自带类别与数据集类别的清单），
+    供模型决定该向用户问什么；没有内容时不出现在输出里，保持原有错误格式。
     """
 
-    def __init__(self, code: str, message: str, *, status: int = 400) -> None:
+    def __init__(self, code: str, message: str, *, status: int = 400, details: object = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.status = int(status)
+        self.details = details
 
     def as_dict(self) -> dict:
-        return {"code": self.code, "message": self.message}
+        payload = {"code": self.code, "message": self.message}
+        if self.details is not None:
+            payload["details"] = self.details
+        return payload

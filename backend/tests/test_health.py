@@ -26,7 +26,7 @@ class PublicSurfaceTest(unittest.TestCase):
         self.assertEqual(data["status"], "ok")
         self.assertEqual(data["service"], "haixun-1.7-backend")
         self.assertEqual(data["version"], "1.7.0")
-        self.assertEqual(data["stage"], "WB17-02")
+        self.assertEqual(data["stage"], "WB17-03")
         # 绝对路径不应出现在匿名可读的响应里。
         self.assertNotIn("data_dir", data)
         self.assertNotIn(str(self.harness.data_dir), response.get_data(as_text=True))
@@ -49,8 +49,15 @@ class PublicSurfaceTest(unittest.TestCase):
         # WB17-02 起运行时已接入，但命令执行仍不开放。
         self.assertTrue(features["agent_runtime"])
         self.assertFalse(features["agent_shell"])
+        # WB17-03 起资产/数据集/模型/检测/AI 核查是真实实现。
+        self.assertTrue(features["assets"])
+        self.assertTrue(features["detection"])
+        self.assertTrue(features["ai_review"])
+        self.assertTrue(features["datasets"])
+        self.assertTrue(features["models"])
         # 未实现的必须保持 False，界面据此显示“未实现”。
-        self.assertFalse(features["detection"])
+        self.assertFalse(features["review"])
+        self.assertFalse(features["feedback"])
         self.assertFalse(features["training"])
 
     def test_meta_reports_initialized_after_account_created(self):

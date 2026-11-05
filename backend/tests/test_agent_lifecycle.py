@@ -16,10 +16,14 @@
 
 from __future__ import annotations
 
+import base64
 import dataclasses
+import io
+import json
 import time
 import unittest
 import uuid
+import zipfile
 from unittest.mock import patch
 
 from backend import db
@@ -27,8 +31,16 @@ from backend.agent import identity, store
 from backend.agent.engine import EngineHandle, EngineManager, EngineSpec, EngineUnavailable
 from backend.agent.runner import TurnRunner
 from backend.tests.fake_engine import FakeEngine
-from backend.tests.support import Harness, api, body, login, wait_turn
+from backend.tests.support import Harness, api, body, csrf_headers, login, wait_turn
 from backend.tests import test_agent_gateway as gateway_fixture
+
+
+def png_bytes(width: int = 32, height: int = 24, color=(90, 60, 30)) -> bytes:
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), color).save(buffer, "PNG")
+    return buffer.getvalue()
 
 
 class EngineFleet:
@@ -372,6 +384,195 @@ class BaselineBoundaryTest(LifecycleTestBase):
         self.assertEqual(final["turn"]["status"], "failed")
         self.assertEqual(final["turn"]["error_code"], "BASELINE_UNAVAILABLE")
         self.assertEqual(len(engine.prompts), before_prompts)
+
+
+class EngineFailureScopeTest(LifecycleTestBase):
+    """失效范围必须等于**真实**范围。
+
+    反例：``_poll`` 里读会话状态失败，一个会话读不出来就把整个项目的引擎都停掉
+    （``stop_project``）。表现是“另一个会话明明没出错，正在跑的一轮突然没了”。
+    项目级失效（删项目、解除目录绑定、收回目录授权）才允许作用于整个项目。
+    """
+
+    def _other_session(self) -> dict:
+        return self.harness.create_session(self.project["id"], self.alice["id"], "第二个会话")
+
+    def _instance_for(self, session_id: str):
+        for item in list(self.manager._instances.values()):
+            if item.spec.session_id == str(session_id):
+                return item
+        return None
+
+    def test_one_session_engine_failure_does_not_break_other_sessions(self):
+        original = self.session
+        self.fleet.script({"text": "会话一：目录里有一个 readme.txt。"})
+        self.assertEqual(self.run_turn("第一轮")["turn"]["status"], "completed")
+        first = self._instance_for(original["id"])
+        self.assertIsNotNone(first, "第一轮之后应该有一台会话一的引擎")
+        first_port = first.handle.port
+        engines_before = len(self.fleet.engines)
+
+        other = self._other_session()
+        real_messages = self.manager.messages
+        reads = {"n": 0}
+
+        def messages(instance, engine_session, limit=500):
+            if instance.spec.session_id == str(other["id"]):
+                reads["n"] += 1
+                # 第 1 次是发起前的**基线读取**：那次失败本轮根本不会发 prompt，
+                # 测的就不是这里要测的东西。这里模拟的是“引擎起来了之后读不出状态”。
+                if reads["n"] > 1:
+                    raise EngineUnavailable("ENGINE_UNAVAILABLE", "这个会话的引擎读不出消息")
+            return real_messages(instance, engine_session, limit=limit)
+
+        self.session = other
+        with patch.object(self.manager, "messages", side_effect=messages), patch(
+            "backend.agent.runner.MAX_ENGINE_ERRORS", 2
+        ):
+            failed = self.run_turn("这个会话的引擎会挂", timeout=45.0)
+
+        self.assertEqual(failed["turn"]["status"], "failed")
+        self.assertEqual(failed["turn"]["error_code"], "ENGINE_LOST")
+        self.assertIsNone(self._instance_for(other["id"]), "故障会话的引擎应该被隔离")
+
+        survivor = self._instance_for(original["id"])
+        self.assertIsNotNone(survivor, "同项目另一个会话的引擎被一起杀掉了")
+        self.assertEqual(survivor.handle.port, first_port, "另一个会话的引擎不该被重建")
+        self.assertTrue(survivor.alive(), "另一个会话的引擎进程不该被停止")
+
+        # 另一个会话必须还能用**同一台**引擎正常完成一轮
+        self.session = original
+        self.fleet.script({"text": "会话一：第二轮仍然正常。"})
+        again = self.run_turn("第二轮")
+        self.assertEqual(again["turn"]["status"], "completed")
+        self.assertEqual(
+            len(self.fleet.engines), engines_before + 1, "只应多出故障会话那一台引擎"
+        )
+        self.assertEqual(self._instance_for(original["id"]).handle.port, first_port)
+        self.assertEqual(
+            self.assistant_texts(),
+            ["会话一：目录里有一个 readme.txt。", "会话一：第二轮仍然正常。"],
+        )
+
+    def test_project_grant_revocation_stops_every_engine_in_project(self):
+        original = self.session
+        self.fleet.script({"text": "会话一：正常回答。"})
+        self.assertEqual(self.run_turn("第一轮")["turn"]["status"], "completed")
+        self.assertIsNotNone(self._instance_for(original["id"]))
+
+        other = self._other_session()
+        self.session = other
+        self.fleet.script({"text": "这条回答不该出现。", "initial_delay": 3.0})
+        response = self.send("目录授权马上会被收回")
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        turn_id = body(response)["data"]["turn"]["id"]
+
+        deadline = time.time() + 10.0
+        while time.time() < deadline and self._instance_for(other["id"]) is None:
+            time.sleep(0.05)
+        self.assertIsNotNone(self._instance_for(other["id"]))
+        # 项目级失效：目录授权被收回
+        self.assertTrue(self.harness.revoke_root(self.root_row["id"], self.alice["id"]))
+
+        result = wait_turn(self.client, turn_id, timeout=60.0)
+        self.assertEqual(result["turn"]["status"], "failed")
+        self.assertEqual(result["turn"]["error_code"], "GRANT_REVOKED")
+        self.assertIsNone(self._instance_for(other["id"]))
+        self.assertIsNone(
+            self._instance_for(original["id"]), "项目级失效时同项目其它会话的引擎也应被隔离"
+        )
+
+
+class AttachmentTurnTest(LifecycleTestBase):
+    """聊天附件必须真的送到引擎：真实字节、真实图片 part。
+
+    只把文件路径写进文本是“看起来带了图”，模型其实看不到内容；
+    没有视觉证据就把图片塞给模型，会把请求发给一个不支持图像的模型。
+    两条都在这里用**真实回环引擎请求体**验证，不靠界面文案。
+    """
+
+    def _mark_vision(self, model: str, *, vision: bool = True) -> None:
+        conn = self.harness.conn()
+        try:
+            row = identity.connection_for(conn, self.alice["id"])
+            conn.execute(
+                """
+                UPDATE connections SET capabilities = ?, checked_at = ?, checked_base_url = ?,
+                       checked_model = ?, checked_provider = ?, checked_fingerprint = ?
+                 WHERE user_id = ?
+                """,
+                (
+                    json.dumps({"auth": True, "chat": True, "vision": vision, "tools": False}),
+                    "2026-11-05T00:00:00Z",
+                    str(row["base_url"]),
+                    model,
+                    str(row["provider"]),
+                    str(row["key_fingerprint"]),
+                    int(self.alice["id"]),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _upload(self, data: bytes, filename: str) -> dict:
+        response = self.client.post(
+            f"/api/projects/{self.project['id']}/assets/upload",
+            data={"file": (io.BytesIO(data), filename)},
+            headers=csrf_headers(self.client),
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        return body(response)["data"]["asset"]
+
+    def _send_with(self, content: str, asset_ids: list[str]):
+        return api(
+            self.client,
+            "POST",
+            f"/api/sessions/{self.session['id']}/turns",
+            {"content": content, "request_id": uuid.uuid4().hex, "asset_ids": asset_ids},
+        )
+
+    def test_image_is_sent_as_real_bytes_not_a_path(self):
+        self._mark_vision("probe-model")
+        blob = png_bytes()
+        asset = self._upload(blob, "热斑.png")
+        self.fleet.script({"text": "我看到图里有一块热斑。"})
+        response = self._send_with("看看这张图", [asset["id"]])
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        turn_id = body(response)["data"]["turn"]["id"]
+        result = wait_turn(self.client, turn_id, timeout=40.0)
+        self.assertEqual(result["turn"]["status"], "completed", result)
+        self.assertEqual(result["turn"]["attachments"], [asset["id"]])
+
+        parts = self.fleet.latest.prompts[-1]["parts"]
+        files = [part for part in parts if part.get("type") == "file"]
+        self.assertEqual(len(files), 1, parts)
+        url = str(files[0]["url"])
+        self.assertTrue(url.startswith("data:image/png;base64,"), url[:40])
+        encoded = url.split(",", 1)[1]
+        self.assertEqual(base64.b64decode(encoded), blob, "发出去的必须是原图字节")
+        self.assertEqual(files[0]["filename"], "热斑.png")
+        self.assertTrue(any(part.get("type") == "text" for part in parts))
+
+    def test_image_without_vision_evidence_is_refused_before_prompt(self):
+        self._mark_vision("probe-model", vision=False)
+        asset = self._upload(png_bytes(), "热斑.png")
+        response = self._send_with("看看这张图", [asset["id"]])
+        self.assertEqual(response.status_code, 409, response.get_data(as_text=True))
+        self.assertEqual(body(response)["error"], "VISION_UNVERIFIED")
+        # 没有视觉证据就一个 prompt 都不能发（否则会真实计费，还可能失败）。
+        self.assertFalse(self.fleet.latest.prompts if self.fleet.engines else [])
+
+    def test_non_image_asset_is_refused(self):
+        self._mark_vision("probe-model")
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("readme.txt", "hello")
+        asset = self._upload(buffer.getvalue(), "pack.zip")
+        response = self._send_with("把这个压缩包看看", [asset["id"]])
+        self.assertEqual(response.status_code, 409, response.get_data(as_text=True))
+        self.assertEqual(body(response)["error"], "NOT_AN_IMAGE")
 
 
 class TokenLifecycleTest(LifecycleTestBase):

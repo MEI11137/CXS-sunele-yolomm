@@ -24,6 +24,10 @@ const session = computed(
     ) ?? null,
 )
 
+function openBusiness(name: 'inspect' | 'records' | 'datasets' | 'models'): void {
+  void router.push({ name, params: { projectId: projectId.value } })
+}
+
 function openDetails(): void {
   void router.push({
     name: 'project',
@@ -44,6 +48,10 @@ function openDetails(): void {
         </p>
       </div>
       <div class="header-actions">
+        <button class="ghost small" type="button" @click="openBusiness('inspect')">图片巡检</button>
+        <button class="ghost small" type="button" @click="openBusiness('records')">识别记录</button>
+        <button class="ghost small" type="button" @click="openBusiness('datasets')">数据集</button>
+        <button class="ghost small" type="button" @click="openBusiness('models')">模型</button>
         <button class="ghost small" type="button" @click="openDetails">项目详情</button>
       </div>
     </header>

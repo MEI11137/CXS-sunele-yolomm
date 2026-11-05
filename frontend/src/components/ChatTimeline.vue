@@ -13,6 +13,8 @@ import {
   toolStateLabel,
   turnStatusLabel,
 } from '@/lib/timeline'
+import { jobStatusLabel, recordStatusLabel } from '@/lib/business'
+import type { BusinessCard } from '@/lib/business'
 import type { ChatMessage, Turn, TurnEvent } from '@/types'
 
 const props = defineProps<{
@@ -21,6 +23,8 @@ const props = defineProps<{
   messages: ChatMessage[]
   turn: Turn | null
   events: TurnEvent[]
+  /** 会话级业务卡片（检测/巡检/核查进度）：与轮次是否结束无关。 */
+  businessCards?: BusinessCard[]
   pollIssue?: string
 }>()
 
@@ -230,6 +234,37 @@ defineExpose({ toLatest })
           <div class="message-text markdown-body" v-html="renderMarkdown(streamed)"></div>
         </div>
       </details>
+
+      <!--
+        业务卡片：默认折叠，只显示一行摘要与状态。
+        它**不是**最终回答——回答只来自落库消息，所以这里不会重复渲染一遍结论。
+      -->
+      <section v-if="businessCards && businessCards.length" class="business-cards" aria-label="业务进度">
+        <p class="business-cards-title">本轮业务（{{ businessCards.length }}）</p>
+        <details v-for="card in businessCards" :key="card.jobId" class="business-card">
+          <summary>
+            <span class="tool-state" :data-state="card.status">{{ jobStatusLabel(card.status) }}</span>
+            <span class="tool-title">{{ card.title }}</span>
+            <span class="business-summary">{{ card.summary }}</span>
+            <span v-if="card.recordIds.length" class="live-meta">{{ card.recordIds.length }} 条记录</span>
+          </summary>
+          <ul v-if="card.items.length" class="business-items">
+            <li v-for="item in card.items" :key="item.recordId">
+              <span class="mono">…{{ item.recordId.slice(-6) }}</span>
+              <span>{{ recordStatusLabel(item.status) }}</span>
+              <span v-if="item.hitCount !== null">命中 {{ item.hitCount }}</span>
+              <span v-if="item.classes">{{ item.classes }}</span>
+              <span v-if="item.error" class="form-error">{{ item.error }}</span>
+            </li>
+          </ul>
+          <ul v-if="card.detail.length" class="business-items">
+            <li v-for="(line, index) in card.detail" :key="index" class="mono">{{ line }}</li>
+          </ul>
+          <p v-if="!card.items.length && !card.detail.length" class="hint">
+            这个作业还没有逐条明细；进度更新时会自动补上。
+          </p>
+        </details>
+      </section>
 
       <p v-if="failure" class="banner banner-warn" role="status">{{ failure }}</p>
       <p v-if="notice" class="hint">{{ notice }}</p>

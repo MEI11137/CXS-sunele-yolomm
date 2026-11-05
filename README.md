@@ -1,13 +1,13 @@
 # 海巡智检 v1.7
 
-光伏（RGB+IR）巡检与数据质量闭环系统。当前版本 **1.7.0**，阶段 **WB17-02：网站内嵌 OpenCode Agent 与真实工具交互**。
+光伏（RGB+IR）巡检与数据质量闭环系统。当前版本 **1.7.0**，阶段 **WB17-03：真实文件、数据集/模型准备、图片检测与 AI 核查**。
 
 本目录是从空白工程重新开发的 v1.7 工程。v1.6 仅作为只读功能参考，不复制其源码目录；
 契约（接口形态、权限规则、工具语义）可以参考，代码按本工程结构重新实现。
 
 ## 现状（重要）
 
-WB17-01 + WB17-02 已实现并可实际使用：
+WB17-01 + WB17-02 + WB17-03 已实现并可实际使用：
 
 - 账号：本机 CLI 建号、登录/登出/当前用户、改密、管理员建普通账号与启停；**无注册入口、无默认账号**；
 - 项目与会话：CRUD、软删除/恢复、真实消息历史；每个项目与会话都按 owner 隔离；
@@ -28,13 +28,32 @@ WB17-01 + WB17-02 已实现并可实际使用：
     刷新或关侧栏都不中断后台任务，stop 以引擎真实状态为准；工具调用按 `call_id` 在数据库里
     **原子认领**，并发同 ID 只执行一次，同 ID 换参数直接冲突；
   - 助手回复用 marked 解析 + DOMPurify 净化后渲染，工具详情默认收起。
+- **业务能力（WB17-03）**：
+  - 资产：手动选择/拖拽/粘贴上传、ZIP/PT 上传、把项目目录里的已有文件登记为资产；
+    类型按**真实内容**判定（图片 `kind=image` 而非 `project_file`），保留原始字节/文件名/大小/SHA，
+    内容流按 owner+project 鉴权，没有免鉴权桶入口；
+  - 数据集：目录或 ZIP 导入，RGB 或 RGB+X；缺 `data.yaml` 可显式给类别（不猜真实类名），
+    逐样本校验图片可解码、标签 5 列、类别索引与归一化框在范围内；ZIP 越界/符号链接/超量一律拒绝；
+  - 模型：导入 PT（`yolo` 单模态 / `yolomm` 双模态），校验权重可用性与类别索引，
+    类别对齐必须显式（`NEED_CLASS_MAPPING` 返回两份清单交给人确认），发布只作用于当前项目；
+  - 检测：真实 vendor ultralytics（8.3.163，禁回退 pip）推理，兼容 Tensor `Boxes` 与 Nx6 ndarray；
+    原图字节不改写、结果图另存；记录模型/数据集版本/置信度/框/状态/`request_key`，重复提交不产生第二条；
+  - AI 核查：只核查用户明确选中的记录（单条或批量），用本人当前连接的**本轮模型**，
+    真实 RGB + 配套图一起发；严格 JSON，失败即失败，绝不落 `consistent`；结论与人工状态分栏；
+  - 巡检：发现 → 准备资产 → 检测 → 按需核查 → 生成本轮人工队列并给页面定位；
+    依赖失效（模型/目录/连接）暂停整批，单张失败不影响其他记录；
+  - 页面：识别记录（筛选/分页/勾选/单条与批量核查/详情）、数据集、模型都是真实数据；
+  - 助手：业务进度按**会话**拉 `job-events`，对话结束/刷新/切页都不丢；业务卡片默认折叠、不重复最终回答；
+    输入框带输入法保护（组词中 Enter 不发送，Shift+Enter 换行）。
 
 仍未实现（界面会明确标注，不会伪造结果）：
 
-- 文件发现、图片检测、AI 核查 —— WB17-03；人工复核与数据回流 —— WB17-04；
-- 数据集、模型、训练 —— WB17-05；受控命令执行 —— WB17-05；公网 HTTPS 与正式部署 —— WB17-06。
-- 本轮**没有调用任何真实付费模型**：运行时用真实引擎 + 本地 stub 模型与假引擎用例验证，
-  真实模型的工具调用质量未验收。
+- 人工复核提交与数据回流 —— WB17-04；训练评估 —— WB17-05；受控命令执行 —— WB17-05；
+  公网 HTTPS 与正式部署 —— WB17-06。
+- 附件发图已按 OpenCode file part 传**真实字节**，并用回环假引擎验证了请求体；
+  但**没有**用真实视觉模型做过端到端确认（本轮零付费调用）。
+- 真实权重推理用合作方提供的 `best.pt` 实跑通过；单测里的检测器是注入的假实现，
+  **不**把注入实现写成「GPU / 真 YOLO 通过」。
 
 ## 目录
 
@@ -49,22 +68,34 @@ backend/
   paths.py          目录边界校验（盘符 / UNC / .. / 链接 / 联接）
   cli.py            本机管理命令行
   agent/            引擎适配器 / 网关 / MCP 桥 / 轮次运行器 / 工具 / 权限策略 / 系统提示
-  routes/           health / meta / auth / admin / projects / sessions / directories / connections / agent
-  services/         users / projects / sessions / connections / roots / audit
-  tests/            238 项 unittest（含 Agent 网关/文件/轮次/生命周期用例与假引擎）
+  routes/           health / meta / auth / admin / projects / sessions / directories / connections /
+                    agent / assets / datasets / models / records
+  services/         users / projects / sessions / connections / roots / audit /
+                    storage / assets / datasets / models / detection / aireview / jobs / pipelines
+  vision/           vendor ultralytics 的受控入口（只认 vendor，禁止回退 pip）+ 受限权重反序列化
+  vendor/           ultralytics 8.3.163（派生，AGPL-3.0，许可证原文见该目录 LICENSE）
+  tests/            275 项 unittest（含 Agent 网关/文件/轮次/生命周期、业务层与存储/反序列化反例）
 frontend/           Vue 3 + TypeScript + Pinia + Vite
 deploy/serve.py     生产同源启动器（后端托管 frontend/dist）
-docs/               开发文档，含 WB17-00 / WB17-01 / WB17-02 记录
+docs/               开发文档，含 WB17-00 / WB17-01 / WB17-02 / WB17-03 记录
 scripts/            check.ps1、smoke_http.py、tool_roundtrip.py、engine_smoke.py、
-                    mcp_bridge_handshake.py、engine_protocol_integration.py
+                    mcp_bridge_handshake.py、engine_protocol_integration.py、
+                    contract_frontend.py（真实前端适配器 → 真实 HTTP 的契约测试）
 ```
 
 ## 环境
 
-- Python 3.10+（本机验证：3.14.6，Flask 3.1.3，cryptography 50.0.2）
+- Python 3.10+（本机验证：3.14.6，Flask 3.1.3，cryptography 50.0.2，itsdangerous 2.2.0）
 - Node 20+（本机验证：22.2.0，npm 10.7.0）
 
-不重装 Torch/CUDA，不安装训练相关大包；vendor YOLO 在后续阶段以第三方组件方式引入。
+基础依赖：`python -m pip install -r backend/requirements.txt`（Flask、itsdangerous、
+cryptography、requests、mcp、anyio、Pillow、PyYAML）。
+
+视觉推理是**可选**能力：需要时再装 `backend/requirements-vision.txt`（torch/torchvision/
+opencv/matplotlib/pandas/scipy/tqdm/psutil/einops/timm/ultralytics-thop）。
+不装不会影响账号、项目、会话、上传、数据集登记与页面；跑检测时会显式报
+`VISION_DEPENDENCY_MISSING`，**不会自动安装、不会自动下载模型、不会返回空框假装成功**。
+ultralytics 不从 PyPI 安装，推理只用 `backend/vendor/ultralytics`（AGPL-3.0）。
 
 ## 首次初始化（没有默认账号）
 
@@ -175,6 +206,8 @@ python deploy\serve.py
 ```powershell
 python -m unittest discover -s backend/tests -t . -v
 python scripts/smoke_http.py        # 真实起服务 + Cookie/CSRF 全流程，自动停服
+python scripts/contract_frontend.py # 真实前端适配器 → 真实 HTTP：上传 ZIP、导入数据集、读游标
+python scripts/contract_frontend.py --with-model  # 另加真实 best.pt 上传、导入、发布（较慢）
 python scripts/tool_roundtrip.py    # 真实回环 HTTP + 真实文件操作串测（列目录→读→建→改→移→查→删）
 python scripts/engine_smoke.py      # 真实引擎进程烟测（--version/健康检查，不发 prompt）
 python scripts/mcp_bridge_handshake.py      # 真实 MCP stdio 握手（initialize/list_tools/call_tool，桩网关）
@@ -192,4 +225,6 @@ powershell -File scripts/check.ps1 -Python <python> -Node <node>
 ## 许可与来源
 
 第三方组件与许可声明见 `THIRD_PARTY_NOTICES.md`。OpenCode 1.19.4（MIT，内部 Agent 执行层）以外部
-可执行文件方式调用，保留其原始环境变量名；vendor YOLO 将在后续阶段按上游许可引入并更新该文件。
+可执行文件方式调用，保留其原始环境变量名；`backend/vendor/ultralytics` 为派生定制版（8.3.163），
+按 **AGPL-3.0** 引用，许可证原文随代码放在 `backend/vendor/ultralytics/LICENSE`（源码未修改，
+该文件是唯一新增），对外提供服务时需按 AGPL 提供对应源码。

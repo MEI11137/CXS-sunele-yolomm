@@ -64,7 +64,10 @@ export const useAgentStore = defineStore('agent', () => {
    * 待提交请求：网络回包丢失后的重试必须复用同一个 request_id，
    * 否则服务端会当成第二轮，重复计费、重复落库。
    */
-  const pendingRequest = new Map<string, { requestId: string; content: string }>()
+  const pendingRequest = new Map<
+    string,
+    { requestId: string; content: string; assetIds: string[] }
+  >()
 
   const modes = computed(() => preferences.value?.modes ?? capabilities.value?.modes ?? [])
   const model = computed(() => preferences.value?.model ?? capabilities.value?.connection.model ?? null)
@@ -177,18 +180,27 @@ export const useAgentStore = defineStore('agent', () => {
 
   // ------------------------------------------------------------------ 发送 / 停止
 
-  async function send(sessionId: string, content: string): Promise<boolean> {
+  async function send(
+    sessionId: string,
+    content: string,
+    assetIds: string[] = [],
+  ): Promise<boolean> {
     const text = content.trim()
     if (!text || sending.value) return false
+    const assets = [...assetIds]
     sending.value = true
     error.value = ''
     notice.value = ''
     // 同一段内容沿用同一个 request_id：网络断在半路时，用户再点一次发送
     // 拿到的是**同一轮**，不会变成两轮、两份计费。
     const pending = pendingRequest.get(sessionId)
-    const requestId =
-      pending && pending.content === text ? pending.requestId : newRequestId()
-    pendingRequest.set(sessionId, { requestId, content: text })
+    const sameAsPending =
+      pending &&
+      pending.content === text &&
+      pending.assetIds.length === assets.length &&
+      pending.assetIds.every((item, index) => item === assets[index])
+    const requestId = sameAsPending ? pending!.requestId : newRequestId()
+    pendingRequest.set(sessionId, { requestId, content: text, assetIds: assets })
     try {
       const data = await http.post<{
         turn: Turn
@@ -196,7 +208,11 @@ export const useAgentStore = defineStore('agent', () => {
         resumed: boolean
         events: TurnEvent[]
         actions: AgentAction[]
-      }>(`/sessions/${sessionId}/turns`, { content: text, request_id: requestId })
+      }>(`/sessions/${sessionId}/turns`, {
+        content: text,
+        request_id: requestId,
+        asset_ids: assets,
+      })
       pendingRequest.delete(sessionId)
       adopt(data.turn, data.events ?? [], data.actions ?? [])
       if (data.message) workspace.appendMessage(sessionId, data.message)

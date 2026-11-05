@@ -99,10 +99,18 @@ def evidence_scope(row: sqlite3.Row) -> tuple[str, str, str, str]:
     )
 
 
-def resolve(conn: sqlite3.Connection, user_id: int) -> Selection | None:
+def resolve(
+    conn: sqlite3.Connection, user_id: int, *, model: str | None = None
+) -> Selection | None:
     """唯一的模型/能力解析入口。
 
-    优先级：偏好里选的模型（且仍在可用列表里）→ 连接里保存的模型。
+    优先级：``model`` 显式快照（本轮真正下发给引擎的模型）→ 偏好里选的模型（且仍在
+    可用列表里）→ 连接里保存的模型。
+
+    **业务作业必须传 ``model``**：聊天可能用 turn.model（例如偏好刚改、连接还没切），
+    此时若业务自己再按偏好解析一次，就会出现“聊天用 B、核查用 A”，而视觉证据只对
+    A 有效。显式传入后，视觉结论按同一个模型重新判定：证据不属于它就一律作废。
+
     解析出的模型若与“检查连接”覆盖的模型不一致，视觉结论一律作废：
     给 B 声明 A 验证过的图像能力，会让引擎把图片发给一个不支持图像的模型。
     """
@@ -110,8 +118,12 @@ def resolve(conn: sqlite3.Connection, user_id: int) -> Selection | None:
     if row is None:
         return None
     models = available_models(conn, user_id)
-    preferred = store.prefs(conn, user_id).get("model")
-    model = str(preferred) if preferred and str(preferred) in models else str(row["model"])
+    if model is not None and str(model).strip():
+        chosen = str(model).strip()
+    else:
+        preferred = store.prefs(conn, user_id).get("model")
+        chosen = str(preferred) if preferred and str(preferred) in models else str(row["model"])
+    model = chosen
 
     capabilities = _capabilities(row)
     checked_at = row["checked_at"]
@@ -160,7 +172,7 @@ def verified_vision(conn: sqlite3.Connection, user_id: int, model: str | None = 
     传 ``model`` 时还要求它与解析结果一致：轮次里记的模型和偏好里的最新选择
     可能在极端时序下不同，这时宁可否掉视觉能力，也不给另一个模型声明图像输入。
     """
-    selection = resolve(conn, user_id)
+    selection = resolve(conn, user_id, model=model)
     if selection is None or not selection.vision:
         return False
     return model is None or str(model) == selection.model
