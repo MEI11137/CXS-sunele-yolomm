@@ -1,4 +1,4 @@
-# Python 3.12.15 / conda environment: py12
+﻿# Python 3.12.15 / conda environment: py12
 # Verified dependency lock for the Flask backend, YOLO/YOLOMM RGB+X training,
 # OpenAI-compatible visual-language review, image/video processing and tests.
 # Install with: python -m pip install -r requirements.txt
@@ -20,6 +20,7 @@ colorama==0.4.6
 contourpy==1.4.0
 cycler==0.12.1
 distro==1.9.0
+dill==0.4.1
 einops==0.8.1
 filelock==4.1.1
 Flask==3.1.3
