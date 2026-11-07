@@ -496,9 +496,22 @@ class CapabilitiesTest(unittest.TestCase):
 
     def test_services_report_not_available(self):
         data = body(api(self.client, "GET", "/api/agent/capabilities"))["data"]
-        # 已接入的服务必须如实报告为可用（WB17-03 检测/核查，WB17-04 复核/反馈/回流）。
-        for name in ("detection", "ai_review", "datasets", "models", "review", "feedback", "reflow"):
+        # 已接入的服务必须如实报告为可用：
+        # WB17-03 检测/核查/数据集/模型，WB17-04 复核/反馈/回流，
+        # WB17-05 训练、资料、手册、外部 MCP。
+        for name in (
+            "detection",
+            "ai_review",
+            "datasets",
+            "models",
+            "review",
+            "feedback",
+            "reflow",
+            "training",
+            "documents",
+            "manuals",
+            "mcp",
+        ):
             self.assertTrue(data["services"][name]["available"], name)
-        # 还没接入的一律保持不可用，不能“先声明后实现”。
-        for name in ("training",):
-            self.assertFalse(data["services"][name]["available"], name)
+        # 这里列的服务已经全部接入；真出现"声明了但没工具"的情况，
+        # `available` 会是 False，上面的断言就会失败 —— 不允许先声明后实现。

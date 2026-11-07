@@ -47,8 +47,14 @@ ALLOWED_SYMBOLS: dict[str, str] = {
     "torch.nn.modules.container.ModuleList": "模块列表",
     "torch.nn.modules.conv.Conv2d": "卷积层",
     "torch.nn.modules.linear.Linear": "全连接层",
+    "torch.nn.modules.linear.Identity": "恒等层（无参数直通，v8/v11 瓶颈与 MM 路径常用）",
+    "torch.nn.modules.pooling.MaxPool2d": "最大池化层（SPPF 内部结构）",
+    "torch.nn.modules.loss.BCEWithLogitsLoss": "二分类交叉熵损失（训练态对象，nn.Module）",
     "torch.nn.modules.upsampling.Upsample": "上采样",
     "torch.Size": "张量形状（纯数据）",
+    # —— numpy 纯数据（真实训练 checkpoint 的指标/数组标量） ——
+    "numpy.dtype": "numpy dtype（纯数据）",
+    "numpy._core.multiarray.scalar": "numpy 标量（纯数据）",
     # —— ultralytics 结构 ——
     "ultralytics.nn.tasks.DetectionModel": "检测模型根对象",
     "ultralytics.nn.modules.conv.Conv": "Conv 组合块",
@@ -60,8 +66,23 @@ ALLOWED_SYMBOLS: dict[str, str] = {
     "ultralytics.nn.modules.block.DFL": "分布焦点损失层",
     "ultralytics.nn.modules.block.C2f": "C2f 块（v8/v11 常用）",
     "ultralytics.nn.modules.block.SPPF": "SPPF 池化块（v8/v11 常用）",
+    "ultralytics.nn.modules.block.Attention": "注意力块（v11 PSA 使用）",
     "ultralytics.nn.modules.head.Detect": "检测头",
+    "ultralytics.nn.extraction.c2psa_base.PSABlock": "PSA 注意力块（v11/MM 检测颈）",
+    "ultralytics.nn.extraction.c2psa_variants.C2PSA": "C2PSA 块（v11/MM 检测颈）",
+    # 上游 8.3.x 的同名结构类（vendor 原样保留在 nn/modules/block.py）。官方 YOLO11
+    # 预训练权重按这个路径序列化；它与上面的 MM 版本并存但类名相同、均为普通 nn.Module
+    # 层（构造函数只建层，不做 IO）。不补这两条时，合规的官方 yolo11n.pt 会被闸门当成
+    # 未审核架构拒绝（2026-11-07 现场：VISION_WEIGHT_UNTRUSTED C2PSA/PSABlock）。
+    "ultralytics.nn.modules.block.PSABlock": "PSA 注意力块（上游 8.3.x 定义，官方 YOLO11 权重引用）",
+    "ultralytics.nn.modules.block.C2PSA": "C2PSA 块（上游 8.3.x 定义，官方 YOLO11 权重引用）",
     "ultralytics.nn.mm.router.MultiModalRouter": "双模态路由参数（纯数据）",
+    # —— ultralytics 训练态对象（真实训练产物 best.pt 携带，均为 nn.Module 或纯数据命名空间） ——
+    "ultralytics.utils.IterableSimpleNamespace": "纯数据命名空间（训练参数快照）",
+    "ultralytics.utils.loss.BboxLoss": "边界框损失（nn.Module）",
+    "ultralytics.utils.loss.DFLoss": "分布焦点损失（nn.Module）",
+    "ultralytics.utils.loss.v8DetectionLoss": "检测损失（nn.Module，训练态）",
+    "ultralytics.utils.tal.TaskAlignedAssigner": "任务对齐分配器（nn.Module，训练态）",
     # —— 纯数据类型 ——
     "builtins.set": "集合",
     "collections.OrderedDict": "有序字典",
@@ -109,12 +130,44 @@ def _resolve_approved(ref: str) -> Any:
     return getattr(importlib.import_module(module), name)
 
 
+def _numpy_reduce_types() -> list[Any]:
+    """numpy 的具体 dtype 描述类（纯数据）。
+
+    背景：真实训练 checkpoint 里的 numpy 标量（指标快照）在 ``weights_only=True``
+    反序列化时，先 GLOBAL 到 ``numpy.dtype``，再 REDUCE 出**具体 dtype 实例**
+    （如 ``Float64DType``）。torch 的受限 unpickler 会校验 REDUCE 产物类型，
+    只许可表里的 ``numpy.dtype`` 类不够，还要把这些描述类一并许可。
+    它们全部是 ``numpy.dtypes`` 命名空间下的类型描述符（无行为、无 IO），
+    已逐个人工审核；numpy 1.x 没有该命名空间时安静跳过。
+    """
+    try:
+        import numpy.dtypes as ndt  # noqa: PLC0415
+    except ImportError:  # pragma: no cover - numpy 1.x
+        return []
+    out: list[Any] = []
+    for name in dir(ndt):
+        if name.endswith("DType"):
+            out.append(getattr(ndt, name))
+    return out
+
+
 def allowed_globals(path: Path) -> tuple[list[Any], list[str]]:
     """返回 ``(可许可的类型对象, 被拒绝的引用)``；只读 checkpoint 元数据。"""
     import torch
 
+    # torch < 2.6 没有这个 API（2.6 才进 torch.serialization.__all__）。缺它时给出
+    # 明确的依赖版本提示，而不是把“环境太旧”误报成“你的 PT 权重损坏”。
+    probe = getattr(torch.serialization, "get_unsafe_globals_in_checkpoint", None)
+    if probe is None:
+        raise WeightRejected(
+            "TORCH_TOO_OLD",
+            f"当前 torch {getattr(torch, '__version__', '未知')} 缺少 "
+            "torch.serialization.get_unsafe_globals_in_checkpoint（需要 torch>=2.6）；"
+            "请按 backend/requirements-vision.txt 安装与部署机 CUDA/CPU 匹配的 torch，"
+            "不要为了兼容退回 weights_only=False。",
+        )
     try:
-        refs = torch.serialization.get_unsafe_globals_in_checkpoint(str(path))
+        refs = probe(str(path))
     except Exception as exc:
         raise WeightRejected(
             "WEIGHT_UNVERIFIABLE",
@@ -133,6 +186,9 @@ def allowed_globals(path: Path) -> tuple[list[Any], list[str]]:
             denied.append(ref)
         except Exception:
             denied.append(ref)
+    # numpy dtype 描述类：让 REDUCE 产物（dtype 实例）过 torch 的产物类型校验。
+    if not denied:
+        allowed.extend(_numpy_reduce_types())
     return allowed, denied
 
 

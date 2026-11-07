@@ -269,11 +269,16 @@ def create_turn(session_id: str):
     if not created:
         return ok({"turn": store.turn_public(turn), "message": None, "resumed": True})
 
+    # 补 turn_id 时必须**合并**已有 meta：这里曾经整体覆盖，把刚写进去的
+    # ``asset_ids`` 丢了，于是用户发出的图片在历史里再也找不到引用。
+    meta = dict(message.get("meta") or {})
+    meta.update({"source": "web", "request_id": request_id, "turn_id": turn["id"]})
     conn.execute(
         "UPDATE messages SET meta = ? WHERE id = ?",
-        (json.dumps({"source": "web", "request_id": request_id, "turn_id": turn["id"]}), message["id"]),
+        (json.dumps(meta, ensure_ascii=False), message["id"]),
     )
     conn.commit()
+    message["meta"] = meta
     # 用户发了新消息 = 新目标：上一条等待人工提交的接力作废，避免旧目标被再次唤醒。
     from backend.services import followups as followup_service
 

@@ -49,6 +49,9 @@ FOLDER_MODALITY = {
     "images_ir": "ir",
     "images_edge": "edge",
     "images_depth": "depth",
+    # 参考模态不是 rgb 时，辅模态 rgb 不能也放进 images/（会和主图撞目录），
+    # 统一写 images_rgb/ 并在 data.yaml 里映射回 rgb。
+    "images_rgb": "rgb",
 }
 ROLE_FOLDER = {"rgb": "images", "ir": "images_ir", "edge": "images_edge", "depth": "images_depth"}
 
@@ -64,6 +67,17 @@ def _folder_of(path_like: Any) -> str:
 
 def _modality_of(rel: Any) -> str:
     return FOLDER_MODALITY.get(_folder_of(rel), "ir")
+
+
+def _secondary_folder(modality: str | None) -> str | None:
+    """辅模态在数据集里的目录名；与参考模态的 images/ 冲突时改用 images_<modality>。"""
+    mod = str(modality or "").strip().lower()
+    if mod not in ROLE_FOLDER:
+        return None
+    folder = ROLE_FOLDER[mod]
+    if folder == "images":
+        folder = f"images_{mod}"
+    return folder
 
 
 def _loads(raw: Any, fallback: Any) -> Any:
@@ -233,6 +247,7 @@ def preview(
     strategy: str = "even",
     ratios: dict[str, int] | None = None,
     seed: int = 0,
+    reference_modality: str | None = None,
 ) -> dict:
     plan = _plan(
         conn,
@@ -244,11 +259,15 @@ def preview(
         strategy=strategy,
         ratios=ratios,
         seed=seed,
+        reference_modality=reference_modality,
     )
     result = {
         "mode": plan["mode"],
         "dataset_id": plan.get("dataset_id"),
         "parent_dataset_id": plan.get("parent_dataset_id"),
+        # 数据集以哪一模态的像素坐标作为 labels/ 的参考，以及另一模态是什么。
+        "reference_modality": plan.get("reference_modality"),
+        "secondary_modality": plan.get("secondary_modality"),
         "counts": {
             "replace": sum(1 for item in plan["items"] if item["action"] == "replace"),
             "append": sum(1 for item in plan["items"] if item["action"] == "append"),
@@ -263,7 +282,10 @@ def preview(
                 "split": item.get("split"),
                 "stem": item.get("stem"),
                 "outcome": item.get("outcome"),
-                "boxes": len(item.get("boxes") or []),
+                "boxes": len(item.get("output_primary_boxes") or []),
+                "x_boxes": len(item.get("output_secondary_boxes") or []),
+                "reference_modality": item.get("output_reference_modality"),
+                "secondary_modality": item.get("output_secondary_modality"),
                 "target_sample_id": (item.get("target_sample") or {}).get("id"),
                 "matches": item.get("matches") or [],
                 "hints": item.get("hints") or [],
@@ -285,6 +307,7 @@ def plan_signature(plan: dict) -> str:
         "mode": plan.get("mode"),
         "dataset_id": plan.get("dataset_id"),
         "parent_dataset_id": plan.get("parent_dataset_id"),
+        "reference_modality": plan.get("reference_modality"),
         "counts": plan.get("counts"),
         "items": [
             {
@@ -294,6 +317,8 @@ def plan_signature(plan: dict) -> str:
                 "stem": item.get("stem"),
                 "target": item.get("target_sample_id"),
                 "boxes": item.get("boxes"),
+                "x_boxes": item.get("x_boxes"),
+                "reference_modality": item.get("reference_modality"),
             }
             for item in plan.get("items") or []
         ],
@@ -332,6 +357,7 @@ def _plan(
     strategy: str,
     ratios: dict[str, int] | None,
     seed: int,
+    reference_modality: str | None = None,
 ) -> dict:
     if mode not in {"revision", "new"}:
         raise ApiError(400, "BAD_MODE", "mode 只能是 revision 或 new")
@@ -411,12 +437,18 @@ def _plan(
             continue
         # 反馈池是“待回流”的意向，不是永久授权：如果这条记录在加入反馈之后又产生了
         # 新的驳回/确认版本，旧反馈已经过期，回流时必须让用户重新确认，不能默认沿用。
+        #
+        # 只拿“选中版本本身有没有 pending 反馈”判断，不再要求“表里所有 pending 行都
+        # 是同一版本”：旧版本的 pending 行是历史（``hx_list_feedback`` 的 all 口径），
+        # 不能因为它长期留在表里就把新版本的回流永远卡成 STALE_FEEDBACK。
         stale = conn.execute(
             "SELECT id, review_version_id FROM record_feedback WHERE detection_id = ?"
             " AND owner_id = ? AND status = 'pending'",
             (record_id, int(user_id)),
         ).fetchall()
-        if any(str(row["review_version_id"]) != str(version["id"]) for row in stale):
+        picked = str(version["id"])
+        matched = [row for row in stale if str(row["review_version_id"]) == picked]
+        if stale and not matched:
             conflicts.append(
                 {
                     "record_id": record_id,
@@ -435,12 +467,17 @@ def _plan(
         x_bytes = None
         x_filename = ""
         x_folder = "images_ir"
+        x_row = None
+        x_modality = None
         if record["x_asset_id"]:
             x_row, x_bytes = asset_service.read_bytes(
                 conn, user_id, project_id, str(record["x_asset_id"])
             )
             x_filename = str(x_row["filename"])
             x_folder = ROLE_FOLDER.get(str(x_row["role"]), "images_ir")
+            x_modality = str(x_row["role"] or "").strip().lower()
+            if x_modality not in ROLE_FOLDER:
+                x_modality = FOLDER_MODALITY.get(x_folder, "ir")
         record_classes = [
             item["name"]
             for item in review_service.class_options(conn, user_id, project_id, record)
@@ -653,12 +690,27 @@ def _plan(
                 "sha256": identity["sha256"],
                 "pixel_sha256": identity["pixel_sha256"],
                 "outcome": version["outcome"],
+                # 参考模态 = 记录主图的模态；boxes 只在这个模态的像素坐标里有意义。
+                "reference_modality": str(
+                    version["reference_modality"]
+                    or detection_service.primary_modality_of_record(conn, user_id, project_id, record)
+                    or "rgb"
+                ).lower(),
+                "secondary_modality": x_modality,
                 "boxes": boxes,
+                "x_boxes": _loads(version["x_boxes"], []),
                 "version_id": version["id"],
                 "version": int(version["version"]),
                 "image_width": int(version["image_width"]),
                 "image_height": int(version["image_height"]),
+                "x_image_width": int(
+                    version["x_image_width"] or (int(x_row["width"] or 0) if x_row else 0)
+                ),
+                "x_image_height": int(
+                    version["x_image_height"] or (int(x_row["height"] or 0) if x_row else 0)
+                ),
                 "rgb_row": dict(rgb_row),
+                "model_id": record["model_id"],
                 "rgb_bytes": rgb_bytes,
                 "x_asset_id": record["x_asset_id"],
                 "x_bytes": x_bytes,
@@ -678,11 +730,23 @@ def _plan(
             }
         )
 
+    # 数据集以哪一模态作为 labels/ 的参考：用户显式指定优先，否则跟随记录，
+    # 绝不能因为内部列名还叫 rgb_rel 就把 IR 主模态当 rgb。
+    reference = _resolve_reference(
+        conn, user_id, project_id, parent, items, reference_modality, conflicts
+    )
+    for item in items:
+        _apply_output_spaces(item, reference, conflicts)
+    secondary = _plan_secondary(items, reference)
+
     if conflicts:
         return {
             "mode": mode,
             "dataset_id": str(parent["id"]) if parent else None,
             "parent_dataset_id": str(parent["id"]) if parent else None,
+            "primary_modality": reference,
+            "reference_modality": reference,
+            "secondary_modality": secondary,
             "items": items,
             "kept": kept,
             "conflicts": conflicts,
@@ -693,11 +757,204 @@ def _plan(
         "mode": mode,
         "dataset_id": str(parent["id"]) if parent else None,
         "parent_dataset_id": str(parent["id"]) if parent else None,
+        "primary_modality": reference,
+        "reference_modality": reference,
+        "secondary_modality": secondary,
         "items": items,
         "kept": kept,
         "conflicts": conflicts,
         "classes": classes,
     }
+
+
+def _resolve_reference(conn, user_id: int, project_id: str, parent, items: list[dict],
+                       requested: str | None, conflicts: list[dict]) -> str:
+    """确定输出数据集的参考模态（labels/ 的像素坐标空间）。"""
+    text = str(requested or "").strip().lower() or None
+    if text is not None and text not in ROLE_FOLDER:
+        conflicts.append({
+            "record_id": "",
+            "code": "REFERENCE_MODALITY_INVALID",
+            "message": "参考模态只能是 rgb / ir / edge / depth 之一。",
+            "details": {"requested": text},
+        })
+        return "rgb"
+    if text is not None:
+        chosen = text
+    else:
+        refs = sorted({
+            str(item.get("reference_modality") or "").lower()
+            for item in items
+            if str(item.get("reference_modality") or "").strip()
+        })
+        if len(refs) > 1:
+            conflicts.append({
+                "record_id": "",
+                "code": "REFERENCE_MODALITY_MIXED",
+                "message": "这批记录的参考模态不一致（%s）；请显式指定用哪一模态作为 labels/ 的参考。" % "、".join(refs),
+                "details": {"modalities": refs},
+            })
+            chosen = refs[0]
+        elif refs:
+            chosen = refs[0]
+        elif parent is not None:
+            modes = _loads(parent["modalities"], [])
+            chosen = str(modes[0]).lower() if modes else "rgb"
+        else:
+            chosen = "rgb"
+    if parent is not None:
+        modes = _loads(parent["modalities"], [])
+        parent_primary = str(modes[0]).lower() if modes else "rgb"
+        if parent_primary != chosen:
+            conflicts.append({
+                "record_id": "",
+                "code": "REFERENCE_MODALITY_MISMATCH",
+                "message": "父数据集的主模态是 %s，本次标注参考模态是 %s；回原修订不能改父数据集的模态布局，请改用「另建数据集」或选择与父数据集一致的参考模态。" % (parent_primary, chosen),
+                "details": {"parent_primary": parent_primary, "reference_modality": chosen},
+            })
+    return chosen
+
+
+def _plan_secondary(items: list[dict], reference: str) -> str | None:
+    for item in items:
+        sec = item.get("output_secondary_modality")
+        if sec and sec != reference:
+            return str(sec).lower()
+    return None
+
+
+def _suffix_of(name) -> str:
+    suffix = Path(str(name or "")).suffix.lower()
+    return suffix if suffix else ".jpg"
+
+
+def _apply_output_spaces(item: dict, reference: str, conflicts: list[dict]) -> None:
+    """把一条记录的 boxes/x_boxes 映射到“参考模态 / 辅模态”两个真实输出空间。
+
+    两模态图片尺寸或内容未配准，绝不做坐标换算：只交换整套框与整套图，
+    换过去以后框仍然按各自原图像素坐标校验。
+    """
+    if item.get("action") == "exclude":
+        item["output_reference_modality"] = None
+        item["output_secondary_modality"] = None
+        item["output_primary_boxes"] = []
+        item["output_secondary_boxes"] = []
+        item["output_primary_size"] = [0, 0]
+        item["output_secondary_size"] = None
+        item["output_primary_bytes"] = None
+        item["output_secondary_bytes"] = None
+        item["output_secondary_filename"] = ""
+        item["output_secondary_folder"] = None
+        return
+
+    record_id = str(item.get("record_id") or "")
+    ref_mod = str(item.get("reference_modality") or "rgb").lower()
+    sec_mod = str(item.get("secondary_modality") or "").lower() or None
+    primary = {
+        "boxes": list(item.get("boxes") or []),
+        "size": [int(item.get("image_width") or 0), int(item.get("image_height") or 0)],
+        "bytes": item.get("rgb_bytes"),
+        "suffix": _suffix_of((item.get("rgb_row") or {}).get("filename")),
+    }
+    secondary = None
+    if item.get("x_bytes") is not None and sec_mod:
+        secondary = {
+            "boxes": list(item.get("x_boxes") or []),
+            "size": [int(item.get("x_image_width") or 0), int(item.get("x_image_height") or 0)],
+            "bytes": item.get("x_bytes"),
+            "suffix": _suffix_of(item.get("x_filename")),
+        }
+
+    if reference == ref_mod:
+        out_ref, out_sec = ref_mod, sec_mod
+        out_primary, out_secondary = primary, secondary
+    elif secondary is not None and reference == sec_mod:
+        out_ref, out_sec = sec_mod, ref_mod
+        out_primary, out_secondary = secondary, primary
+    else:
+        conflicts.append({
+            "record_id": record_id,
+            "code": "MODALITY_UNAVAILABLE",
+            "message": "这条记录没有 %s 模态的图片，不能把它当参考模态；请改选含该模态的记录或换一个参考模态。" % reference,
+            "details": {
+                "record_id": record_id,
+                "reference_modality": reference,
+                "available": [ref_mod] + ([sec_mod] if sec_mod else []),
+            },
+        })
+        return
+
+    width, height = out_primary["size"]
+    for box in out_primary["boxes"]:
+        x1, y1, x2, y2 = [float(value) for value in box["bbox"]]
+        if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+            conflicts.append({
+                "record_id": record_id,
+                "code": "BOX_OUT_OF_REFERENCE_IMAGE",
+                "message": "参考模态的标注框超出该模态原图尺寸，不能转换或裁切；请回到复核页按该模态原图重新标注。",
+                "details": {"record_id": record_id, "reference_modality": reference, "size": [width, height]},
+            })
+            return
+
+    if out_secondary is not None:
+        width, height = out_secondary["size"]
+        for box in out_secondary["boxes"]:
+            x1, y1, x2, y2 = [float(value) for value in box["bbox"]]
+            if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+                conflicts.append({
+                    "record_id": record_id,
+                    "code": "BOX_OUT_OF_SECONDARY_IMAGE",
+                    "message": "辅模态的标注框超出该模态原图尺寸，不能转换或裁切；请回到复核页按该模态原图重新标注。",
+                    "details": {"record_id": record_id, "secondary_modality": out_sec, "size": [width, height]},
+                })
+                return
+
+    if item.get("outcome") == "defect" and not out_primary["boxes"] and out_secondary and out_secondary["boxes"]:
+        conflicts.append({
+            "record_id": record_id,
+            "code": "REFERENCE_HAS_NO_BOXES",
+            "message": "%s 参考模态没有标注框，只有 %s 模态有框；这样导出会把空标签写成“确认无缺陷”的负样本。请把含框的模态选为参考模态，或改用「另建数据集」。" % (reference, out_sec),
+            "details": {"record_id": record_id, "reference_modality": reference, "secondary_modality": out_sec},
+        })
+        return
+
+    item["output_reference_modality"] = out_ref
+    item["output_secondary_modality"] = out_sec
+    item["output_primary_boxes"] = out_primary["boxes"]
+    item["output_secondary_boxes"] = out_secondary["boxes"] if out_secondary else []
+    item["output_primary_size"] = out_primary["size"]
+    item["output_secondary_size"] = out_secondary["size"] if out_secondary else None
+    item["output_primary_bytes"] = out_primary["bytes"]
+    item["output_secondary_bytes"] = out_secondary["bytes"] if out_secondary else None
+    item["output_secondary_filename"] = item.get("x_filename") if out_ref == sec_mod else (item.get("rgb_row") or {}).get("filename", "")
+    item["output_secondary_folder"] = _secondary_folder(out_sec)
+
+
+def _primary_for(conn, user_id: int, project_id: str, parent, items: list[dict]) -> str:
+    """输出数据集的**主模态**：回原修订跟父数据集，另建跟随所选记录用的模型。
+
+    单 IR 数据集必须继续保持 ir，不能因为内部列名还叫 rgb_rel 就写成 rgb。
+    """
+    if parent is not None:
+        modes = _loads(parent["modalities"], [])
+        return str(modes[0]).lower() if modes else "rgb"
+    for item in items:
+        model_id = str(item.get("model_id") or "")
+        if not model_id:
+            continue
+        row = conn.execute(
+            "SELECT dataset_id FROM models WHERE id = ? AND project_id = ? AND owner_id = ?",
+            (model_id, str(project_id), int(user_id)),
+        ).fetchone()
+        if row is not None and row["dataset_id"]:
+            dataset = conn.execute(
+                "SELECT modalities FROM datasets WHERE id = ?", (str(row["dataset_id"]),)
+            ).fetchone()
+            if dataset is not None:
+                modes = _loads(dataset["modalities"], [])
+                if modes:
+                    return str(modes[0]).lower()
+    return "rgb"
 
 
 def _stem(filename: str, split: str) -> str:
@@ -753,6 +1010,7 @@ def apply(
     seed: int = 0,
     request_key: str,
     session_id: str | None = None,
+    reference_modality: str | None = None,
 ) -> dict:
     key = str(request_key or "").strip()
     if not key:
@@ -776,6 +1034,7 @@ def apply(
         strategy=strategy,
         ratios=ratios,
         seed=seed,
+        reference_modality=reference_modality,
     )
     if plan["conflicts"]:
         raise ApiError(
@@ -886,15 +1145,23 @@ def _build(
                 continue
             # 同图替换：把原文件复制到新版本的**相同相对位置**，只改 label
             row = _copy_existing_sample(root, db_id, target, split=split)
+            primary_size = item["output_primary_size"]
             label_dir = storage.project_dir(root, storage.DATASETS, db_id, "labels", split)
             label_path = label_service.write_label(
-                root, label_dir, stem, item["boxes"], item["image_width"], item["image_height"]
+                root, label_dir, stem, item["output_primary_boxes"], primary_size[0], primary_size[1]
+            )
+            labels_ir_rel = _write_secondary_labels(
+                root, db_id, split, stem, item.get("output_secondary_boxes") or [],
+                item.get("output_secondary_size") or [0, 0],
             )
             row.update(
                 {
-                    "boxes": item["boxes"],
-                    "class_ids": [int(box["class_id"]) for box in item["boxes"]],
+                    "boxes": item["output_primary_boxes"],
+                    "class_ids": [int(box["class_id"]) for box in item["output_primary_boxes"]],
                     "label_rel": storage.relative(root, label_path),
+                    "labels_ir_rel": labels_ir_rel,
+                    "width": int(primary_size[0]),
+                    "height": int(primary_size[1]),
                     "origin_record_id": item["record_id"],
                     "origin_sample_key": str(
                         target.get("origin_sample_key") or f"{target['split']}/{target['stem']}"
@@ -924,18 +1191,19 @@ def _build(
         conn.execute(
             """
             INSERT INTO datasets (id, project_id, owner_id, name, modalities, secondary_modality,
-                classes, root_rel, source, sample_count, split_counts, status, notes,
-                created_at, parent_dataset_id, kind, seed, split_strategy, request_key,
+                reference_modality, classes, root_rel, source, sample_count, split_counts, status,
+                notes, created_at, parent_dataset_id, kind, seed, split_strategy, request_key,
                 manifest_rel, export_rel)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'local', ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'local', ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 db_id,
                 str(project_id),
                 int(user_id),
                 name,
-                json.dumps(_modalities(rows)),
+                json.dumps(_modalities(rows, plan.get("reference_modality") or plan.get("primary_modality") or "rgb")),
                 _secondary(rows),
+                plan.get("reference_modality") or plan.get("primary_modality") or "rgb",
                 json.dumps(names, ensure_ascii=False),
                 storage.relative(root, base),
                 len(rows),
@@ -953,8 +1221,9 @@ def _build(
         )
         conn.executemany(
             "INSERT INTO dataset_samples (id, dataset_id, split, stem, rgb_rel, x_rel, label_rel,"
-            " width, height, boxes, class_ids, created_at, origin_record_id, origin_sample_key,"
-            " review_version_id, sha256, pixel_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " labels_ir_rel, width, height, boxes, class_ids, created_at, origin_record_id,"
+            " origin_sample_key, review_version_id, sha256, pixel_sha256)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     security.new_id("smp"),
@@ -964,6 +1233,7 @@ def _build(
                     row["rgb_rel"],
                     row["x_rel"],
                     row["label_rel"],
+                    row.get("labels_ir_rel"),
                     row["width"],
                     row["height"],
                     json.dumps(row["boxes"], ensure_ascii=False),
@@ -1017,12 +1287,22 @@ def _copy_existing_sample(root: Path, dataset_id: str, sample, *, split: str | N
         label_src = storage.resolve_rel(root, str(sample["label_rel"]), must_exist=False)
         if label_src.is_file():
             label_rel = _copy_into_split(root, dataset_id, label_src, split, f"{stem}.txt", "labels")
+    # 辅模态标注随主标签一起复制，保证回归修订时两套标注都不丢。
+    labels_ir_rel = None
+    labels_ir_src_rel = sample["labels_ir_rel"] if "labels_ir_rel" in sample.keys() else None
+    if labels_ir_src_rel:
+        labels_ir_src = storage.resolve_rel(root, str(labels_ir_src_rel), must_exist=False)
+        if labels_ir_src.is_file():
+            labels_ir_rel = _copy_into_split(
+                root, dataset_id, labels_ir_src, split, f"{stem}.txt", "labels_ir"
+            )
     return {
         "split": split,
         "stem": stem,
         "rgb_rel": rgb_rel,
         "x_rel": x_rel,
         "label_rel": label_rel,
+        "labels_ir_rel": labels_ir_rel,
         "width": int(sample["width"] or 0),
         "height": int(sample["height"] or 0),
         "boxes": _loads(sample["boxes"], []),
@@ -1066,21 +1346,52 @@ def _copy_into_split(
     return storage.relative(root, target)
 
 
+def _secondary_label_dir(root: Path, dataset_id: str, split: str) -> Path:
+    return storage.project_dir(root, storage.DATASETS, dataset_id, "labels_ir", split)
+
+
+def _write_secondary_labels(
+    root: Path, dataset_id: str, split: str, stem: str, boxes: list[dict], size: list[int]
+) -> str | None:
+    """辅模态标注单独写 labels_ir/，不与参考模态的 labels/ 混在一起。
+
+    没有框时返回 None（不是写空文件）：空文件会被下游当成“确认无缺陷”。
+    """
+    if not boxes:
+        return None
+    width, height = int(size[0] or 0), int(size[1] or 0)
+    if width <= 0 or height <= 0:
+        raise ApiError(
+            409,
+            "IMAGE_SIZE_UNKNOWN",
+            "辅模态图片尺寸未知，不能按原图像素坐标写标注；请重新打开复核页保存一次。",
+        )
+    label_dir = _secondary_label_dir(root, dataset_id, split)
+    label_path = label_service.write_label(root, label_dir, stem, boxes, width, height)
+    return storage.relative(root, label_path)
+
+
 def _write_new_sample(root: Path, dataset_id: str, split: str, stem: str, item: dict) -> dict:
     suffix = Path(str(item["rgb_row"]["filename"])).suffix or ".jpg"
     rgb_path = _dataset_file(root, dataset_id, "images", split, f"{stem}{suffix}")
-    storage.write_bytes(root, rgb_path, item["rgb_bytes"])
+    storage.write_bytes(root, rgb_path, item["output_primary_bytes"])
     x_rel = None
-    if item.get("x_bytes"):
-        x_suffix = Path(str(item["x_filename"])).suffix or ".jpg"
-        x_path = _dataset_file(
-            root, dataset_id, str(item.get("x_folder") or "images_ir"), split, f"{stem}{x_suffix}"
-        )
-        storage.write_bytes(root, x_path, item["x_bytes"])
+    secondary_bytes = item.get("output_secondary_bytes")
+    if secondary_bytes:
+        secondary_filename = str(item.get("output_secondary_filename") or "image.jpg")
+        x_suffix = Path(secondary_filename).suffix or ".jpg"
+        x_folder = str(item.get("output_secondary_folder") or "images_ir")
+        x_path = _dataset_file(root, dataset_id, x_folder, split, f"{stem}{x_suffix}")
+        storage.write_bytes(root, x_path, secondary_bytes)
         x_rel = storage.relative(root, x_path)
+    primary_size = item["output_primary_size"]
     label_dir = storage.project_dir(root, storage.DATASETS, dataset_id, "labels", split)
     label_path = label_service.write_label(
-        root, label_dir, stem, item["boxes"], item["image_width"], item["image_height"]
+        root, label_dir, stem, item["output_primary_boxes"], primary_size[0], primary_size[1]
+    )
+    labels_ir_rel = _write_secondary_labels(
+        root, dataset_id, split, stem, item.get("output_secondary_boxes") or [],
+        item.get("output_secondary_size") or [0, 0],
     )
     return {
         "split": split,
@@ -1088,10 +1399,11 @@ def _write_new_sample(root: Path, dataset_id: str, split: str, stem: str, item: 
         "rgb_rel": storage.relative(root, rgb_path),
         "x_rel": x_rel,
         "label_rel": storage.relative(root, label_path),
-        "width": int(item.get("image_width") or 0),
-        "height": int(item.get("image_height") or 0),
-        "boxes": item["boxes"],
-        "class_ids": [int(box["class_id"]) for box in item["boxes"]],
+        "labels_ir_rel": labels_ir_rel,
+        "width": int(primary_size[0]),
+        "height": int(primary_size[1]),
+        "boxes": item["output_primary_boxes"],
+        "class_ids": [int(box["class_id"]) for box in item["output_primary_boxes"]],
         "origin_record_id": item["record_id"],
         "origin_sample_key": None,
         "review_version_id": item["version_id"],
@@ -1100,9 +1412,9 @@ def _write_new_sample(root: Path, dataset_id: str, split: str, stem: str, item: 
     }
 
 
-def _modalities(rows: list[dict]) -> list[str]:
+def _modalities(rows: list[dict], primary: str = "rgb") -> list[str]:
     found = {_modality_of(row.get("x_rel")) for row in rows if row.get("x_rel")}
-    return ["rgb"] + sorted(found)
+    return [primary] + sorted(found)
 
 
 def _secondary(rows: list[dict]) -> str | None:
@@ -1118,7 +1430,7 @@ def _write_yaml(root: Path, base: Path, names: list[str], rows: list[dict], plan
     # modalities 的键是模态名、值是**真实目录名**；导入侧就是按这张表找 RGB 与配图。
     # 旧实现取 Path(x_rel).parent.name，目录布局是 datasets/<id>/images_ir/<split>/<file>，
     # 取到的是划分名 train，于是 YAML 里多出 train: train，IR 反而丢了。
-    modalities = {"rgb": "images"}
+    modalities = {str(plan.get("primary_modality") or "rgb"): "images"}
     for row in rows:
         if row.get("x_rel"):
             folder = _folder_of(row["x_rel"])
@@ -1134,6 +1446,8 @@ def _manifest(plan: dict, rows: list[dict], dataset_id: str, name: str) -> dict:
         "name": name,
         "mode": plan["mode"],
         "parent_dataset_id": plan.get("parent_dataset_id"),
+        "reference_modality": plan.get("reference_modality") or plan.get("primary_modality"),
+        "secondary_modality": plan.get("secondary_modality"),
         "classes": plan["classes"],
         "created_at": security.now_iso(),
         "samples": [
@@ -1143,6 +1457,10 @@ def _manifest(plan: dict, rows: list[dict], dataset_id: str, name: str) -> dict:
                 "rgb_rel": row["rgb_rel"],
                 "x_rel": row.get("x_rel"),
                 "label_rel": row.get("label_rel"),
+                "labels_ir_rel": row.get("labels_ir_rel"),
+                "reference_modality": plan.get("reference_modality") or plan.get("primary_modality"),
+                "secondary_modality": plan.get("secondary_modality"),
+                "reference_size": [row.get("width"), row.get("height")],
                 "sha256": row.get("sha256"),
                 "pixel_sha256": row.get("pixel_sha256"),
                 "source": {
@@ -1277,6 +1595,16 @@ def list_drafts(conn, user_id: int, project_id: str, *, include_deleted: bool = 
     return {"drafts": [_draft_public(row) for row in rows]}
 
 
+def read_draft(conn, user_id: int, project_id: str, draft_id: str) -> dict:
+    """按真实草稿 ID 读取（含回收站里的），供页面/Agent 看当前选择与预览。"""
+    row = _owned_draft(conn, user_id, project_id, draft_id)
+    data = _draft_public(row)
+    data["note"] = (
+        "草稿只是计划，没有生成数据集文件；改过参数后旧预览会失效，需要重新保存预览再定稿。"
+    )
+    return data
+
+
 def save_draft(
     conn,
     user_id: int,
@@ -1291,8 +1619,13 @@ def save_draft(
     seed: int,
     session_id: str | None = None,
     draft_id: str | None = None,
+    reference_modality: str | None = None,
 ) -> dict:
-    """保存/更新草稿：只写计划，不生成 images/labels/ZIP。"""
+    """保存/更新草稿：只写计划，不生成 images/labels/ZIP。
+
+    ``reference_modality`` 与预览保持同一参数并写进计划；定稿会复用它，
+    避免“预览看的是 IR 参考、定稿又悄悄换回 RGB”。
+    """
     label = str(name or "").strip()[:60] or _default_name({"mode": mode})
     plan = preview(
         conn,
@@ -1304,6 +1637,7 @@ def save_draft(
         strategy=strategy,
         ratios=ratios,
         seed=seed,
+        reference_modality=reference_modality,
     )
     status = "editing" if plan["counts"]["conflicts"] else "ready"
     now = security.now_iso()
@@ -1393,6 +1727,7 @@ def finalize_draft(conn, user_id: int, project_id: str, draft_id: str) -> dict:
         raise ApiError(409, "DRAFT_NOT_READY", "草稿里还有冲突或上次定稿失败，请修改后重新预览")
     plan = _loads(row["plan"], {})
     selections = _loads(row["selections"], [])
+    reference_modality = plan.get("reference_modality") or None
     # 服务端自己核验：草稿存的是“那一刻的真实状态”。父数据集样本、复核结论或身份
     # 核验结果变过，就要求重新预览，而不是拿旧计划写文件。UI 的按钮状态只是辅助。
     fresh = preview(
@@ -1405,6 +1740,7 @@ def finalize_draft(conn, user_id: int, project_id: str, draft_id: str) -> dict:
         strategy=str(row["strategy"]),
         ratios=_loads(row["ratios"], DEFAULT_RATIOS),
         seed=int(row["seed"] or 0),
+        reference_modality=reference_modality,
     )
     stored_signature = str(plan.get("signature") or "")
     if stored_signature and not fresh["conflicts"] and fresh["signature"] != stored_signature:
@@ -1434,6 +1770,7 @@ def finalize_draft(conn, user_id: int, project_id: str, draft_id: str) -> dict:
             seed=int(row["seed"] or 0),
             request_key=key,
             session_id=row["session_id"],
+            reference_modality=reference_modality,
         )
     except ApiError as exc:
         conn.execute(

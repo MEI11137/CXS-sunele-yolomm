@@ -32,6 +32,7 @@ from backend.routes.auth import bp as auth_bp  # noqa: E402
 from backend.routes.connections import bp as connections_bp  # noqa: E402
 from backend.routes.datasets import bp as datasets_bp  # noqa: E402
 from backend.routes.directories import bp as directories_bp  # noqa: E402
+from backend.routes.documents import bp as documents_bp  # noqa: E402
 from backend.routes.health import bp as health_bp  # noqa: E402
 from backend.routes.meta import bp as meta_bp  # noqa: E402
 from backend.routes.models import bp as models_bp  # noqa: E402
@@ -39,8 +40,14 @@ from backend.routes.projects import bp as projects_bp  # noqa: E402
 from backend.routes.records import bp as records_bp  # noqa: E402
 from backend.routes.reviews import bp as reviews_bp  # noqa: E402
 from backend.routes.sessions import bp as sessions_bp  # noqa: E402
+from backend.routes.service import bp as service_bp  # noqa: E402
+from backend.routes.mcp import bp as mcp_bp  # noqa: E402
+from backend.routes.training import bp as training_bp  # noqa: E402
 from backend.services import aireview as aireview_service  # noqa: E402
 from backend.services import jobs as job_service  # noqa: E402
+from backend.services import manuals as manual_service  # noqa: E402
+from backend.services import mcp as mcp_service  # noqa: E402
+from backend.services import training as training_service  # noqa: E402
 from backend.vision import runtime as vision_runtime  # noqa: E402
 
 DIST_DIR = _ROOT / "frontend" / "dist"
@@ -98,9 +105,18 @@ def create_app(
     # 业务后台作业与视觉运行时都只吃工厂阶段的配置快照，请求期间不再读环境变量。
     job_service.configure(settings)
     vision_runtime.configure(settings)
+    # 训练槽与在跑的训练进程：只核对真实进程/产物，绝不自动重启训练。
+    conn = db.connect(settings.db_path)
+    try:
+        training_service.recover(conn)
+        # 内置手册按稳定 ID 幂等登记；不覆盖用户改过的版本。
+        manual_service.seed_builtin(conn)
+    finally:
+        conn.close()
     # 服务端私有区在工厂阶段就登记：业务文件服务与文件工具共用同一份规则，
     # 不依赖“先起过一次 Agent 网关”这种时序巧合。
     paths.configure_private([settings.data_dir, settings.secret_dir])
+    mcp_service.configure(settings.secret_dir)
 
     runtime = AgentRuntime(settings, spawner=engine_spawner)
     runtime.start()
@@ -119,9 +135,14 @@ def create_app(
         assets_bp,
         datasets_bp,
         models_bp,
+        documents_bp,
         records_bp,
         reviews_bp,
+        training_bp,
+        mcp_bp,
         agent_bp,
+        # 本机启动/停止脚本专用；没有 HX17_SERVICE_TOKEN 时一律 404。
+        service_bp,
     ):
         app.register_blueprint(blueprint, url_prefix="/api")
 

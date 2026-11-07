@@ -99,7 +99,14 @@ def activate_vendor() -> str:
     try:
         import ultralytics  # noqa: PLC0415 - 必须在 sys.path 调整之后导入
     except Exception as exc:  # pragma: no cover - 依赖缺失时才走到
-        raise VisionError("VISION_DEPENDENCY_MISSING", f"视觉依赖不可用：{type(exc).__name__}") from exc
+        # 只回传异常类型名会把“缺哪个包”抹掉：2026-11-07 现场缺 cv2 /
+        # pytorch_grad_cam 时前端只看到 ModuleNotFoundError，运维要翻 traceback
+        # 才知道补什么。这里把缺的模块名带出来（不含路径/环境变量等敏感信息）。
+        detail = type(exc).__name__
+        missing = getattr(exc, "name", None) if isinstance(exc, ModuleNotFoundError) else None
+        if missing:
+            detail = f"{detail}: {missing}"
+        raise VisionError("VISION_DEPENDENCY_MISSING", f"视觉依赖不可用：{detail}") from exc
     loaded = Path(str(getattr(ultralytics, "__file__", ""))).resolve()
     if VENDOR_PACKAGE.resolve() not in loaded.parents:
         raise VisionError(
@@ -162,11 +169,133 @@ def _detector(weight_path: Path, model_mode: str):
     return detector
 
 
+def _checkpoint_model(checkpoint: dict) -> Any:
+    """取出 checkpoint 里**真正可加载**的模型对象；没有就拒绝。
+
+    选择顺序必须与 vendor 完全一致：``backend/vendor/ultralytics/nn/tasks.py`` 的
+    实际加载处是 ``(ckpt.get('ema') or ckpt['model'])``——**EMA 优先**。两者同时非空
+    时若检查器选了 ``model``，就会出现“检查通过、真跑却用另一个对象”的分裂，
+    所以这里也用 ``ema or model``，不看谁的键在前。
+
+    只有 ``names`` 的字典不是模型——它能让类别校验通过，却会在真正加载/推理时才炸，
+    所以必须在入口就拒绝。
+    """
+    model = checkpoint.get("ema") or checkpoint.get("model")
+    if model is None:
+        raise VisionError(
+            "VISION_WEIGHT_NOT_MODEL",
+            "权重里没有模型对象（model/ema），只有类别表或元数据；"
+            "这不是可运行的训练/导出权重，不能当模型登记或发布",
+        )
+    return model
+
+
+def _require_supported_model(model: Any) -> None:
+    """架构校验：只接受 vendor 的 YOLO/YOLOMM 模型（``BaseModel`` 及其子类）。"""
+    from ultralytics.nn.tasks import BaseModel  # noqa: PLC0415 - 必须在 activate_vendor 之后
+
+    if not isinstance(model, BaseModel):
+        raise VisionError(
+            "VISION_WEIGHT_NOT_MODEL",
+            f"权重里的 model/ema 不是本工程支持的 YOLO/YOLOMM 模型（{type(model).__name__}），"
+            "拒绝登记",
+        )
+
+
+def _weight_modality(model: Any) -> dict:
+    """按 vendor 自己的判定读取权重真实模态结构。
+
+    不能只看类名：真实 YOLOMM 训练权重反序列化后仍是 ``DetectionModel``
+    （vendor 用同一个类 + ``MultiModalRouter`` 表达多模态），类名里没有 "mm"；
+    反过来，只看旧布尔值会把真实双模态权重误判成单模态并拒绝。这里逐项取证：
+
+    * YAML 的 5 字段路由注解（``has_multimodal_config`` / ``has_multimodal_routing_layers``）；
+    * 持久化的 ``multimodal_router`` / ``mm_router``；
+    * 模型 ``metadata`` 里的 ``x_modality_name`` / ``primary_modality_name``。
+
+    这些信息都由 vendor 在训练/导出时写入权重，不靠文件名猜，也不需要推理。
+    """
+    from ultralytics.nn.mm.utils import (  # noqa: PLC0415 - 必须在 activate_vendor 之后
+        MM_X_MODALITY_KEY,
+        has_multimodal_config,
+        has_multimodal_routing_layers,
+    )
+
+    yaml_cfg = getattr(model, "yaml", None)
+    yaml_cfg = yaml_cfg if isinstance(yaml_cfg, dict) else {}
+    router = getattr(model, "multimodal_router", None) or getattr(model, "mm_router", None)
+
+    metadata: dict[str, Any] = {}
+    for candidate in (model, getattr(model, "model", None)):
+        raw = getattr(candidate, "metadata", None)
+        if isinstance(raw, dict):
+            metadata.update(raw)
+    yaml_metadata = yaml_cfg.get("metadata")
+    if isinstance(yaml_metadata, dict):
+        metadata = {**yaml_metadata, **metadata}
+
+    yaml_routing = bool(yaml_cfg) and has_multimodal_config(yaml_cfg)
+    routing_layers = bool(yaml_cfg) and has_multimodal_routing_layers(yaml_cfg)
+    router_flag = bool(getattr(router, "has_multimodal_config", False))
+    legacy_flag = type(model).__name__.lower().startswith("mm") or bool(
+        getattr(model, "multimodal", False)
+    )
+
+    annotations = 0
+    for layer in list(yaml_cfg.get("backbone") or []) + list(yaml_cfg.get("head") or []):
+        if isinstance(layer, (list, tuple)) and len(layer) >= 5 and layer[4]:
+            annotations += 1
+
+    secondary = (
+        metadata.get(MM_X_MODALITY_KEY)
+        or getattr(router, "x_modality_type", None)
+        or None
+    )
+    secondary = _clean_modality(secondary)
+    primary = metadata.get("primary_modality_name") or getattr(
+        router, "primary_modality_type", None
+    )
+    # vendor 的 DetectionModel 默认就挂一个 MultiModalRouter（``x_modality_type='unknown'``），
+    # 所以“有 router 对象”不是多模态证据——按它判断会把任何单模态权重都说成双模态。
+    # 只有：YAML 有 5 字段路由注解 / router 自己被配置成多模态 / metadata 写了 X 模态，
+    # 才算真实的双模态权重。
+    multimodal = bool(
+        yaml_routing or routing_layers or router_flag or legacy_flag or secondary
+    )
+    primary = _clean_modality(primary) or ("rgb" if multimodal else None)
+
+    evidence = {
+        "yaml_routing": bool(yaml_routing),
+        "routing_layers": bool(routing_layers),
+        "router": router_flag,
+        "metadata": bool(secondary or metadata.get("primary_modality_name")),
+        "legacy_flag": bool(legacy_flag),
+        "routing_annotations": int(annotations),
+    }
+    return {
+        "multimodal": multimodal,
+        "multimodal_evidence": evidence,
+        "primary_modality": primary,
+        "secondary_modality": secondary,
+    }
+
+
+def _clean_modality(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text or text in {"unknown", "none", "null"}:
+        return None
+    return text[:16]
+
+
 def inspect_weight(weight_path: Path) -> dict:
     """读取权重的类别表与规模；读不出来就明确失败（导入时用）。
 
     反序列化走 :mod:`backend.vision.safe_weight`：先静态解释 pickle 引用并逐个判定，
     再带白名单闸门加载。**不会**为了“能读出来”而回退到 ``weights_only=False`` 的裸加载。
+
+    结构上还要求 checkpoint 里真的带模型对象（``model`` 或 ``ema``）且是 vendor 支持的
+    架构：``{'names': {...}}`` 这种“只有类别表”的字典不是可运行权重，宁可在这里拒绝，
+    也不要登记成“就绪模型”等推理时才失败。
     """
     if not weight_path.is_file():
         raise VisionError("VISION_WEIGHT_MISSING", "权重文件不存在")
@@ -190,7 +319,11 @@ def inspect_weight(weight_path: Path) -> dict:
         raise VisionError(code, exc.message) from exc
     if not isinstance(checkpoint, dict):
         raise VisionError("VISION_WEIGHT_INVALID", "权重文件结构不是 PyTorch checkpoint")
-    model = checkpoint.get("model")
+    # vendor 的加载语义：``ckpt.get('ema') or ckpt['model']``——EMA 优先（训练态权重
+    # 把滑动平均放在 ema，推理权重常只有 model）。两者都没有就不是可运行权重，
+    # 不是“类别表的问题”。
+    model = _checkpoint_model(checkpoint)
+    _require_supported_model(model)
     names = getattr(model, "names", None) or checkpoint.get("names") or {}
     if isinstance(names, list):
         names = {index: str(name) for index, name in enumerate(names)}
@@ -200,12 +333,13 @@ def inspect_weight(weight_path: Path) -> dict:
             "权重里没有类别表，无法确定它输出的是什么类别；请在导入时显式提供类别映射",
         )
     clean = {int(index): str(name) for index, name in names.items()}
+    modality = _weight_modality(model)
     return {
         "classes": [{"index": index, "name": name} for index, name in sorted(clean.items())],
         "class_count": len(clean),
-        "kind": type(model).__name__ if model is not None else "unknown",
-        "multimodal": type(model).__name__.lower().startswith("mm")
-        or bool(getattr(model, "multimodal", False)),
+        "kind": type(model).__name__,
+        "task": str(getattr(model, "task", "") or ""),
+        **modality,
     }
 
 

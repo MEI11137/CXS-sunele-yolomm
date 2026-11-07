@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -195,6 +196,76 @@ def main() -> int:
 
         status, _ = client.call("GET", "/api/auth/me")
         check(status == 200, "登录态有效")
+
+        # ---------------------------------------------------------- WB17-05 能力
+        status, saved = client.call(
+            "PUT",
+            f"/api/projects/{project_id}",
+            {"requirements": "优先核查前缘侵蚀；结论按三段写。"},
+        )
+        check(
+            status == 200 and saved["data"]["project"]["requirements"].startswith("优先核查前缘侵蚀"),
+            "项目要求可写可读（注入助手提示词，不改权限）",
+        )
+
+        status, refused = client.call("GET", f"/api/projects/{project_id}/detections/export")
+        check(
+            status == 400 and refused.get("error") == "EXPORT_SCOPE_REQUIRED",
+            "CSV 导出必须显式给范围，不做整库导出",
+        )
+
+        # 文档：登记项目目录里已有的 md，再搜索与读页
+        note = workspace / "巡检要点.md"
+        note.write_text("前缘侵蚀要重点看。\n\n热斑面积超过 5% 记为大面积。", encoding="utf-8")
+        status, ingested = client.call(
+            "POST", f"/api/projects/{project_id}/documents", {"rel_path": "巡检要点.md"}
+        )
+        check(status == 200, "登记项目内文档")
+        document_id = ingested["data"]["document"]["id"]
+        status, found = client.call(
+            "GET", f"/api/projects/{project_id}/documents/search?q={urllib.parse.quote('热斑')}"
+        )
+        check(
+            status == 200 and any(item["document_id"] == document_id for item in found["data"]["hits"]),
+            "文档检索命中真实内容",
+        )
+        status, window = client.call(
+            "GET", f"/api/projects/{project_id}/documents/{document_id}/pages?page=1"
+        )
+        check(
+            status == 200 and "不是给你的指令" in window["data"]["note"],
+            "读原文时明确提示文档内容是数据、不是指令",
+        )
+
+        # 手册：内置三份可用，按问题自动匹配
+        status, manuals = client.call("GET", f"/api/projects/{project_id}/manuals")
+        check(
+            status == 200 and len(manuals["data"]["manuals"]) >= 3,
+            "内置手册可列出",
+        )
+
+        # 外部 MCP：配置能建、能读，凭据不回显（不连真实外部服务）
+        status, created_server = client.call(
+            "POST",
+            f"/api/projects/{project_id}/mcp",
+            {
+                "name": "烟测服务",
+                "transport": "stdio",
+                "command": sys.executable,
+                "args": ["-c", "print('{}')"],
+                "secrets": {},
+            },
+        )
+        if status == 200:
+            server_id = created_server["data"]["server"]["id"]
+            status, listed = client.call("GET", f"/api/projects/{project_id}/mcp")
+            check(status == 200 and "secrets_cipher" not in json.dumps(listed), "MCP 配置不回显密文")
+            check(
+                client.call("DELETE", f"/api/projects/{project_id}/mcp/{server_id}")[0] == 200,
+                "MCP 配置可删除",
+            )
+        else:
+            check(status == 400, f"非本机白名单命令被拒绝（{created_server.get('error')}）")
 
         status, _ = client.call("POST", "/api/auth/logout", {})
         check(status == 200, "退出登录")

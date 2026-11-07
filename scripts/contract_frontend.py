@@ -108,6 +108,14 @@ def main() -> int:
         check(login.status_code == 200, "普通成员通过真实 HTTP 登录")
         cookie = "; ".join(f"{item.name}={item.value}" for item in session.cookies)
 
+        device = session.get(f"{base}/api/projects/{project['id']}/training/device", timeout=10)
+        check(device.status_code == 200, "训练设备能力接口真实可用")
+        capabilities = device.json()["data"]
+        check(
+            capabilities.get("cpu") is True and isinstance(capabilities.get("cuda_available"), bool),
+            "设备能力字段齐全：CPU 恒可用，GPU 按部署机真实探测（不写死）",
+        )
+
         check(ZIP.is_file(), f"验收 ZIP 存在：{ZIP.name}")
         check(RGB.is_file() and IR.is_file(), "验收数据集里同时有 RGB 与 IR 真图")
         env = dict(os.environ)

@@ -4,13 +4,35 @@ import { errorMessage } from '@/api/http'
 import { useAuthStore } from '@/stores/auth'
 import { useConnectionStore } from '@/stores/connection'
 import { useRuntimeStore } from '@/stores/runtime'
+import { useWorkspaceStore } from '@/stores/workspace'
 import { useUiStore } from '@/stores/ui'
+import DocumentsPanel from '@/components/DocumentsPanel.vue'
+import McpPanel from '@/components/McpPanel.vue'
 import type { ProviderPreset } from '@/types'
+
+/**
+ * 设置页：四分组（模型连接 / 项目资料与手册 / 工具连接 / 账号与外观），
+ * 默认只展开一组。切换用 v-show：组件常驻，未保存的草稿不因切组丢失。
+ *
+ * 模型连接默认是**简洁摘要**（真实模型 ID + 能力验证状态 + 修改连接）；
+ * 修改才进入编辑，可取消（恢复为已保存值）；Key 永不回显，失败保留输入。
+ * 未检查 / 已过期一律按“未验证”显示，不说成已验证。
+ */
 
 const auth = useAuthStore()
 const connection = useConnectionStore()
 const runtime = useRuntimeStore()
+const workspace = useWorkspaceStore()
 const ui = useUiStore()
+
+const GROUPS = [
+  { key: 'connection', label: '模型连接' },
+  { key: 'documents', label: '项目资料与手册' },
+  { key: 'tools', label: '工具连接' },
+  { key: 'account', label: '账号与外观' },
+] as const
+type GroupKey = (typeof GROUPS)[number]['key']
+const activeGroup = ref<GroupKey>('connection')
 
 const form = reactive({
   provider: 'deepseek',
@@ -20,9 +42,22 @@ const form = reactive({
   api_key: '',
 })
 const formError = ref('')
+const editing = ref(false)
 const passwordForm = reactive({ current: '', next: '', confirm: '' })
 const passwordError = ref('')
 const passwordNotice = ref('')
+
+/** 能力开关的中文名：只影响显示，开关真假完全来自后端 `/api/meta`。 */
+const FEATURE_LABELS: Record<string, string> = {
+  training: '模型训练',
+  documents: '项目资料',
+  manuals: '手册',
+  external_mcp: '外部 MCP',
+  agent: '助手对话',
+  detection: '图片检测',
+  review: '人工复核',
+  reflow: '数据回流',
+}
 
 const selectedProvider = computed<ProviderPreset | null>(
   () => connection.providers.find((item) => item.id === form.provider) ?? null,
@@ -69,9 +104,12 @@ function syncForm(): void {
   form.api_key = ''
 }
 
+// 编辑中不做同步：外部刷新（如检查完成）不能覆盖用户正在填的草稿。
 watch(
   () => connection.connection,
-  () => syncForm(),
+  () => {
+    if (!editing.value) syncForm()
+  },
 )
 
 function applyPreset(): void {
@@ -81,6 +119,19 @@ function applyPreset(): void {
     form.base_url = preset.base_url
   }
   if (!form.model && preset.models.length) form.model = preset.models[0]
+}
+
+function startEdit(): void {
+  syncForm()
+  formError.value = ''
+  editing.value = true
+}
+
+function cancelEdit(): void {
+  // 取消 = 回到已保存值，丢弃本次草稿（摘要视图同步恢复）。
+  syncForm()
+  formError.value = ''
+  editing.value = false
 }
 
 async function save(): Promise<void> {
@@ -100,7 +151,11 @@ async function save(): Promise<void> {
     display_name: form.display_name.trim(),
     api_key: form.api_key.trim() || undefined,
   })
-  if (ok) form.api_key = ''
+  if (ok) {
+    form.api_key = ''
+    editing.value = false
+    syncForm()
+  }
 }
 
 async function changePassword(): Promise<void> {
@@ -125,6 +180,10 @@ onMounted(async () => {
   await connection.loadProviders()
   await connection.load()
   syncForm()
+  // 首次没有连接：直接进入编辑（该填的字段就是首屏）。
+  if (!connection.connection) editing.value = true
+  // 资料与手册按项目存放：这里只要项目清单，选中哪个项目由面板自己管。
+  if (!workspace.projects.length) await workspace.loadProjects()
 })
 </script>
 
@@ -133,145 +192,174 @@ onMounted(async () => {
     <header class="page-header">
       <div>
         <h1>设置</h1>
-        <p class="subtitle">个人模型连接、账号安全与外观偏好</p>
+        <p class="subtitle">模型连接、项目资料与手册、工具连接、账号安全与外观偏好</p>
       </div>
     </header>
 
-    <section class="card">
+    <nav class="segmented settings-groups" role="tablist" aria-label="设置分组">
+      <button
+        v-for="group in GROUPS"
+        :key="group.key"
+        type="button"
+        :aria-pressed="activeGroup === group.key"
+        @click="activeGroup = group.key"
+      >
+        {{ group.label }}
+      </button>
+    </nav>
+
+    <!-- ---------------------------------------------------------------- 模型连接 -->
+    <section v-show="activeGroup === 'connection'" class="card">
       <h2>个人模型连接</h2>
       <p class="body-text">
-        连接只属于当前账号（{{ auth.user?.username }}），Key 加密保存在服务器，接口只回显掩码。
-        能力必须实测：<strong>厂商和模型名都不能证明它支持视觉或工具调用</strong>。
+        连接只属于当前账号（{{ auth.user?.username }}）；Key 加密保存在服务器，界面只回显掩码。
       </p>
 
-      <div v-if="connection.connection" class="connection-summary">
+      <!-- 默认：简洁摘要 + 真实能力状态；修改才进入编辑 -->
+      <div v-if="connection.connection && !editing" class="connection-summary">
         <dl class="kv compact">
+          <div><dt>模型</dt><dd>
+            <span class="mono">{{ connection.connection.model }}</span>
+            <span v-if="connection.connection.display_name" class="hint">
+              （{{ connection.connection.display_name }}）
+            </span>
+          </dd></div>
           <div><dt>接口</dt><dd class="mono">{{ connection.connection.base_url }}</dd></div>
-          <div><dt>模型 ID</dt><dd class="mono">{{ connection.connection.model }}</dd></div>
-          <div>
-            <dt>显示名</dt>
-            <dd>{{ connection.connection.display_name || '（未填）' }}</dd>
-          </div>
           <div><dt>Key</dt><dd class="mono">{{ connection.connection.key_hint }}</dd></div>
-          <div>
-            <dt>能力</dt>
-            <dd>
-              <span v-if="connection.connection.capabilities_stale" class="tag tag-off">未检查 / 已失效</span>
-              <span v-else class="tag tag-on">已检查</span>
+          <div><dt>检查时间</dt><dd>
+            <span v-if="connection.connection.capabilities_stale" class="tag tag-off">未检查 / 已失效</span>
+            <template v-else>
+              <span class="tag tag-on">已检查</span>
               <span v-if="connection.connection.checked_at" class="hint">
                 {{ connection.connection.checked_at }}
               </span>
-            </dd>
-          </div>
+            </template>
+          </dd></div>
         </dl>
         <p v-if="connection.connection.capabilities_stale" class="hint">
-          更换 Key、接口地址或模型 ID 后，旧的能力结论立即作废；请重新检查。
+          更换 Key、接口地址或模型 ID 后，旧的能力结论立即作废；点「检查连接与能力」重新验证。
         </p>
-      </div>
 
-      <div class="form-grid">
-        <label class="field">
-          <span>服务商预设</span>
-          <select v-model="form.provider" @change="applyPreset">
-            <option v-for="item in connection.providers" :key="item.id" :value="item.id">
-              {{ item.label }}
-            </option>
-          </select>
-        </label>
-        <label class="field">
-          <span>接口地址（base_url）</span>
-          <input v-model="form.base_url" placeholder="https://api.deepseek.com/v1" spellcheck="false" />
-        </label>
-        <label class="field">
-          <span>模型 ID（真实 ID，不是展示名）</span>
-          <input v-model="form.model" placeholder="deepseek-chat" spellcheck="false" />
-        </label>
-        <label class="field">
-          <span>显示名（可选，仅本机展示）</span>
-          <input v-model="form.display_name" placeholder="例如 我的 DeepSeek" />
-        </label>
-        <label class="field">
-          <span>API Key</span>
-          <input
-            v-model="form.api_key"
-            type="password"
-            autocomplete="off"
-            :placeholder="connection.connection ? `已保存 ${connection.connection.key_hint}，留空表示不修改` : '首次保存必填'"
-          />
-        </label>
-      </div>
-      <p v-if="selectedProvider?.note" class="hint">{{ selectedProvider.note }}</p>
-      <p v-if="formError" class="form-error">{{ formError }}</p>
-      <p v-if="connection.error" class="form-error">{{ connection.error }}</p>
-      <p v-if="connection.notice" class="banner banner-ok">{{ connection.notice }}</p>
+        <div class="cap-grid">
+          <div v-for="row in capabilityRows" :key="row.key" class="cap" :class="{ ok: row.value, unknown: !checked }">
+            <span class="cap-name">{{ row.label }}</span>
+            <span class="cap-state">
+              {{ !checked ? '未验证' : row.value ? '通过' : '未通过' }}
+            </span>
+          </div>
+        </div>
+        <p v-if="checked && authStateLabel" class="hint">认证判定：{{ authStateLabel }}</p>
 
-      <div class="form-actions">
-        <button class="primary" type="button" :disabled="connection.loading" @click="save">
-          {{ connection.connection ? '保存修改' : '保存连接' }}
-        </button>
-        <button
-          class="ghost"
-          type="button"
-          :disabled="!connection.connection || connection.checking"
-          @click="connection.check()"
-        >
-          {{ connection.checking ? '检查中…' : '检查连接与能力' }}
-        </button>
-        <button
-          v-if="connection.connection"
-          class="ghost danger-text"
-          type="button"
-          :disabled="connection.loading"
-          @click="connection.remove()"
-        >
-          删除连接
-        </button>
-      </div>
-      <p class="hint">
-        检查会依次请求 chat、视觉、工具三项，单项超时（连接 6 秒 / 读取 25 秒）后直接失败，
-        <strong>不会自动重试</strong>，避免产生不可控费用。
-      </p>
+        <details v-if="Object.keys(evidence).length" class="evidence">
+          <summary>诊断详情（检查证据）</summary>
+          <table class="table">
+            <thead>
+              <tr>
+                <th>步骤</th>
+                <th>HTTP</th>
+                <th>耗时(ms)</th>
+                <th>结束原因</th>
+                <th>结果说明</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(item, key) in evidence" :key="key">
+                <td>{{ item.step ?? key }}</td>
+                <td>{{ item.status }}</td>
+                <td>{{ item.latency_ms }}</td>
+                <td>{{ item.finish_reason ?? '—' }}</td>
+                <td>{{ item.note ?? item.outcome ?? '—' }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <p class="hint">证据只保留状态、耗时、环节与固定说明；上游返回的原文不会落库或回显。</p>
+        </details>
 
-      <div v-if="connection.connection" class="cap-grid">
-        <div v-for="row in capabilityRows" :key="row.key" class="cap" :class="{ ok: row.value, unknown: !checked }">
-          <span class="cap-name">{{ row.label }}</span>
-          <span class="cap-state">
-            {{ !checked ? '未检查' : row.value ? '通过' : '未通过' }}
-          </span>
+        <div class="form-actions">
+          <button class="primary" type="button" @click="startEdit">修改连接</button>
+          <button
+            class="ghost"
+            type="button"
+            :disabled="connection.checking"
+            @click="connection.check()"
+          >
+            {{ connection.checking ? '检查中…' : '检查连接与能力' }}
+          </button>
+          <button
+            class="ghost danger-text"
+            type="button"
+            :disabled="connection.loading"
+            @click="connection.remove()"
+          >
+            删除连接
+          </button>
         </div>
       </div>
-      <p v-if="checked && authStateLabel" class="hint">
-        认证判定：{{ authStateLabel }}。只有拿到 200 且返回真实回复才算“认证通过”；
-        402/429/5xx 都不会被当作 Key 已被接受。
-      </p>
 
-      <details v-if="connection.connection && Object.keys(evidence).length" class="evidence">
-        <summary>查看检查证据</summary>
-        <table class="table">
-          <thead>
-            <tr>
-              <th>步骤</th>
-              <th>HTTP</th>
-              <th>耗时(ms)</th>
-              <th>结束原因</th>
-              <th>结果说明</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="(item, key) in evidence" :key="key">
-              <td>{{ item.step ?? key }}</td>
-              <td>{{ item.status }}</td>
-              <td>{{ item.latency_ms }}</td>
-              <td>{{ item.finish_reason ?? '—' }}</td>
-              <td>{{ item.note ?? item.outcome ?? '—' }}</td>
-            </tr>
-          </tbody>
-        </table>
-        <p class="hint">证据只保留状态、耗时、环节与固定说明；上游返回的原文不会落库或回显。</p>
-      </details>
+      <!-- 编辑：首次（无连接）也走这块，字段就是要填的东西 -->
+      <div v-if="editing || !connection.connection">
+        <div class="form-grid">
+          <label class="field">
+            <span>服务商预设</span>
+            <select v-model="form.provider" @change="applyPreset">
+              <option v-for="item in connection.providers" :key="item.id" :value="item.id">
+                {{ item.label }}
+              </option>
+            </select>
+          </label>
+          <label class="field">
+            <span>接口地址（base_url）</span>
+            <input v-model="form.base_url" placeholder="https://api.deepseek.com/v1" spellcheck="false" />
+          </label>
+          <label class="field">
+            <span>模型 ID（真实 ID，不是展示名）</span>
+            <input v-model="form.model" placeholder="deepseek-chat" spellcheck="false" />
+          </label>
+          <label class="field">
+            <span>显示名（可选，仅本机展示）</span>
+            <input v-model="form.display_name" placeholder="例如 我的 DeepSeek" />
+          </label>
+          <label class="field">
+            <span>API Key</span>
+            <input
+              v-model="form.api_key"
+              type="password"
+              autocomplete="off"
+              :placeholder="connection.connection ? `已保存 ${connection.connection.key_hint}，留空表示不修改` : '首次保存必填'"
+            />
+          </label>
+        </div>
+        <p v-if="selectedProvider?.note" class="hint">{{ selectedProvider.note }}</p>
+        <p v-if="formError" class="form-error">{{ formError }}</p>
+        <p v-if="connection.error" class="form-error">{{ connection.error }}</p>
+        <p v-if="connection.notice" class="banner banner-ok">{{ connection.notice }}</p>
+
+        <div class="form-actions">
+          <button class="primary" type="button" :disabled="connection.loading" @click="save">
+            {{ connection.connection ? '保存修改' : '保存连接' }}
+          </button>
+          <button v-if="connection.connection" class="ghost" type="button" @click="cancelEdit">
+            取消（恢复为已保存值）
+          </button>
+        </div>
+        <p class="hint">
+          检查会依次请求 chat、视觉、工具三项，单项超时即失败，不自动重试。
+        </p>
+      </div>
     </section>
 
-    <section class="card">
+    <!-- ---------------------------------------------------------------- 资料与手册 -->
+    <div v-show="activeGroup === 'documents'" class="settings-panel">
+      <DocumentsPanel :projects="workspace.projects" :current-project-id="workspace.currentProjectId" />
+    </div>
+
+    <!-- ---------------------------------------------------------------- 工具连接 -->
+    <div v-show="activeGroup === 'tools'" class="settings-panel">
+      <McpPanel :projects="workspace.projects" :current-project-id="workspace.currentProjectId" />
+    </div>
+
+    <!-- ---------------------------------------------------------------- 账号与外观 -->
+    <section v-show="activeGroup === 'account'" class="card">
       <h2>账号安全</h2>
       <p class="body-text">修改后其它设备上的登录状态会立即失效，当前页面保持登录。</p>
       <div class="form-grid">
@@ -293,9 +381,7 @@ onMounted(async () => {
       <div class="form-actions">
         <button class="primary" type="button" @click="changePassword">更新密码</button>
       </div>
-    </section>
 
-    <section class="card">
       <h2>外观</h2>
       <div class="theme-row">
         <button
@@ -316,24 +402,48 @@ onMounted(async () => {
         </button>
       </div>
       <p class="hint">偏好只保存在这台电脑的浏览器里，不影响账号与服务器数据。</p>
-    </section>
 
-    <section class="card">
-      <h2>关于</h2>
-      <dl class="kv">
-        <div><dt>版本</dt><dd>{{ runtime.meta?.version ?? '—' }}</dd></div>
-        <div><dt>阶段</dt><dd>{{ runtime.meta?.stage ?? '—' }}</dd></div>
-        <div><dt>登录方式</dt><dd>HttpOnly Cookie（服务端可吊销）</dd></div>
-      </dl>
-      <ul class="feature-list">
-        <li v-for="[key, enabled] in Object.entries(runtime.meta?.features ?? {})" :key="key">
-          <span class="mono">{{ key }}</span>
-          <span class="tag" :class="enabled ? 'tag-on' : 'tag-off'">{{ enabled ? '已实现' : '未实现' }}</span>
-        </li>
-      </ul>
-      <p class="hint">
-        数据目录、端口与密钥路径属于服务端内部配置，不会通过任何接口返回。
-      </p>
+      <details class="about-details">
+        <summary>关于本系统</summary>
+        <dl class="kv">
+          <div><dt>版本</dt><dd>{{ runtime.meta?.version ?? '—' }}</dd></div>
+          <div><dt>阶段</dt><dd>{{ runtime.meta?.stage ?? '—' }}</dd></div>
+          <div><dt>登录方式</dt><dd>HttpOnly Cookie（服务端可吊销）</dd></div>
+        </dl>
+        <ul class="feature-list">
+          <li v-for="[key, enabled] in Object.entries(runtime.meta?.features ?? {})" :key="key">
+            <span>{{ FEATURE_LABELS[key] ?? key }}</span>
+            <span class="mono hint">{{ key }}</span>
+            <span class="tag" :class="enabled ? 'tag-on' : 'tag-off'">{{ enabled ? '已实现' : '未实现' }}</span>
+          </li>
+        </ul>
+        <p class="hint">功能开关状态来自服务器 `/api/meta`，与实际接口一致。</p>
+      </details>
     </section>
   </section>
 </template>
+
+<style scoped>
+.settings-groups {
+  margin-bottom: 12px;
+}
+
+.settings-panel {
+  margin-top: 0;
+}
+
+.connection-summary {
+  margin-bottom: 12px;
+}
+
+.about-details summary {
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-top: 16px;
+}
+
+.about-details[open] {
+  margin-top: 8px;
+}
+</style>

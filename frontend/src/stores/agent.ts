@@ -14,6 +14,8 @@ import type {
   TurnEvent,
 } from '@/types'
 import { useWorkspaceStore } from '@/stores/workspace'
+import { useSyncStore } from '@/stores/sync'
+import type { SyncScope } from '@/stores/sync'
 
 /**
  * Agent 运行时（OpenCode 引擎 + 私有工具桥）。
@@ -31,6 +33,7 @@ const POLL_CEILING_MS = 20 * 60 * 1000
 
 export const useAgentStore = defineStore('agent', () => {
   const workspace = useWorkspaceStore()
+  const sync = useSyncStore()
 
   const capabilities = ref<AgentCapabilities | null>(null)
   const preferences = ref<AgentPreferences | null>(null)
@@ -319,9 +322,16 @@ export const useAgentStore = defineStore('agent', () => {
 
   // ------------------------------------------------------------------ 轮询
 
-  /** 单独拉某一轮的事件（终态追溯用；已在轮询里的那一轮不重复拉）。 */
-  async function loadTurnEvents(turnId: string): Promise<void> {
-    if (events[turnId]?.length) return
+  /**
+   * 单独拉某一轮的事件（终态追溯用；已在轮询里的那一轮不重复拉）。
+   *
+   * ``force`` 用于用户主动展开历史详情：即使之前拉过一小段，也补一次最新的；
+   * 无论哪种方式，事件都只按 ``meta.turn_id`` 落在**它自己**那一轮上，
+   * 不会把最新事件挂到旧回答旁边。
+   */
+  async function loadTurnEvents(turnId: string, force = false): Promise<void> {
+    if (!turnId) return
+    if (!force && events[turnId]?.length) return
     const token = generation
     try {
       const detail = await http.get<TurnDetail>(
@@ -334,8 +344,22 @@ export const useAgentStore = defineStore('agent', () => {
     }
   }
 
+  /**
+   * 后台工具改了项目/会话后，当前页面要立刻反映（否则只有 F5 才生效）。
+   *
+   * 只重读**列表**，不动消息缓存、不清筛选、不打断正在输入的内容；同一事件按 seq
+   * 只处理一次（见 sync store），不会每个 token 都请求全站。业务资源（数据集/模型/
+   * 资料/手册/草稿）由各页面 watch 对应的版本号后用自己的 loader 重读。
+   */
+  function refreshBusiness(scopes: Set<SyncScope>): void {
+    if (scopes.has('projects')) void workspace.loadProjects()
+    const projectId = workspace.currentProjectId
+    if (projectId && scopes.has('sessions')) void workspace.loadSessions(projectId)
+  }
+
   function adopt(turn: Turn, incoming: TurnEvent[], turnActions: AgentAction[]): void {
     live[turn.session_id] = turn
+    const scopes = sync.apply(turn.id, incoming)
     if (incoming.length) {
       events[turn.id] = mergeEvents(events[turn.id] ?? [], incoming)
     }
@@ -344,6 +368,7 @@ export const useAgentStore = defineStore('agent', () => {
       for (const action of turnActions) merged.set(action.id, action)
       actions[turn.id] = [...merged.values()]
     }
+    refreshBusiness(scopes)
     if (isTerminalStatus(turn.status)) {
       // 按会话刷新：缓存是按会话存的，不会把用户正在看的另一个会话覆盖掉。
       void workspace.loadMessages(turn.session_id, true)
@@ -410,6 +435,8 @@ export const useAgentStore = defineStore('agent', () => {
     if (token !== generation) return
     delete pollIssue[turnId]
     live[detail.turn.session_id] = detail.turn
+    const scopes = sync.apply(turnId, detail.events)
+    refreshBusiness(scopes)
     events[turnId] = mergeEvents(events[turnId] ?? [], detail.events)
     if (detail.actions.length) {
       const merged = new Map((actions[turnId] ?? []).map((item) => [item.id, item]))
@@ -439,6 +466,7 @@ export const useAgentStore = defineStore('agent', () => {
     for (const key of Object.keys(actions)) delete actions[key]
     for (const key of Object.keys(sessionActions)) delete sessionActions[key]
     for (const key of Object.keys(pollIssue)) delete pollIssue[key]
+    sync.reset()
     capabilities.value = null
     preferences.value = null
     error.value = ''

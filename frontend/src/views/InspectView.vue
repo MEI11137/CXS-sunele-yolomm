@@ -3,7 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import * as api from '@/api/business'
 import { errorMessage } from '@/api/http'
-import { inspectFieldHint, inspectSecondaryLabel } from '@/lib/business'
+import { inspectFieldHint, inspectSecondaryLabel, recordStatusLabel } from '@/lib/business'
 import { useBusinessStore } from '@/stores/business'
 import type { AssetSummary, DetectionRecord, ModelSummary } from '@/types'
 
@@ -31,6 +31,13 @@ const model = computed<ModelSummary | null>(
 const multimodal = computed(() => model.value?.model_mode === 'multimodal')
 const secondary = computed(() => String(model.value?.secondary_modality ?? 'ir'))
 const secondaryLabel = computed(() => inspectSecondaryLabel(secondary.value))
+/** 模型绑定数据集的主模态：单 IR 模型的原图就是红外图，不是缺了 RGB。 */
+const primaryModality = computed<'rgb' | 'ir'>(() =>
+  model.value?.dataset_primary_modality === 'ir' ? 'ir' : 'rgb',
+)
+const primaryLabel = computed(() =>
+  primaryModality.value === 'ir' ? '红外 IR 原图' : '可见光 RGB 原图',
+)
 
 const images = ref<AssetSummary[]>([])
 const rgbId = ref('')
@@ -51,7 +58,14 @@ const hint = computed(() => {
   })
 })
 
-const rgbOptions = computed(() => images.value.filter((item) => item.role !== 'ir' && item.role !== 'edge'))
+// 单 IR 模型：主图选择不再把 role=ir 的资产藏起来（它就是唯一的输入）。
+const rgbOptions = computed(() =>
+  images.value.filter((item) =>
+    primaryModality.value === 'ir'
+      ? item.role !== 'edge'
+      : item.role !== 'ir' && item.role !== 'edge',
+  ),
+)
 const xOptions = computed(() =>
   images.value.filter((item) => item.role === secondary.value || item.role === 'x' || item.role === 'image'),
 )
@@ -59,6 +73,11 @@ const xOptions = computed(() =>
 onMounted(async () => {
   await business.loadModels(projectId.value)
   await loadImages()
+  // 模型页「去巡检」带真实模型 ID 预选（只选中，不自动跑）。
+  const presetModel = String(route.query.model ?? '')
+  if (presetModel && models.value.some((item) => item.id === presetModel)) {
+    selectedModelId.value = presetModel
+  }
   if (!selectedModelId.value && models.value.length) selectedModelId.value = models.value[0].id
 })
 
@@ -84,7 +103,7 @@ async function onUpload(event: Event, target: 'rgb' | 'x'): Promise<void> {
   uploading.value = target
   localError.value = ''
   try {
-    const role = target === 'rgb' ? 'rgb' : secondary.value
+    const role = target === 'rgb' ? primaryModality.value : secondary.value
     const asset = await api.uploadAsset(projectId.value, file, { role })
     if (asset.kind !== 'image') {
       localError.value = `这个文件按内容被识别为 ${asset.kind}，不是图片`
@@ -103,7 +122,7 @@ async function onUpload(event: Event, target: 'rgb' | 'x'): Promise<void> {
 
 async function submit(): Promise<void> {
   if (!model.value || !rgbId.value) {
-    localError.value = '需要选择一个已发布模型和一张 RGB 图片'
+    localError.value = `需要选择一个已发布模型和一张${primaryLabel.value}`
     return
   }
   localError.value = ''
@@ -160,8 +179,15 @@ function openRecords(): void {
     <p v-if="business.error" class="banner banner-error" role="alert">{{ business.error }}</p>
     <p v-if="localError" class="banner banner-error" role="alert">{{ localError }}</p>
 
+    <!-- 范围说明只写一行可执行信息：支持什么、不支持什么，不解释内部实现。 -->
+    <p class="hint scope-note">
+      支持静态图片（单张上传或项目内已有图片）；按目录批量巡检请在对话里让助手执行；
+      暂不支持视频与实时画面。
+    </p>
+
     <div class="card">
       <p class="card-head">检测参数</p>
+      <!-- 顺序就是操作顺序：模型 → 原图/配图 → 置信度 → 开始检测。 -->
       <div class="form-grid">
         <label class="field">
           <span>已发布模型</span>
@@ -173,15 +199,11 @@ function openRecords(): void {
           </select>
         </label>
         <label class="field">
-          <span>置信度</span>
-          <input v-model.number="confidence" type="number" min="0.01" max="0.99" step="0.01" />
-        </label>
-        <label class="field">
-          <span>RGB 图片</span>
+          <span>{{ primaryLabel }}</span>
           <select v-model="rgbId">
             <option value="">选择项目内图片</option>
             <option v-for="item in rgbOptions" :key="item.id" :value="item.id">
-              {{ item.filename }}（{{ item.width }}×{{ item.height }}）
+              {{ item.filename }}（{{ item.width }}×{{ item.height }}<template v-if="item.role"> · {{ item.role }}</template>）
             </option>
           </select>
         </label>
@@ -193,6 +215,10 @@ function openRecords(): void {
               {{ item.filename }}（{{ item.role }}）
             </option>
           </select>
+        </label>
+        <label class="field">
+          <span>置信度阈值</span>
+          <input v-model.number="confidence" type="number" min="0.01" max="0.99" step="0.01" />
         </label>
       </div>
 
@@ -220,20 +246,20 @@ function openRecords(): void {
           :disabled="!model || !rgbId || business.busy === 'detect'"
           @click="submit"
         >
-          {{ business.busy === 'detect' ? '检测中…' : '运行检测' }}
+          {{ business.busy === 'detect' ? '检测中…' : '开始检测' }}
         </button>
       </div>
     </div>
 
     <article v-if="record" class="card">
       <p class="card-head">本次结果 · {{ record.id }}</p>
-      <div class="kv">
-        <span>状态</span><span>{{ record.status }}</span>
-        <span>命中</span><span>{{ record.hit_count }}</span>
-        <span>置信度</span><span class="mono">{{ record.confidence }}</span>
-        <span>配图来源</span><span>{{ record.x_origin }}</span>
-        <span>时间</span><span class="mono">{{ record.created_at_local }}</span>
-      </div>
+      <dl class="kv">
+        <div><dt>状态</dt><dd>{{ recordStatusLabel(record.status) }}</dd></div>
+        <div><dt>命中</dt><dd>{{ record.hit_count }}</dd></div>
+        <div><dt>阈值</dt><dd class="mono">{{ record.confidence }}（本次运行的阈值，不是框分数）</dd></div>
+        <div><dt>配图来源</dt><dd>{{ record.x_origin }}</dd></div>
+        <div><dt>时间</dt><dd class="mono">{{ record.created_at_local }}</dd></div>
+      </dl>
       <p v-if="record.error" class="form-error">{{ record.error.message }}</p>
       <ul v-if="record.boxes.length" class="business-items">
         <li v-for="(box, index) in record.boxes" :key="index">

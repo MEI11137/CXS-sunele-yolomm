@@ -15,7 +15,21 @@ import type {
   ReflowDraft,
   ReflowPlan,
   ReviewState,
+  DocumentSearchResult,
+  DocumentStats,
+  DocumentWindow,
+  ManualDetail,
+  ManualSummary,
+  McpCallAudit,
+  McpCallResult,
+  McpDiscoverResult,
+  McpServer,
+  ProjectDocument,
   ReviewVersion,
+  TrainingComparison,
+  TrainingDeviceCapabilities,
+  TrainingPlan,
+  TrainingRun,
 } from '@/types'
 
 /**
@@ -135,8 +149,12 @@ export async function datasetSamples(
 
 // --------------------------------------------------------------------- 模型
 
-export async function listModels(projectId: string): Promise<{ models: ModelSummary[] }> {
-  return http.get(`${project(projectId)}/models`)
+export async function listModels(
+  projectId: string,
+  includeDeleted = false,
+): Promise<{ models: ModelSummary[] }> {
+  const suffix = includeDeleted ? '?include_deleted=1' : ''
+  return http.get(`${project(projectId)}/models${suffix}`)
 }
 
 export async function importModel(
@@ -161,6 +179,103 @@ export async function publishModel(
   modelId: string,
 ): Promise<{ model: ModelSummary }> {
   return http.post(`${project(projectId)}/models/${encodeURIComponent(modelId)}/publish`, {})
+}
+
+export async function unpublishModel(
+  projectId: string,
+  modelId: string,
+): Promise<{ model: ModelSummary }> {
+  return http.post(`${project(projectId)}/models/${encodeURIComponent(modelId)}/unpublish`, {})
+}
+
+export async function patchModel(
+  projectId: string,
+  modelId: string,
+  payload: { name?: string; notes?: string },
+): Promise<{ model: ModelSummary }> {
+  return http.patch(`${project(projectId)}/models/${encodeURIComponent(modelId)}`, payload)
+}
+
+export async function deleteModel(
+  projectId: string,
+  modelId: string,
+): Promise<{ model: ModelSummary }> {
+  return http.del(`${project(projectId)}/models/${encodeURIComponent(modelId)}`)
+}
+
+export async function restoreModel(
+  projectId: string,
+  modelId: string,
+): Promise<{ model: ModelSummary }> {
+  return http.post(`${project(projectId)}/models/${encodeURIComponent(modelId)}/restore`, {})
+}
+
+// --------------------------------------------------------------------- 训练
+
+export async function listTraining(
+  projectId: string,
+  limit = 30,
+): Promise<{ runs: TrainingRun[]; lock: { held: boolean; run_id: string; project_id: string } }> {
+  return http.get(`${project(projectId)}/training?limit=${limit}`)
+}
+
+export async function planTraining(
+  projectId: string,
+  payload: {
+    dataset_id: string
+    params?: Record<string, number | string | boolean>
+    parent_model_id?: string | null
+    name?: string
+  },
+): Promise<TrainingPlan> {
+  return http.post(`${project(projectId)}/training/plan`, payload)
+}
+
+export async function startTraining(
+  projectId: string,
+  payload: {
+    dataset_id: string
+    request_key: string
+    params?: Record<string, number | string | boolean>
+    parent_model_id?: string | null
+    name?: string
+  },
+): Promise<{ run: TrainingRun; created: boolean }> {
+  return http.post(`${project(projectId)}/training`, payload)
+}
+
+export async function getTrainingRun(
+  projectId: string,
+  runId: string,
+): Promise<{ run: TrainingRun }> {
+  return http.get(`${project(projectId)}/training/${encodeURIComponent(runId)}`)
+}
+
+export async function trainingLog(
+  projectId: string,
+  runId: string,
+  offset = 0,
+): Promise<{ text: string; next: number; size: number; eof: boolean }> {
+  return http.get(`${project(projectId)}/training/${encodeURIComponent(runId)}/log?offset=${offset}`)
+}
+
+export async function cancelTraining(
+  projectId: string,
+  runId: string,
+): Promise<{ run: TrainingRun }> {
+  return http.post(`${project(projectId)}/training/${encodeURIComponent(runId)}/cancel`, {})
+}
+
+export async function compareTraining(
+  projectId: string,
+  runId: string,
+): Promise<TrainingComparison> {
+  return http.get(`${project(projectId)}/training/${encodeURIComponent(runId)}/compare`)
+}
+
+/** 训练设备真实能力：CPU 恒可用；GPU 看部署机探测结果（不写死 CPU）。 */
+export async function trainingDevice(projectId: string): Promise<TrainingDeviceCapabilities> {
+  return http.get(`${project(projectId)}/training/device`)
 }
 
 // --------------------------------------------------------------------- 记录
@@ -254,7 +369,13 @@ export async function getReviewState(projectId: string, recordId: string): Promi
 export async function saveReviewDraft(
   projectId: string,
   recordId: string,
-  payload: { boxes: ReviewBoxPayload[]; note?: string; base_version: number },
+  payload: {
+    boxes: ReviewBoxPayload[]
+    /** 辅模态框：各自原图像素坐标；不传保留已存值，显式 [] 才清空。 */
+    x_boxes?: ReviewBoxPayload[]
+    note?: string
+    base_version: number
+  },
 ): Promise<{ state: ReviewState }> {
   return http.post(`${project(projectId)}/detections/${encodeURIComponent(recordId)}/review/draft`, payload)
 }
@@ -264,6 +385,7 @@ export async function submitReview(
   recordId: string,
   payload: {
     boxes: ReviewBoxPayload[]
+    x_boxes?: ReviewBoxPayload[]
     outcome: 'defect' | 'no_defect'
     note?: string
     base_version: number
@@ -272,6 +394,49 @@ export async function submitReview(
   },
 ): Promise<{ version: ReviewVersion; created: boolean }> {
   return http.post(`${project(projectId)}/detections/${encodeURIComponent(recordId)}/review/submit`, payload)
+}
+
+export interface ReviewEvent {
+  record_id: string
+  version: number
+  status: 'draft' | 'confirmed' | 'rejected'
+  outcome: 'defect' | 'no_defect' | null
+  updated_at: string
+}
+
+/** Agent/其他页面改草稿后的只读投影；after 传上次收到的 updated_at，避免重复刷新。 */
+export interface ReviewProjection {
+  id: string
+  record_id: string
+  version: number
+  status: 'draft' | 'confirmed' | 'rejected'
+  outcome: 'defect' | 'no_defect' | null
+  updated_at: string
+}
+
+export async function getReviewEvents(
+  projectId: string,
+  params: {
+    after?: string
+    after_version?: number
+    record_id?: string
+    limit?: number
+    latest?: boolean
+  } = {},
+): Promise<{
+  events: ReviewEvent[]
+  last: string | null
+  last_version?: number | null
+  projection?: ReviewProjection | null
+}> {
+  const query = new URLSearchParams()
+  if (params.after) query.set('after', params.after)
+  if (typeof params.after_version === 'number') query.set('after_version', String(params.after_version))
+  if (params.record_id) query.set('record_id', params.record_id)
+  if (params.limit) query.set('limit', String(params.limit))
+  if (params.latest) query.set('latest', '1')
+  const suffix = query.toString()
+  return http.get(`${project(projectId)}/review-events${suffix ? `?${suffix}` : ''}`)
 }
 
 export async function rejectReview(
@@ -351,6 +516,7 @@ export async function reflowPreview(
     strategy?: 'even' | 'ratio' | 'manual'
     ratios?: Record<string, number>
     seed?: number
+    reference_modality?: 'rgb' | 'ir' | 'edge' | 'depth' | null
   },
 ): Promise<ReflowPlan> {
   return http.post(`${project(projectId)}/reflow/preview`, payload)
@@ -374,6 +540,7 @@ export async function reflowApply(
     seed?: number
     request_key: string
     session_id?: string
+    reference_modality?: 'rgb' | 'ir' | 'edge' | 'depth' | null
   },
 ): Promise<{ dataset: DatasetSummary }> {
   return http.post(`${project(projectId)}/reflow/apply`, payload)
@@ -402,6 +569,7 @@ export async function saveReflowDraft(
     ratios?: Record<string, number>
     seed: number
     session_id?: string
+    reference_modality?: 'rgb' | 'ir' | 'edge' | 'depth' | null
   },
 ): Promise<{ draft: ReflowDraft }> {
   return http.post(`${project(projectId)}/reflow/drafts`, payload)
@@ -446,4 +614,201 @@ export async function restoreDataset(projectId: string, datasetId: string): Prom
  */
 export function datasetExportUrl(projectId: string, datasetId: string): string {
   return apiUrl(`${project(projectId)}/datasets/${encodeURIComponent(datasetId)}/export`)
+}
+
+/**
+ * 识别记录 CSV 导出地址：只支持 scope=selected（明确 ID 清单）。
+ * 「导出当前显示」传页面现有记录，「导出所选」传勾选的记录——范围与文件内容一致，
+ * 不做含糊的整项目导出。下载走 `<a href download>`，不经过 XHR。
+ */
+export function recordsExportUrl(projectId: string, recordIds: string[]): string {
+  const query = new URLSearchParams({ scope: 'selected', ids: recordIds.join(',') })
+  return apiUrl(`${project(projectId)}/detections/export?${query.toString()}`)
+}
+
+// --------------------------------------------------------------------- 资料与手册
+
+export async function listDocuments(
+  projectId: string,
+  options: { includeDeleted?: boolean } = {},
+): Promise<{ documents: ProjectDocument[]; stats: DocumentStats }> {
+  const suffix = options.includeDeleted ? '?include_deleted=1' : ''
+  return http.get(`${project(projectId)}/documents${suffix}`)
+}
+
+export async function uploadDocument(
+  projectId: string,
+  file: File,
+  name?: string,
+): Promise<ProjectDocument> {
+  const form = new FormData()
+  form.append('file', file, file.name)
+  if (name) form.append('name', name)
+  const token = readCsrf()
+  const response = await fetch(apiUrl(`${project(projectId)}/documents`), {
+    method: 'POST',
+    body: form,
+    credentials: 'same-origin',
+    headers: token ? { 'X-CSRF-Token': token, Accept: 'application/json' } : { Accept: 'application/json' },
+  })
+  let payload: { code?: number; msg?: string; error?: string; data?: { document: ProjectDocument } } | null = null
+  try {
+    payload = await response.json()
+  } catch {
+    payload = null
+  }
+  if (!response.ok || !payload || payload.code !== 0 || !payload.data) {
+    throw new ApiError(response.status, payload?.msg || `上传失败（HTTP ${response.status}）`, payload?.error ?? '')
+  }
+  return payload.data.document
+}
+
+export async function searchDocuments(
+  projectId: string,
+  query: string,
+  documentId?: string,
+): Promise<DocumentSearchResult> {
+  const params = new URLSearchParams({ q: query })
+  if (documentId) params.set('document_id', documentId)
+  return http.get(`${project(projectId)}/documents/search?${params.toString()}`)
+}
+
+export async function documentPages(
+  projectId: string,
+  documentId: string,
+  page = 1,
+  span = 0,
+): Promise<DocumentWindow> {
+  return http.get(
+    `${project(projectId)}/documents/${encodeURIComponent(documentId)}/pages?page=${page}&span=${span}`,
+  )
+}
+
+export async function deleteDocument(projectId: string, documentId: string): Promise<{ document: ProjectDocument }> {
+  return http.del(`${project(projectId)}/documents/${encodeURIComponent(documentId)}`)
+}
+
+export async function restoreDocument(projectId: string, documentId: string): Promise<{ document: ProjectDocument }> {
+  return http.post(`${project(projectId)}/documents/${encodeURIComponent(documentId)}/restore`, {})
+}
+
+/** 下载走 `<a href download>`，与其余接口共用同一个 base，避免嵌入宿主下打到错误的源。 */
+export function documentDownloadUrl(projectId: string, documentId: string): string {
+  return apiUrl(`${project(projectId)}/documents/${encodeURIComponent(documentId)}/download`)
+}
+
+export async function listManuals(projectId: string): Promise<{ manuals: ManualSummary[] }> {
+  return http.get(`${project(projectId)}/manuals`)
+}
+
+export async function readManual(projectId: string, manualId: string): Promise<ManualDetail> {
+  return http.get(`${project(projectId)}/manuals/${encodeURIComponent(manualId)}`)
+}
+
+export async function createManual(
+  projectId: string,
+  payload: { name: string; content: string; description?: string },
+): Promise<ManualDetail> {
+  return http.post(`${project(projectId)}/manuals`, payload)
+}
+
+export async function addManualVersion(
+  projectId: string,
+  manualId: string,
+  payload: { content: string; note?: string },
+): Promise<ManualDetail> {
+  return http.post(`${project(projectId)}/manuals/${encodeURIComponent(manualId)}/versions`, payload)
+}
+
+export async function activateManualVersion(
+  projectId: string,
+  manualId: string,
+  versionId: string,
+): Promise<ManualDetail> {
+  return http.post(
+    `${project(projectId)}/manuals/${encodeURIComponent(manualId)}/versions/${encodeURIComponent(versionId)}/activate`,
+    {},
+  )
+}
+
+export async function deleteManual(projectId: string, manualId: string): Promise<{ status: string; id: string }> {
+  return http.del(`${project(projectId)}/manuals/${encodeURIComponent(manualId)}`)
+}
+
+// --------------------------------------------------------------------- 外部 MCP
+
+export async function listMcpServers(projectId: string): Promise<{ servers: McpServer[]; note: string }> {
+  return http.get(`${project(projectId)}/mcp`)
+}
+
+export interface McpServerInput {
+  name: string
+  transport: 'stdio' | 'http'
+  command?: string
+  args?: string[]
+  cwd_rel?: string
+  url?: string
+  env?: Record<string, string>
+  headers?: Record<string, string>
+  enabled?: boolean
+}
+
+export async function createMcpServer(
+  projectId: string,
+  payload: McpServerInput,
+): Promise<{ server: McpServer }> {
+  return http.post(`${project(projectId)}/mcp`, payload)
+}
+
+export async function updateMcpServer(
+  projectId: string,
+  serverId: string,
+  payload: Partial<McpServerInput>,
+): Promise<{ server: McpServer }> {
+  return http.patch(`${project(projectId)}/mcp/${encodeURIComponent(serverId)}`, payload)
+}
+
+export async function deleteMcpServer(
+  projectId: string,
+  serverId: string,
+): Promise<{ status: string; id: string }> {
+  return http.del(`${project(projectId)}/mcp/${encodeURIComponent(serverId)}`)
+}
+
+export async function discoverMcpServer(
+  projectId: string,
+  serverId: string,
+): Promise<McpDiscoverResult> {
+  return http.post(`${project(projectId)}/mcp/${encodeURIComponent(serverId)}/discover`, {})
+}
+
+export async function authorizeMcpTool(
+  projectId: string,
+  serverId: string,
+  tool: string,
+  decision: 'allow' | 'deny' | 'revoke',
+): Promise<{ tool: McpServer['tools'][number] }> {
+  return http.post(`${project(projectId)}/mcp/${encodeURIComponent(serverId)}/authorize`, {
+    tool,
+    decision,
+  })
+}
+
+export async function callMcpTool(
+  projectId: string,
+  serverId: string,
+  tool: string,
+  args: Record<string, unknown>,
+): Promise<McpCallResult> {
+  return http.post(`${project(projectId)}/mcp/${encodeURIComponent(serverId)}/call`, {
+    tool,
+    arguments: args,
+  })
+}
+
+export async function listMcpCalls(
+  projectId: string,
+  serverId: string,
+): Promise<{ calls: McpCallAudit[] }> {
+  return http.get(`${project(projectId)}/mcp/${encodeURIComponent(serverId)}/calls`)
 }

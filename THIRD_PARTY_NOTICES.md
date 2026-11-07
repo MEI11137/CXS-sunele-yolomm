@@ -29,9 +29,14 @@
 | anyio | mcp 的运行时依赖（显式声明，避免离线环境漏装） | MIT |
 | Pillow | 资产按真实内容判定（`Image.open` + `verify()`），导入期即依赖 | MIT-CMU |
 | PyYAML | `data.yaml` 的解析与生成 | MIT |
+| pypdf | 项目资料库的 PDF 解析（逐页取文本，不渲染） | BSD-3-Clause |
+| python-docx | 项目资料库的 Word 解析（段落与表格） | MIT |
+| waitress | 对外示范用的 WSGI 服务器（`deploy/serve.py` 起单端口，不用 Flask 开发服务器） | ZPL 2.1（Zope Public License） |
 
-许可文本位置：pip 安装后位于对应 `*.dist-info/licenses/LICENSE`（例如
-`pyyaml-6.0.3.dist-info/licenses/LICENSE`）；本仓库不复制这些文本，部署时随包分发。
+以上都是**第三方开源组件**（本工程只声明依赖并按其许可使用，不属于本项目自行开发的部分）；
+许可文本位置：pip 安装后位于对应 `*.dist-info/` 下（例如 Python 3.12+ 的 PEP 639 布局是
+`pyyaml-6.0.3.dist-info/licenses/LICENSE`，waitress 3.0.2 是
+`waitress-3.0.2.dist-info/LICENSE.txt`）；本仓库不复制这些文本，部署时随包分发。
 
 ## 运行时依赖（Python 视觉，**可选**，见 backend/requirements-vision.txt）
 
@@ -52,15 +57,21 @@
 | timm | vendor 中主干网络依赖 | Apache-2.0 |
 | ultralytics-thop | vendor 统计参数量/FLOPs | **AGPL-3.0** |
 
+Pillow、PyYAML、requests 在视觉清单里也出现，但用的是与基础依赖同一份包（上表已列），
+不重复声明；torch 的下限是 **2.6**（`safe_weight.py` 需要
+`torch.serialization.get_unsafe_globals_in_checkpoint`），高于这个下限的组合由部署方按驱动自选。
+
 ## 外部程序（不入库，按许可单独引入）
 
 ### OpenCode 1.19.4 — MIT
 
 - 用途：本工程的 Agent 执行层（模型循环、规划、工具调用）。**不修改其源码、不整目录复制**，
   以外部可执行文件方式调用。
-- 来源：`https://github.com/sst/opencode`；本机路径 `E:/OpenCode/bin/opencode.exe`，
-  可用 `HX17_ENGINE_EXE` 覆盖。版本校验默认严格 1.19.4（不匹配即拒绝启动），
-  可用 `HX17_ENGINE_VERSION` 与 `HX17_ENGINE_STRICT_VERSION` 调整。
+- 来源：`https://github.com/sst/opencode`（**外部程序，不随本仓库分发**）。本工作机的
+  开发环境用 `HX17_ENGINE_EXE` 指向本机的一份 1.19.4；没有配置时按 PATH 里的
+  `opencode` 查找，**不写死任何盘符或安装路径**（换机后路径不同是正常的）。
+  版本校验默认严格 1.19.4（不匹配即拒绝启动），可用 `HX17_ENGINE_VERSION` 与
+  `HX17_ENGINE_STRICT_VERSION` 调整。
 - 许可：MIT；上游 LICENSE 随其发布物分发，本仓库不复制其源码。
 - 调用方式：以 `serve`（headless HTTP）子进程运行，隐藏窗口、只绑 `127.0.0.1` 随机端口、
   随机 `OPENCODE_SERVER_PASSWORD`；每个「用户 + 会话 + 连接指纹」一个隔离运行目录
@@ -76,8 +87,10 @@
 ### vendor 定制 YOLO（ultralytics 派生，AGPL-3.0）— 已引入
 
 - 位置：`backend/vendor/ultralytics`（`__version__ = "8.3.163"`，见该目录 `__init__.py`）。
-  交付内容为 **1301 个源文件**（不含 `__pycache__`，约 9.8MB）；本机运行后会生成
-  `__pycache__`，不属于交付内容，也不应入库。
+  交付内容为 **1301 个源文件**（不含 `__pycache__`，约 9.8MB）；本机运行后会在
+  `backend/vendor/ultralytics/` 下生成 `__pycache__`，并在 `backend/vendor/logs/` 下生成
+  `error_report_*.txt` 错误报告——两者都是运行期产物，不属于交付内容，已加入 `.gitignore`
+  （报告本身保留在磁盘上供排查，不删除、也不改 vendor 源码）。
 - 来源：原工程 CXSDet-YOLOmm 的 `web-flask/vendor/ultralytics`（合作方提供），**源码逐字节复制、未做任何修改**；
   交付时的 `best.pt` 是用这套代码训练并保存的，反序列化依赖它的类定义。
 - 本工程对该目录的**唯一新增**是补齐上游许可证文本 `backend/vendor/ultralytics/LICENSE`
@@ -105,3 +118,8 @@
 
 功能与交互契约参考海巡智检 v1.6（保留其原有版权与许可声明）；v1.7 的业务代码按本工程
 结构重新实现，不整目录复制旧站源码。
+
+界面与交互设计参考 DeepSeek Harness（DSH）官方产品界面：
+`https://www.deepseek.com/en/harness/`（开源仓库 `https://github.com/deepseek-ai/deepseek-harness`）。
+本工程只参考其信息层级与交互方式，前端为自写 Vue 3 组件，**未复制其源码、样式表或静态资源**，
+也不随本仓库分发其任何文件。

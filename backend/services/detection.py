@@ -96,7 +96,67 @@ def _sha256(path: Path) -> str:
 def public_with_labels(conn, user_id: int, project_id: str, row) -> dict:
     """单条记录：带上目标数据集类别名。"""
     labels = _labels_by_model(conn, user_id, project_id, {str(row["model_id"])}).get(str(row["model_id"]))
-    return public(row, labels)
+    data = public(row, labels)
+    attach_filenames(conn, user_id, project_id, [data])
+    return data
+
+
+def attach_filenames(conn, user_id: int, project_id: str, records: list[dict]) -> None:
+    """给记录批量补上 RGB 原图的真实文件名（列表以文件名为主展示）。
+
+    一次查询取回全部资产名；记录仍以 ``rgb_asset_id`` 为准，文件名只是展示，
+    不参与任何身份/路径判断。
+    """
+    ids = sorted({str(item.get("rgb_asset_id") or "") for item in records} - {""})
+    if not ids:
+        return
+    placeholders = ", ".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT id, filename FROM assets WHERE project_id = ? AND owner_id = ? AND id IN ({placeholders})",
+        (str(project_id), int(user_id), *ids),
+    ).fetchall()
+    names = {str(row["id"]): str(row["filename"]) for row in rows}
+    for item in records:
+        item["rgb_filename"] = names.get(str(item.get("rgb_asset_id") or ""))
+
+
+def attach_primary_modality(conn, user_id: int, project_id: str, records: list[dict]) -> None:
+    """批量补主模态：记录用的模型绑定哪个数据集，原图就是那个模态。
+
+    单 IR 数据集的原图本身就是热红外图，界面/Agent 必须如实显示 ir；
+    默认 rgb 只用于没有绑定数据集的旧记录，不改变任何存储字段。
+    """
+    if not records:
+        return
+    model_ids = sorted({str(item.get("model_id") or "") for item in records} - {""})
+    mapping: dict[str, str] = {}
+    if model_ids:
+        placeholders = ", ".join("?" for _ in model_ids)
+        rows = conn.execute(
+            f"SELECT id, dataset_id FROM models WHERE project_id = ? AND owner_id = ?"
+            f" AND id IN ({placeholders})",
+            (str(project_id), int(user_id), *model_ids),
+        ).fetchall()
+        dataset_ids = sorted({str(row["dataset_id"] or "") for row in rows} - {""})
+        primaries: dict[str, str] = {}
+        if dataset_ids:
+            marks = ", ".join("?" for _ in dataset_ids)
+            for dataset in conn.execute(
+                f"SELECT id, modalities FROM datasets WHERE id IN ({marks})", tuple(dataset_ids)
+            ).fetchall():
+                modes = _loads(dataset["modalities"], [])
+                primaries[str(dataset["id"])] = str(modes[0]).lower() if modes else "rgb"
+        mapping = {
+            str(row["id"]): primaries.get(str(row["dataset_id"] or ""), "rgb") for row in rows
+        }
+    for item in records:
+        item["primary_modality"] = mapping.get(str(item.get("model_id") or ""), "rgb")
+
+
+def primary_modality_of_record(conn, user_id: int, project_id: str, record) -> str:
+    holder = {"model_id": record["model_id"]}
+    attach_primary_modality(conn, user_id, project_id, [holder])
+    return str(holder.get("primary_modality") or "rgb")
 
 
 def _labels_by_model(conn, user_id: int, project_id: str, model_ids: set[str]) -> dict[str, dict[int, str]]:
@@ -149,9 +209,16 @@ def list_for_project(
     limit: int = 20,
     before: str | None = None,
     deleted: str = "exclude",
+    q: str | None = None,
 ) -> dict:
-    """分页 + 筛选。日期按**本地日期**解释，并在返回里给出换算后的 UTC 边界。"""
+    """分页 + 筛选。日期按**本地日期**解释，并在返回里给出换算后的 UTC 边界。
+
+    ``q`` 按 RGB 原图的**真实文件名**模糊匹配（``%``/``_`` 已转义，不做通配注入）。
+    """
     bounds = timeutil.day_bounds(date_from, date_to)
+    # 筛选子句与分页游标子句分开维护：``total_in_range`` 必须统计**当前全部
+    # 筛选条件**命中的总数（状态/模型/会话/命中/回收站/文件名搜索都在内），
+    # 且不随翻页游标缩减——页头数字才和表格一致。
     clauses = ["project_id = ?", "owner_id = ?", "created_at >= ?", "created_at < ?"]
     params: list[Any] = [str(project_id), int(user_id), bounds["utc_from"], bounds["utc_to_exclusive"]]
     if status:
@@ -172,30 +239,40 @@ def list_for_project(
         clauses.append("hit_count > 0")
     elif has_hits is False:
         clauses.append("hit_count = 0")
+    needle = str(q or "").strip()
+    if needle:
+        escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        clauses.append(
+            "rgb_asset_id IN (SELECT id FROM assets WHERE project_id = ? AND owner_id = ?"
+            " AND filename LIKE ? ESCAPE '\\')"
+        )
+        params.extend([str(project_id), int(user_id), f"%{escaped}%"])
+    cursor_clauses: list[str] = []
+    cursor_params: list[Any] = []
     if before:
         cursor = conn.execute(
             "SELECT created_at, id FROM detections WHERE id = ? AND project_id = ? AND owner_id = ?",
             (str(before), str(project_id), int(user_id)),
         ).fetchone()
         if cursor is not None:
-            clauses.append("(created_at < ? OR (created_at = ? AND id < ?))")
-            params.extend([cursor["created_at"], cursor["created_at"], cursor["id"]])
+            cursor_clauses.append("(created_at < ? OR (created_at = ? AND id < ?))")
+            cursor_params.extend([cursor["created_at"], cursor["created_at"], cursor["id"]])
     limit = max(1, min(int(limit or 20), 200))
     rows = conn.execute(
-        f"SELECT * FROM detections WHERE {' AND '.join(clauses)} "
+        f"SELECT * FROM detections WHERE {' AND '.join(clauses + cursor_clauses)} "
         "ORDER BY created_at DESC, id DESC LIMIT ?",
-        (*params, limit + 1),
+        (*params, *cursor_params, limit + 1),
     ).fetchall()
     page = rows[:limit]
     labels_by_model = _labels_by_model(conn, user_id, project_id, {row["model_id"] for row in page})
+    records = [public(row, labels_by_model.get(str(row["model_id"]))) for row in page]
+    attach_filenames(conn, user_id, project_id, records)
     total = conn.execute(
-        f"SELECT COUNT(*) FROM detections WHERE {' AND '.join(clauses[:4])}",
-        tuple(params[:4]),
+        f"SELECT COUNT(*) FROM detections WHERE {' AND '.join(clauses)}",
+        tuple(params),
     ).fetchone()[0]
     return {
-        "records": [
-            public(row, labels_by_model.get(str(row["model_id"]))) for row in page
-        ],
+        "records": records,
         "has_more": len(rows) > limit,
         "next_before": page[-1]["id"] if len(rows) > limit and page else None,
         "total_in_range": int(total),

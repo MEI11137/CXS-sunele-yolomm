@@ -41,10 +41,13 @@ export const useBusinessStore = defineStore('business', () => {
   const filters = reactive<Record<string, RecordFiltersState>>({})
   const watching = new Map<string, { timer: ReturnType<typeof setTimeout>; started: number; running: boolean }>()
   let generation = 0
+  // 记录页**当前真实范围**（筛选 + 回收站视图，不含分页游标）：作业刷新时必须
+  // 在这个范围内更新，绝不能退回"整个会话"——筛选框还在而表格变全项目就是错觉。
+  const recordScope: Record<string, Partial<RecordFiltersState> & { session_id?: string; deleted?: string }> = {}
 
   function filtersFor(projectId: string): RecordFiltersState {
     if (!filters[projectId]) {
-      filters[projectId] = { status: '', model_id: '', has_hits: null, date_from: '', date_to: '' }
+      filters[projectId] = { status: '', model_id: '', has_hits: null, date_from: '', date_to: '', q: '' }
     }
     return filters[projectId]
   }
@@ -91,8 +94,9 @@ export const useBusinessStore = defineStore('business', () => {
       if (data.events.length) {
         events[sessionId] = mergeJobEvents(events[sessionId] ?? [], data.events)
         // 有新事件说明刚有进展：立刻刷新作业清单与记录，让页面和卡片同步。
+        // 记录按**当前筛选范围**刷新，不退回"整个会话"。
         void refreshJobs(projectId, sessionId)
-        void loadRecords(projectId, { session_id: sessionId }, true)
+        void loadRecords(projectId, { ...recordScope[projectId] }, true)
       }
       const entry = watching.get(sessionId)
       if (entry) {
@@ -145,6 +149,8 @@ export const useBusinessStore = defineStore('business', () => {
   ): Promise<void> {
     if (!silent) loading.value = true
     try {
+      const { before: _cursor, limit: _limit, ...scope } = params
+      recordScope[projectId] = scope
       const data = await api.listRecords(projectId, { limit: 20, ...params })
       records[projectId] = data
     } catch (failure) {
@@ -200,7 +206,9 @@ export const useBusinessStore = defineStore('business', () => {
         await refreshJobs(projectId, sessionId)
         if (!watching.has(sessionId)) watchSession(projectId, sessionId)
       }
-      await loadRecords(projectId, { session_id: sessionId ?? undefined }, true)
+      // 核查启动后的首刷也留在当前筛选范围内（root UI-04A 反例：原来这里
+      // 只按 session_id 刷，把文件名/日期/状态/回收站筛选全丢了）。
+      await loadRecords(projectId, { ...recordScope[projectId] }, true)
       return true
     } catch (failure) {
       error.value = errorMessage(failure)
@@ -236,7 +244,9 @@ export const useBusinessStore = defineStore('business', () => {
     notice.value = ''
     try {
       const data = await api.importDataset(projectId, payload)
-      notice.value = `数据集「${data.dataset.name}」导入完成：${data.dataset.sample_count} 个样本`
+      notice.value = data.dataset.reused
+        ? `该数据集已存在（内容、模态、类别、标注与划分都相同），已使用现有数据集「${data.dataset.name}」`
+        : `数据集「${data.dataset.name}」导入完成：${data.dataset.sample_count} 个样本`
       await loadDatasets(projectId)
       return true
     } catch (failure) {

@@ -5,7 +5,7 @@ import type { HealthData, MetaData } from '@/types'
 
 /**
  * 运行时状态：只反映后端真实自报的信息。
- * 骨架阶段用它显示"哪些能力尚未实现"，不提供任何假数据。
+ * 设置页用它显示“哪些能力是开关为真的、哪些还没实现”，不提供任何假数据。
  */
 export const useRuntimeStore = defineStore('runtime', () => {
   const health = ref<HealthData | null>(null)

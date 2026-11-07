@@ -20,6 +20,7 @@ from backend.services import audit, roots
 
 NAME_MAX = 80
 DESCRIPTION_MAX = 400
+REQUIREMENTS_MAX = 2000
 
 
 def public(row: sqlite3.Row | dict) -> dict:
@@ -28,6 +29,8 @@ def public(row: sqlite3.Row | dict) -> dict:
         "id": data["id"],
         "name": data["name"],
         "description": data["description"],
+        # 项目要求是**用户写的文本**，注入提示词时单独成段、不能放宽任何权限。
+        "requirements": data.get("requirements") or "",
         "root_path": data["root_path"],
         "root_bound_at": data["root_bound_at"],
         "status": data["status"],
@@ -35,6 +38,28 @@ def public(row: sqlite3.Row | dict) -> dict:
         "updated_at": data["updated_at"],
         "deleted_at": data["deleted_at"],
     }
+
+
+def requirements_text(raw: Any) -> str:
+    """把“项目要求”统一成纯文本。
+
+    兼容 v1.6：那边 `requirements` 是对象，界面只编辑其中的 ``notes``。
+    这里接受字符串或 ``{"notes": "..."}``，其它结构一律当空处理，
+    不做“猜字段”的容错——宁可丢内容，也不要把别人的结构硬塞进提示词。
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        text = raw
+    elif isinstance(raw, dict):
+        note = raw.get("notes")
+        text = note if isinstance(note, str) else ""
+    else:
+        text = ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if len(text) > REQUIREMENTS_MAX:
+        raise ApiError(400, "VALIDATION", f"项目要求不能超过 {REQUIREMENTS_MAX} 个字符")
+    return text
 
 
 def _validate_name(raw: Any) -> str:
@@ -47,20 +72,26 @@ def _validate_name(raw: Any) -> str:
 
 
 def create(
-    conn: sqlite3.Connection, owner_id: int, *, name: str, description: str = ""
+    conn: sqlite3.Connection,
+    owner_id: int,
+    *,
+    name: str,
+    description: str = "",
+    requirements: Any = "",
 ) -> sqlite3.Row:
     label = _validate_name(name)
     desc = str(description or "").strip()
     if len(desc) > DESCRIPTION_MAX:
         raise ApiError(400, "VALIDATION", f"项目说明不能超过 {DESCRIPTION_MAX} 个字符")
+    req = requirements_text(requirements)
     now = security.now_iso()
     project_id = security.new_id("prj")
     conn.execute(
         """
-        INSERT INTO projects (id, owner_id, name, description, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'active', ?, ?)
+        INSERT INTO projects (id, owner_id, name, description, requirements, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
         """,
-        (project_id, int(owner_id), label, desc, now, now),
+        (project_id, int(owner_id), label, desc, req, now, now),
     )
     conn.commit()
     audit.record(conn, owner_id, "project.create", project_id, label)
@@ -103,6 +134,7 @@ def update(
     *,
     name: str | None = None,
     description: str | None = None,
+    requirements: Any = None,
 ) -> sqlite3.Row:
     fields: list[str] = []
     params: list[Any] = []
@@ -115,6 +147,9 @@ def update(
             raise ApiError(400, "VALIDATION", f"项目说明不能超过 {DESCRIPTION_MAX} 个字符")
         fields.append("description = ?")
         params.append(desc)
+    if requirements is not None:
+        fields.append("requirements = ?")
+        params.append(requirements_text(requirements))
     if not fields:
         return project
     fields.append("updated_at = ?")

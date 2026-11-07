@@ -8,6 +8,7 @@ from backend import auth, db
 from backend.errors import ApiError, ok
 from backend.services import datasets as dataset_service
 from backend.services import identity as identity_service
+from backend.services import projects as project_service
 from backend.services import reflow as reflow_service
 
 bp = Blueprint("datasets", __name__)
@@ -19,10 +20,16 @@ def _user() -> dict:
     return user
 
 
+def _assert_project(conn, project_id: str, user_id: int) -> None:
+    """别人的项目与不存在的项目一样返回 404：不能拿一个空列表冒充“这里没数据”。"""
+    project_service.get_owned(conn, project_id, user_id)
+
+
 @bp.get("/projects/<project_id>/datasets")
 @auth.login_required
 def list_datasets(project_id: str):
     conn = db.get_db()
+    _assert_project(conn, project_id, int(_user()["id"]))
     return ok(
         dataset_service.list_for_project(
             conn,
@@ -124,6 +131,7 @@ def reflow_preview(project_id: str):
             strategy=str(payload.get("strategy") or "even"),
             ratios=payload.get("ratios"),
             seed=int(payload.get("seed") or 0),
+            reference_modality=payload.get("reference_modality"),
         )
     )
 
@@ -148,6 +156,7 @@ def reflow_apply(project_id: str):
                 seed=int(payload.get("seed") or 0),
                 request_key=str(payload.get("request_key") or ""),
                 session_id=(payload.get("session_id") or None),
+                reference_modality=payload.get("reference_modality"),
             )
         }
     )
@@ -204,6 +213,7 @@ def save_reflow_draft(project_id: str):
         seed=int(payload.get("seed") or 0),
         session_id=payload.get("session_id") or None,
         draft_id=payload.get("draft_id") or None,
+        reference_modality=payload.get("reference_modality"),
     )
     return ok({"draft": draft})
 

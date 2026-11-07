@@ -124,7 +124,18 @@ def _review_images(conn, user_id: int, project_id: str, record: sqlite3.Row) -> 
     """真实读取两张图并各自产出「模态说明 + data URI」，IR 不会被丢掉。"""
     parts: list[dict] = []
     rgb_row, rgb_bytes = asset_service.read_bytes(conn, user_id, project_id, record["rgb_asset_id"])
-    parts.extend(_image_parts(rgb_row, rgb_bytes, _modality_label(rgb_row)))
+    caption = _modality_label(rgb_row)
+    primary = detection_service.primary_modality_of_record(conn, user_id, project_id, record)
+    if primary == "ir":
+        # 单 IR 数据集：原图本身就是红外图。资产角色可能还是历史上的 rgb，
+        # 但送给模型看的模态说明必须按数据集真实主模态写，不能骗模型这是可见光。
+        overridden = dict(rgb_row)
+        overridden["role"] = "ir"
+        caption = (
+            _modality_label(overridden)
+            + "（数据集主模态为 IR：这张原图本身就是红外图，没有 RGB 替身）"
+        )
+    parts.extend(_image_parts(rgb_row, rgb_bytes, caption))
     if record["x_asset_id"]:
         x_row, x_bytes = asset_service.read_bytes(conn, user_id, project_id, record["x_asset_id"])
         parts.extend(_image_parts(x_row, x_bytes, _modality_label(x_row)))

@@ -1,0 +1,4 @@
+# 三个 Windows 启动命令是 GBK + CRLF 的交付件（给评委/新机器直接双击运行）。
+# 只用 -text 关闭 Git 对 *.cmd 的行尾/编码转换，保证提交 blob 与实测字节一致；
+# 其余源码不在此文件里做任何换行转换。
+*.cmd -text whitespace=cr-at-eol

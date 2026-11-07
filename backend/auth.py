@@ -24,7 +24,7 @@ CSRF_COOKIE = "hx17_csrf"
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 # 只有这一个已鉴权路由接受 multipart（文件上传）；其它写接口仍然必须是 JSON。
 # 用 endpoint（蓝图.视图）而不是路径前缀，避免以后新增路由被顺带放宽。
-MULTIPART_ENDPOINTS = {"assets.upload_asset"}
+MULTIPART_ENDPOINTS = {"assets.upload_asset", "documents.upload_document"}
 
 
 def _settings():

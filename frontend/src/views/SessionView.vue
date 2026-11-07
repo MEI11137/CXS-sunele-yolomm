@@ -1,63 +1,16 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
 import AssistantPanel from '@/components/AssistantPanel.vue'
-import { useWorkspaceStore } from '@/stores/workspace'
 
 /**
- * 会话页：**对话就在主区**。
+ * 会话页 = 项目主对话。
  *
- * 项目配置（目录、改名、删除）不属于日常操作，收进“项目详情”入口，
- * 不再占据中间位置；进入复核/数据集等业务页时，对话会改为右侧 360px 停靠。
+ * 这里**不再**放“会话名 / 项目名”页头：项目名在顶部工具栏，当前会话在左侧列表，
+ * 助手面板自己也只有消息区 + 输入框，避免同一件事在一屏里说三遍（v1.6 的做法）。
  */
-const route = useRoute()
-const router = useRouter()
-const workspace = useWorkspaceStore()
-
-const projectId = computed(() => String(route.params.projectId ?? ''))
-const sessionId = computed(() => String(route.params.sessionId ?? ''))
-const project = computed(() => (projectId.value ? workspace.projectById(projectId.value) : null))
-const session = computed(
-  () =>
-    (workspace.sessionsByProject[projectId.value] ?? []).find(
-      (item) => item.id === sessionId.value,
-    ) ?? null,
-)
-
-function openBusiness(name: 'inspect' | 'records' | 'reviewQueue' | 'reflow' | 'datasets' | 'models'): void {
-  void router.push({ name, params: { projectId: projectId.value } })
-}
-
-function openDetails(): void {
-  void router.push({
-    name: 'project',
-    params: { projectId: projectId.value },
-    query: { details: '1' },
-  })
-}
 </script>
 
 <template>
-  <section class="page chat-page">
-    <header class="chat-head">
-      <div class="chat-head-text">
-        <h1>{{ session?.title || '会话' }}</h1>
-        <p class="subtitle">
-          {{ project?.name || '项目' }}
-          <span v-if="project?.root_path" class="mono crumb">· {{ project.root_path }}</span>
-        </p>
-      </div>
-      <div class="header-actions">
-        <button class="ghost small" type="button" @click="openBusiness('inspect')">图片巡检</button>
-        <button class="ghost small" type="button" @click="openBusiness('records')">识别记录</button>
-        <button class="ghost small" type="button" @click="openBusiness('reviewQueue')">复核队列</button>
-        <button class="ghost small" type="button" @click="openBusiness('reflow')">数据回流</button>
-        <button class="ghost small" type="button" @click="openBusiness('datasets')">数据集</button>
-        <button class="ghost small" type="button" @click="openBusiness('models')">模型</button>
-        <button class="ghost small" type="button" @click="openDetails">项目详情</button>
-      </div>
-    </header>
-
+  <section class="chat-page">
     <AssistantPanel variant="center" />
   </section>
 </template>

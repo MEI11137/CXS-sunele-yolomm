@@ -174,6 +174,58 @@ def list_messages(
     }
 
 
+def search_messages(
+    conn: sqlite3.Connection,
+    user_id: int,
+    project_id: str,
+    query: str,
+    *,
+    limit: int = 20,
+) -> dict:
+    """在本人、当前项目、未删除的会话里按**字面**搜索消息。
+
+    只返回命中片段与定位信息（会话 ID/标题/消息 ID），不返回整段历史；
+    权限范围与页面一致：``sessions.owner_id`` 与 ``project_id`` 同时匹配。
+    """
+    keyword = str(query or "").strip()
+    if len(keyword) < 2:
+        raise ApiError(400, "QUERY_TOO_SHORT", "搜索词至少 2 个字")
+    escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    cap = max(1, min(int(limit), 100))
+    rows = conn.execute(
+        "SELECT m.id AS message_id, m.session_id, m.role, m.content, m.created_at, s.title"
+        " FROM messages m JOIN sessions s ON s.id = m.session_id"
+        " WHERE s.project_id = ? AND s.owner_id = ? AND s.status = 'active'"
+        " AND m.content LIKE ? ESCAPE '\\'"
+        " ORDER BY m.id DESC LIMIT ?",
+        (str(project_id), int(user_id), f"%{escaped}%", cap),
+    ).fetchall()
+    lowered = keyword.casefold()
+    matches: list[dict] = []
+    for row in rows:
+        text = str(row["content"])
+        position = text.casefold().find(lowered)
+        if position < 0:  # LIKE 的 ASCII 大小写规则与 Python 略有差异，找不到就从头截
+            position = 0
+        start = max(0, position - 60)
+        end = min(len(text), position + len(keyword) + 60)
+        matches.append(
+            {
+                "message_id": int(row["message_id"]),
+                "session_id": str(row["session_id"]),
+                "session_title": str(row["title"]),
+                "role": str(row["role"]),
+                "created_at": row["created_at"],
+                "snippet": text[start:end],
+            }
+        )
+    return {
+        "query": keyword,
+        "matches": matches,
+        "note": "字面匹配，不是语义搜索；只覆盖本人当前项目里未删除的会话。",
+    }
+
+
 def append_message(
     conn: sqlite3.Connection,
     *,

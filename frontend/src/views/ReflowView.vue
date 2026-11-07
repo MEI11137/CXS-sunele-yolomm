@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import * as api from '@/api/business'
-import { errorMessage } from '@/api/http'
+import { errorCode, errorMessage } from '@/api/http'
 import {
   actionOf as resolveAction,
   buildSelections,
@@ -39,6 +39,8 @@ const mode = ref<'revision' | 'new'>('revision')
 const datasetId = ref('')
 const name = ref('')
 const strategy = ref<'even' | 'ratio' | 'manual'>('even')
+// 参考模态：labels/ 与参考图以它为准；auto = 交给后端按已确认版本/父数据集决定。
+const referenceModality = ref<'auto' | 'rgb' | 'ir' | 'edge' | 'depth'>('auto')
 const seed = ref(7)
 const ratios = ref({ train: 7, val: 2, test: 1 })
 const feedback = ref<FeedbackSummary[]>([])
@@ -56,6 +58,29 @@ const busy = ref('')
 
 const pending = computed(() => feedback.value.filter((item) => item.status === 'pending'))
 const selectedIds = computed(() => Object.keys(chosen.value).filter((key) => chosen.value[key]))
+
+// 模态 token 只用于显示，不参与任何坐标/导出逻辑。
+function modalityLabel(token: string | null | undefined): string {
+  const value = String(token || '').toLowerCase()
+  if (value === 'rgb') return 'RGB'
+  if (value === 'ir') return 'IR'
+  if (value === 'edge') return '边缘'
+  if (value === 'depth') return '深度'
+  return value ? value.toUpperCase() : '辅模态'
+}
+
+// 缺陷结论必须同时给出两套真实框数：IR-only 缺陷不能显示成 0 框。
+function conclusionText(item: FeedbackSummary): string {
+  const review = item.review
+  if (!review) return '—'
+  if (review.outcome === 'no_defect') return '确认无缺陷'
+  const parts: string[] = []
+  if (review.box_count > 0) parts.push(`${review.box_count} 框（${modalityLabel(review.reference_modality || 'rgb')}）`)
+  if ((review.x_box_count ?? 0) > 0) {
+    parts.push(`${review.x_box_count} 框（${modalityLabel(review.x_modality || review.secondary_modality)}）`)
+  }
+  return `确认有缺陷（${parts.join(' + ') || '0 框'}）`
+}
 
 const form = computed<ReflowForm>(() => ({
   mode: mode.value,
@@ -100,18 +125,20 @@ function selections() {
 }
 
 const previewedState = ref('')
-const planStale = computed(() =>
-  isPlanStale(
-    previewedState.value,
-    formSnapshot(
-      form.value,
-      selectedIds.value,
-      actions.value,
-      splits.value,
-      targetSamples.value,
-    ),
-  ),
-)
+
+function referenceValue(): 'rgb' | 'ir' | 'edge' | 'depth' | '' {
+  return referenceModality.value === 'auto' ? '' : referenceModality.value
+}
+
+/** 参考模态也影响导出结果，必须一起进过期判断。 */
+function formSignature(): string {
+  return (
+    formSnapshot(form.value, selectedIds.value, actions.value, splits.value, targetSamples.value) +
+    `|ref:${referenceValue()}`
+  )
+}
+
+const planStale = computed(() => isPlanStale(previewedState.value, formSignature()))
 
 onMounted(async () => {
   await business.loadDatasets(projectId.value)
@@ -148,13 +175,7 @@ async function preview(): Promise<void> {
   notice.value = ''
   busy.value = 'preview'
   // 记下**这次真正提交出去**的表单值；定稿前拿它和当前表单比对。
-  const submitted = formSnapshot(
-    form.value,
-    selectedIds.value,
-    actions.value,
-    splits.value,
-    targetSamples.value,
-  )
+  const submitted = formSignature()
   try {
     const data = await api.saveReflowDraft(projectId.value, {
       draft_id: draftId.value || undefined,
@@ -165,6 +186,7 @@ async function preview(): Promise<void> {
       strategy: strategy.value,
       ratios: strategy.value === 'ratio' ? ratios.value : undefined,
       seed: seed.value,
+      reference_modality: referenceValue() || undefined,
       session_id: workspace.currentSessionId || undefined,
     })
     draftId.value = data.draft.id
@@ -176,7 +198,7 @@ async function preview(): Promise<void> {
         ? '草稿已可定稿；还没有生成任何数据集文件。'
         : '草稿已保存，需要先解决冲突。'
   } catch (failure) {
-    error.value = errorMessage(failure)
+    error.value = [errorCode(failure), errorMessage(failure)].filter(Boolean).join('：')
   } finally {
     busy.value = ''
   }
@@ -240,6 +262,14 @@ function chooseTarget(recordId: string, sampleId: string): void {
 function openDataset(): void {
   void router.push({ name: 'datasets', params: { projectId: projectId.value } })
 }
+
+function goReview(): void {
+  void router.push({ name: 'reviewQueue', params: { projectId: projectId.value } })
+}
+
+function goRecords(): void {
+  void router.push({ name: 'records', params: { projectId: projectId.value } })
+}
 </script>
 
 <template>
@@ -262,68 +292,7 @@ function openDataset(): void {
     <p v-else-if="notice" class="banner banner-ok" role="status">{{ notice }}</p>
 
     <div class="card">
-      <p class="card-head">回流方式</p>
-      <div class="form-grid">
-        <label class="field">
-          <span>模式</span>
-          <select v-model="mode">
-            <option value="revision">回原修订（同图替换 label，不增样本）</option>
-            <option value="new">另建数据集（只取选中样本并重新划分）</option>
-          </select>
-        </label>
-        <label v-if="mode === 'revision'" class="field">
-          <span>父数据集</span>
-          <select v-model="datasetId">
-            <option value="">选择数据集</option>
-            <option v-for="item in datasets" :key="item.id" :value="item.id">
-              {{ item.name }}（{{ item.sample_count }} 样本）
-            </option>
-          </select>
-        </label>
-        <label class="field">
-          <span>新数据集名称</span>
-          <input v-model="name" placeholder="留空自动命名" maxlength="60" />
-        </label>
-        <label class="field">
-          <span>划分方式</span>
-          <select v-model="strategy">
-            <option value="even">1/1/1（按身份分组轮流）</option>
-            <option value="ratio">按比例 + 固定种子</option>
-            <option value="manual">逐样本指定（每条都要选划分）</option>
-          </select>
-        </label>
-        <label class="field">
-          <span>随机种子</span>
-          <input v-model.number="seed" type="number" min="0" step="1" />
-        </label>
-        <label v-if="strategy === 'ratio'" class="field">
-          <span>比例 train/val/test</span>
-          <input
-            :value="`${ratios.train}/${ratios.val}/${ratios.test}`"
-            @input="
-              (event) => {
-                const parts = (event.target as HTMLInputElement).value.split('/').map(Number)
-                if (parts.length === 3 && parts.every((n) => n >= 0)) {
-                  ratios = { train: parts[0], val: parts[1], test: parts[2] }
-                }
-              }
-            "
-          />
-        </label>
-      </div>
-      <div class="inline-form">
-        <button class="ghost small" type="button" :disabled="!datasetId" @click="checkIdentity">
-          检查重复 / 跨划分泄漏
-        </button>
-        <span v-if="report" class="hint">
-          重复组 {{ report.duplicate_groups.length }} · 泄漏 {{ report.cross_split_leakage.length }} ·
-          标注冲突 {{ report.annotation_conflicts.length }}
-        </span>
-      </div>
-    </div>
-
-    <div class="card">
-      <p class="card-head">待整理反馈（{{ pending.length }}）</p>
+      <p class="card-head">① 选择样本 · 待整理反馈（{{ pending.length }}）</p>
       <table v-if="pending.length" class="table">
         <thead>
           <tr>
@@ -340,7 +309,7 @@ function openDataset(): void {
             <td><input v-model="chosen[item.detection_id]" type="checkbox" /></td>
             <td class="mono">{{ item.detection_id }}</td>
             <td>v{{ item.review?.version ?? '—' }}</td>
-            <td>{{ item.review?.outcome === 'no_defect' ? '确认无缺陷' : `确认有缺陷（${item.review?.box_count ?? 0} 框）` }}</td>
+            <td>{{ conclusionText(item) }}</td>
             <td>
               <select
                 :value="actionOf(item.detection_id)"
@@ -370,27 +339,102 @@ function openDataset(): void {
         </tbody>
       </table>
       <p v-else class="empty-hint">
-        还没有待整理反馈。先到「识别记录」或「人工复核」确认记录，再点「加入反馈」。
+        还没有待整理反馈。确认记录后点「加入反馈」，确认过的版本会出现在这里。
       </p>
+      <div v-if="!pending.length" class="inline-form">
+        <button class="ghost small" type="button" @click="goReview">前往人工复核</button>
+        <button class="ghost small" type="button" @click="goRecords">前往识别记录</button>
+      </div>
+    </div>
 
-      <div class="form-actions">
-        <button class="primary small" type="button" :disabled="!selectedIds.length || busy !== ''" @click="preview">
-          {{ busy === 'preview' ? '计算中…' : `保存草稿并预览（${selectedIds.length} 条）` }}
+    <div class="card">
+      <p class="card-head">② 回流方式与目标</p>
+      <div class="form-grid">
+        <label class="field">
+          <span>模式</span>
+          <select v-model="mode">
+            <option value="revision">回原修订（同图替换 label，不增样本）</option>
+            <option value="new">另建数据集（只取选中样本并重新划分）</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>参考模态（labels / 参考图）</span>
+          <select v-model="referenceModality">
+            <option value="auto">自动（按已确认版本）</option>
+            <option value="rgb">RGB</option>
+            <option value="ir">红外 IR</option>
+            <option value="edge">边缘</option>
+            <option value="depth">深度</option>
+          </select>
+        </label>
+        <label v-if="mode === 'revision'" class="field">
+          <span>父数据集</span>
+          <select v-model="datasetId">
+            <option value="">选择数据集</option>
+            <option v-for="item in datasets" :key="item.id" :value="item.id">
+              {{ item.name }}（{{ item.sample_count }} 样本）
+            </option>
+          </select>
+        </label>
+        <label class="field">
+          <span>新数据集名称</span>
+          <input v-model="name" placeholder="留空自动命名" maxlength="60" />
+        </label>
+        <label v-if="mode === 'new'" class="field">
+          <span>划分方式</span>
+          <select v-model="strategy">
+            <option value="even">1/1/1（按身份分组轮流）</option>
+            <option value="ratio">按比例 + 固定种子</option>
+            <option value="manual">逐样本指定（每条都要选划分）</option>
+          </select>
+        </label>
+        <label v-if="mode === 'new'" class="field">
+          <span>随机种子</span>
+          <input v-model.number="seed" type="number" min="0" step="1" />
+        </label>
+        <label v-if="mode === 'new' && strategy === 'ratio'" class="field">
+          <span>比例 train/val/test</span>
+          <input
+            :value="`${ratios.train}/${ratios.val}/${ratios.test}`"
+            @input="
+              (event) => {
+                const parts = (event.target as HTMLInputElement).value.split('/').map(Number)
+                if (parts.length === 3 && parts.every((n) => n >= 0)) {
+                  ratios = { train: parts[0], val: parts[1], test: parts[2] }
+                }
+              }
+            "
+          />
+        </label>
+      </div>
+      <div class="inline-form">
+        <button class="ghost small" type="button" :disabled="!datasetId" @click="checkIdentity">
+          检查重复 / 跨划分泄漏
         </button>
-        <button
-          class="primary small"
-          type="button"
-          :disabled="
-            !plan || draftStatus !== 'ready' || busy !== '' || planStale || (plan?.conflicts.length ?? 0) > 0
-          "
-          @click="apply"
-        >
-          {{ busy === 'apply' ? '写入中…' : '定稿并生成版本' }}
-        </button>
-        <span v-if="planStale" class="form-error">
-          表单已改动，先重新保存预览，否则定稿执行的还是旧设置。
+        <span v-if="report" class="hint">
+          重复组 {{ report.duplicate_groups.length }} · 泄漏 {{ report.cross_split_leakage.length }} ·
+          标注冲突 {{ report.annotation_conflicts.length }}
         </span>
       </div>
+    </div>
+
+    <div class="form-actions">
+      <button class="primary small" type="button" :disabled="!selectedIds.length || busy !== ''" @click="preview">
+        {{ busy === 'preview' ? '计算中…' : `③ 保存草稿并预览（${selectedIds.length} 条）` }}
+      </button>
+      <button
+        class="primary small"
+        type="button"
+        :disabled="
+          !plan || draftStatus !== 'ready' || busy !== '' || planStale || (plan?.conflicts.length ?? 0) > 0
+        "
+        @click="apply"
+      >
+        {{ busy === 'apply' ? '写入中…' : '定稿并生成版本' }}
+      </button>
+      <span v-if="planStale" class="form-error">
+        表单已改动，先重新保存预览，否则定稿执行的还是旧设置。
+      </span>
     </div>
 
     <div v-if="plan" class="card">
@@ -398,13 +442,23 @@ function openDataset(): void {
         预览结果
         <span v-if="planStale" class="form-error">（已过期：下面的数字对应改动前的表单）</span>
       </p>
-      <div class="kv">
-        <span>替换</span><span>{{ plan.counts.replace }}</span>
-        <span>追加</span><span>{{ plan.counts.append }}</span>
-        <span>排除</span><span>{{ plan.counts.excluded }}</span>
-        <span>保留</span><span>{{ plan.counts.kept }}</span>
-        <span>冲突</span><span>{{ plan.counts.conflicts }}</span>
-      </div>
+      <dl class="kv">
+        <div><dt>替换</dt><dd>{{ plan.counts.replace }}</dd></div>
+        <div><dt>追加</dt><dd>{{ plan.counts.append }}</dd></div>
+        <div><dt>排除</dt><dd>{{ plan.counts.excluded }}</dd></div>
+        <div><dt>保留</dt><dd>{{ plan.counts.kept }}</dd></div>
+        <div><dt>冲突</dt><dd>{{ plan.counts.conflicts }}</dd></div>
+        <div>
+          <dt>参考模态</dt>
+          <dd>
+            {{ modalityLabel(plan.reference_modality || 'rgb') }}
+            <span v-if="plan.secondary_modality" class="hint"> · 辅模态 {{ modalityLabel(plan.secondary_modality) }}</span>
+          </dd>
+        </div>
+      </dl>
+      <p v-if="plan.reference_modality === 'ir'" class="hint">
+        参考模态是红外：images/ 存红外图，另一模态图与辅助标注另存；训练只有勾选“仅红外训练”时才会使用该布局。
+      </p>
       <ul v-if="plan.conflicts.length" class="business-items">
         <li v-for="(conflict, index) in plan.conflicts" :key="index">
           <span class="mono">{{ conflict.record_id }}</span>

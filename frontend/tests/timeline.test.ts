@@ -18,6 +18,7 @@ import {
   pollDelay,
   streamingText,
   toolCards,
+  toolFoldSummary,
   toolStateLabel,
   turnStatusLabel,
 } from '../src/lib/timeline.ts'
@@ -155,4 +156,20 @@ test('状态标签：未知值原样显示，不吞掉后端新状态', () => {
   assert.equal(toolStateLabel('weird'), 'weird')
   assert.equal(turnStatusLabel('waiting_action'), '等待你确认')
   assert.equal(turnStatusLabel('unknown_state'), 'unknown_state')
+})
+
+test('toolFoldSummary：折叠时只报次数与最近一次，不把输出摘要当回答', () => {
+  assert.equal(toolFoldSummary([]), '本轮工具调用')
+
+  const one = toolFoldSummary([{ title: '读取目录', state: 'completed' }])
+  assert.equal(one, '1 次工具调用 · 最近：已完成 · 读取目录')
+
+  const many = toolFoldSummary([
+    { title: '读取目录', state: 'completed' },
+    { title: '检测图片', state: 'running' },
+  ])
+  assert.equal(many, '2 次工具调用 · 最近：执行中 · 检测图片')
+
+  // 未知状态原样出现，和 toolStateLabel 保持一致，不吞掉后端新状态。
+  assert.match(toolFoldSummary([{ title: 'x', state: 'weird' }]), /最近：weird · x$/)
 })

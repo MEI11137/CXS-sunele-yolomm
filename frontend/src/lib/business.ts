@@ -280,6 +280,34 @@ export function recordsSummary(records: DetectionRecord[]): string {
   return `共 ${records.length} 条，其中 ${hits} 条有命中`
 }
 
+/**
+ * 本地时间短格式：同一年显示「MM-DD HH:mm」，跨年保留年份。
+ * 后端给的 `created_at_local` 已带时区偏移，这里只是截短展示；
+ * 完整本地时间与 UTC 边界在记录详情里，不丢时区信息。
+ */
+export function shortLocalTime(isoLocal: string | null | undefined): string {
+  const text = String(isoLocal || '')
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/)
+  if (!match) return text
+  const [, year, month, day, hour, minute] = match
+  const currentYear = new Date().getFullYear()
+  return currentYear === Number(year)
+    ? `${month}-${day} ${hour}:${minute}`
+    : `${year}-${month}-${day} ${hour}:${minute}`
+}
+
+/** 人工状态展示名（与 AI 核查分列，互不混用）。 */
+export function humanStatusLabel(status: string | null | undefined): string {
+  return (
+    {
+      confirmed: '人工已确认',
+      rejected: '人工已驳回',
+      draft: '人工草稿',
+      pending: '待人工',
+    }[String(status || 'pending')] ?? String(status)
+  )
+}
+
 export function formatBytes(size: number): string {
   if (!Number.isFinite(size) || size < 0) return '—'
   if (size < 1024) return `${size} B`

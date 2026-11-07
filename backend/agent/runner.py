@@ -34,6 +34,15 @@ STOP_WAIT_SECONDS = 20.0
 MAX_ENGINE_ERRORS = 5
 TOOL_EVENT_LIMIT = 160
 MAX_ASSISTANT_CHARS = 40000
+# 事件流的文本快照最多每 120ms 落一条：上游 100 字/200ms 时肉眼已是逐字效果，
+# 再密只会白白写库。被节流掉的内容由下一次快照或轮询收尾补上，不会丢。
+LIVE_EMIT_INTERVAL = 0.12
+# 订阅必须在 prompt 之前真正建立，否则会漏掉 message/part 首帧、又退化成“最后才见字”。
+# 等不到就降级为纯轮询，绝不伪造流式。
+LIVE_READY_TIMEOUT = 6.0
+# 未知角色/未知类型 part 的增量只做**有界**缓存：既不能先展示，也不能无限吃内存。
+LIVE_BUFFER_CHARS = 4000
+LIVE_BUFFER_PARTS = 64
 # 发起前读取“已有消息 ID 集合”的次数。这是**只读** GET，不会计费，也不发 prompt；
 # 失败一次就换重试，最终拿不到确定答案时必须让本轮失败，绝不能当成空历史继续。
 BASELINE_READ_ATTEMPTS = 3
@@ -43,6 +52,77 @@ BASELINE_READ_BACKOFF = 0.25
 PROJECT_SCOPE_CODES = frozenset({"PROJECT_CLOSED", "GRANT_REVOKED", "NO_PROJECT_ROOT"})
 
 _ABORTED = "MessageAbortedError"
+
+
+def _requirements_of(project: Any) -> str:
+    """读出项目要求；旧库/测试夹具没有这一列时按空处理，不因此让本轮失败。"""
+    try:
+        value = project["requirements"]
+    except (IndexError, KeyError, TypeError):
+        return ""
+    return str(value or "")
+
+
+def _cancelled_read(response, stop: threading.Event | None) -> bool:
+    """这次读取异常是否属于**取消/连接已关闭**的正常结束。
+
+    取消时另一线程会 ``response.close()``，底层 fp 被释放，读取端于是拿到
+    ``AttributeError: 'NoneType' object has no attribute 'read'``。它是关闭过程的
+    副产物，不是业务失败；但只有“确实已取消或连接确实已关闭”才算，
+    其它 AttributeError 仍然是编程错误，必须继续抛出保留诊断。
+    """
+    if stop is not None and stop.is_set():
+        return True
+    return bool(getattr(response, "closed", False))
+
+
+class _LiveText:
+    """本轮**已确认属于 assistant** 的文本快照，按 part_id 单调增长。
+
+    事件流和轮询共用同一份状态：谁先到都行，但短的回退快照不会被写进去——
+    否则用户会看到已经显示的回答忽然变短（旧的轮询结果覆盖新的增量）。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._parts: dict[str, str] = {}
+
+    def update(self, part_id: str, text: str) -> bool:
+        if not part_id or not text:
+            return False
+        with self._lock:
+            previous = self._parts.get(part_id, "")
+            if text == previous or len(text) < len(previous):
+                return False
+            self._parts[part_id] = text
+            return True
+
+
+class _LiveStream:
+    """一次事件订阅的生命周期：握手 → 读 → 关闭连接并等线程退出。"""
+
+    def __init__(
+        self, stop: threading.Event, holder: dict, thread: threading.Thread
+    ) -> None:
+        self._stop = stop
+        self._holder = holder
+        self._thread = thread
+
+    def ready(self, timeout: float) -> bool:
+        """等“连接已建立/已明确失败”的握手信号；返回是否就绪。"""
+        event = self._holder.get("ready")
+        return bool(event is not None and event.wait(timeout))
+
+    def close(self) -> None:
+        self._stop.set()
+        # 先关连接：阻塞在 iter_lines 上的读取会立刻抛错返回，不用等读超时。
+        response = self._holder.pop("response", None)
+        if response is not None:
+            try:
+                response.close()
+            except Exception:  # noqa: BLE001 - 关闭失败不影响收尾
+                pass
+        self._thread.join(timeout=2.0)
 
 
 class TurnRunner:
@@ -218,19 +298,33 @@ class TurnRunner:
                 prompt_text = self._prompt_text(conn, turn)
                 if recreated:
                     prompt_text = self._restore_context(conn, turn, prompt_text) + prompt_text
-                self._manager.prompt_async(
-                    instance,
-                    engine_session,
-                    text=prompt_text,
-                    system=prompt.build(actor),
-                    model=model,
-                    attachments=attachments,
-                )
+                live = _LiveText()
+                # 先握手再发 prompt：连接建立之后再下发，才不会漏掉最早的 message/part 帧。
+                stream = self._start_live(turn, instance, engine_session, live, baseline)
+                try:
+                    self._manager.prompt_async(
+                        instance,
+                        engine_session,
+                        text=prompt_text,
+                        # 项目要求是用户写的文字，单独成段注入；它不能改工具与权限。
+                        system=prompt.build(actor, requirements=_requirements_of(project)),
+                        model=model,
+                        attachments=attachments,
+                    )
+                except engine_module.EngineUnavailable as exc:
+                    stream.close()
+                    self._fail(conn, turn, exc.code, self._engine_message(exc))
+                    return
+                except BaseException:
+                    stream.close()
+                    raise
+                try:
+                    self._poll(conn, turn, instance, engine_session, baseline, live)
+                finally:
+                    stream.close()
             except engine_module.EngineUnavailable as exc:
                 self._fail(conn, turn, exc.code, self._engine_message(exc))
                 return
-
-            self._poll(conn, turn, instance, engine_session, baseline)
         except KeyError:
             return
         finally:
@@ -525,21 +619,282 @@ class TurnRunner:
         ).fetchone()
         return str(row["content"]) if row is not None else "请继续。"
 
+    # ------------------------------------------------------------------ 实时增量
+
+    def _start_live(
+        self,
+        turn,
+        instance,
+        engine_session: str,
+        live: _LiveText,
+        baseline: set[str] | None = None,
+        *,
+        ready_timeout: float = LIVE_READY_TIMEOUT,
+    ) -> _LiveStream:
+        """订阅事件流，并**等它真正建立**再返回。
+
+        为什么必须等：``prompt`` 之后才建立连接的话，这一轮最早的 message/part 帧
+        已经在路上丢掉了，界面又会退化成“最后一次性出现”，看起来像没接流式。
+        等不到（引擎慢/不支持）就把 ``ready`` 记为未就绪，调用方继续用轮询，
+        绝不伪造流式输出。
+        """
+        stop = threading.Event()
+        holder: dict[str, Any] = {"ready": threading.Event()}
+        thread = threading.Thread(
+            target=self._live_loop,
+            args=(turn, instance, engine_session, live, stop, holder, baseline),
+            name=f"hx17-live-{turn['id']}",
+            daemon=True,
+        )
+        thread.start()
+        stream = _LiveStream(stop, holder, thread)
+        if not stream.ready(ready_timeout):
+            logging.getLogger(__name__).warning(
+                "事件流未在 %.1fs 内就绪，本轮只用轮询 turn=%s", ready_timeout, turn["id"]
+            )
+        return stream
+
+    def _live_loop(
+        self,
+        turn,
+        instance,
+        engine_session: str,
+        live: _LiveText,
+        stop: threading.Event,
+        holder: dict,
+        baseline: set[str] | None = None,
+    ) -> None:
+        """订阅引擎 ``/event``，把**已确认属于本轮 assistant 文本**的增量写成 turn 事件。
+
+        为什么需要它：``/session/{id}/message`` 里的 text part 通常要等这段输出结束
+        才完整落库，只靠轮询会让长回答在最后一次性出现。事件流补上实时性，但
+        **完成判定仍然只由轮询给出**——事件流断掉、读不到、顺序乱都不能让这一轮提前成功。
+
+        边界（依据真实 1.19.4 结构，不靠字段名猜类型）：
+
+        * ``sessionID`` 必须就是本次 ``engine_session``（``message.updated`` 的
+          properties 与 info、part、delta 三处都校验）；
+        * 只认 **assistant 且非 summary** 的消息，基线里有过的 messageID 一律排除；
+        * 只认被 ``message.part.updated`` 明确标成 ``type=text`` 且非
+          ``synthetic``/``ignored`` 的 part——reasoning part 的增量同样发
+          ``field='text'``，只看 field 会把内部推理当正文上屏；
+        * 判定为不可用的 message/part 会**永久**记入拒绝集合，后面的 delta 或元数据
+          刷新都不能把它复活；未知角色/类型的增量只做有界缓存，确认后再补发。
+        """
+        ready = holder.get("ready")
+        try:
+            response = self._manager.open_events(instance)
+        except engine_module.EngineUnavailable:
+            # 订阅失败只影响实时性，不影响这一轮本身；轮询照常工作。
+            if ready is not None:
+                ready.set()
+            return
+        holder["response"] = response
+        if ready is not None:
+            ready.set()
+        if stop.is_set():
+            try:
+                response.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        old_ids = {str(item) for item in (baseline or set())}
+        conn = None
+        assistant: set[str] = set()
+        # 只要进了这里就再也不放行：summary / 非 assistant / 基线旧消息 / 非文本 part。
+        blocked_messages: set[str] = set(old_ids)
+        text_parts: set[str] = set()
+        blocked_parts: set[str] = set()
+        buffers: dict[tuple[str, str], str] = {}
+        last_emit = 0.0
+
+        def same_session(*sources: dict | None) -> bool:
+            """事件里出现的 sessionID 必须都与本次引擎会话一致（缺失时不猜）。"""
+            for source in sources:
+                if not isinstance(source, dict):
+                    continue
+                sid = str(source.get("sessionID") or "")
+                if sid and sid != engine_session:
+                    return False
+            return True
+
+        def drop_part(message_id: str, part_id: str) -> None:
+            blocked_parts.add(part_id)
+            text_parts.discard(part_id)
+            buffers.pop((message_id, part_id), None)
+
+        def drop_message(message_id: str) -> None:
+            blocked_messages.add(message_id)
+            assistant.discard(message_id)
+            for key in [item for item in buffers if item[0] == message_id]:
+                buffers.pop(key, None)
+
+        def flush(message_id: str, part_id: str) -> None:
+            key = (message_id, part_id)
+            text = buffers.pop(key, "")
+            if not text or part_id not in text_parts or message_id not in assistant:
+                return
+            if live.update(part_id, text):
+                self._emit_live_text(conn, turn, message_id, part_id, text)
+
+        try:
+            conn = self._connect()
+            try:
+                for event in self._manager.iter_events(response):
+                    if stop.is_set():
+                        break
+                    type_ = str(event.get("type") or "")
+                    props = event.get("properties")
+                    if not isinstance(props, dict):
+                        continue
+
+                    if type_ == "message.updated":
+                        info = props.get("info")
+                        if not isinstance(info, dict) or not same_session(props, info):
+                            continue
+                        message_id = str(info.get("id") or props.get("messageID") or "")
+                        if not message_id:
+                            continue
+                        if message_id in old_ids:
+                            # 基线里的消息属于更早的轮次，绝不能再当本轮回答。
+                            drop_message(message_id)
+                            continue
+                        if info.get("role") != "assistant" or info.get("summary"):
+                            drop_message(message_id)
+                            continue
+                        if message_id in blocked_messages:
+                            continue
+                        assistant.add(message_id)
+                        for mid, pid in list(buffers):
+                            if mid == message_id and pid in text_parts:
+                                flush(mid, pid)
+                        continue
+
+                    if type_ == "message.part.delta":
+                        if str(props.get("field") or "") != "text":
+                            continue
+                        if not same_session(props):
+                            continue
+                        message_id = str(props.get("messageID") or "")
+                        part_id = str(props.get("partID") or "")
+                        if not message_id or not part_id:
+                            continue
+                        if message_id in blocked_messages or part_id in blocked_parts:
+                            continue
+                        chunk = str(props.get("delta") or "")
+                        if not chunk:
+                            continue
+                        key = (message_id, part_id)
+                        merged = (buffers.get(key, "") + chunk)[:LIVE_BUFFER_CHARS]
+                        buffers[key] = merged
+                        if message_id not in assistant or part_id not in text_parts:
+                            # 角色或 part 类型尚未确认：先缓存不展示（有界）。
+                            if len(buffers) > LIVE_BUFFER_PARTS:
+                                buffers.pop(next(iter(buffers)))
+                            continue
+                        now = time.monotonic()
+                        if now - last_emit < LIVE_EMIT_INTERVAL:
+                            continue
+                        # 节流时**不写状态**：留给下一次快照或轮询收尾，避免丢掉尾巴。
+                        if live.update(part_id, merged):
+                            last_emit = now
+                            self._emit_live_text(conn, turn, message_id, part_id, merged)
+                        continue
+
+                    if type_ == "message.part.updated":
+                        part = props.get("part")
+                        if not isinstance(part, dict) or not same_session(props, part):
+                            continue
+                        part_id = str(part.get("id") or "")
+                        message_id = str(part.get("messageID") or "")
+                        if not part_id:
+                            continue
+                        if part.get("type") != "text" or part.get("synthetic") or part.get("ignored"):
+                            # reasoning / tool / step-* / synthetic / ignored：
+                            # 一旦判定就永久拒绝，后续 field=text 的增量同样丢弃。
+                            drop_part(message_id, part_id)
+                            continue
+                        if message_id in blocked_messages or part_id in blocked_parts:
+                            # 已经判定过不可用：后面的元数据刷新（哪怕不再带 flag）
+                            # 也不能把它“洗白”回正文。
+                            drop_part(message_id, part_id)
+                            continue
+                        text_parts.add(part_id)
+                        text = str(part.get("text") or "")[:MAX_ASSISTANT_CHARS]
+                        if not text:
+                            # 空 part 也要登记类型，后面同 part 的增量才能被正确放行。
+                            continue
+                        key = (message_id, part_id)
+                        if len(text) > len(buffers.get(key, "")):
+                            buffers[key] = text
+                        if message_id not in assistant:
+                            continue
+                        now = time.monotonic()
+                        if now - last_emit < LIVE_EMIT_INTERVAL:
+                            continue
+                        if live.update(part_id, text):
+                            last_emit = now
+                            self._emit_live_text(conn, turn, message_id, part_id, text)
+                        continue
+            except AttributeError:
+                # 取消路径：连接已被 close()，读取端的 fp 释放会抛 AttributeError。
+                # 只在确实取消/连接已关闭时正常结束迭代；否则照抛，保留诊断。
+                if not _cancelled_read(response, stop):
+                    raise
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                response.close()
+            except Exception:  # noqa: BLE001
+                pass
+            holder.pop("response", None)
+
+    def _emit_live_text(self, conn, turn, message_id: str, part_id: str, text: str) -> None:
+        try:
+            store.append_event(
+                conn,
+                str(turn["id"]),
+                str(turn["session_id"]),
+                "text",
+                {
+                    "message_id": message_id,
+                    "part_id": part_id,
+                    "text": text[:MAX_ASSISTANT_CHARS],
+                    "live": True,
+                },
+            )
+        except Exception:  # noqa: BLE001 - 实时性写失败不能让这一轮崩掉
+            logging.getLogger(__name__).exception("写入实时文本事件失败 turn=%s", turn["id"])
+
     # ------------------------------------------------------------------ 轮询
 
     def _poll(
-        self, conn, turn, instance, engine_session: str, baseline: set[str]
+        self,
+        conn,
+        turn,
+        instance,
+        engine_session: str,
+        baseline: set[str],
+        live: _LiveText | None = None,
     ) -> None:
         """轮询直到本轮结束。
 
         ``baseline`` 是发起前取得的**确定**边界，这里不再提供“没有就按空集算”的兜底：
         空集会把整段历史当成本轮新增，正是旧回答被重新落库的那条路径。
+
+        ``live`` 与事件流共享：同一 part_id 只向前推进，短快照不会把已经显示的
+        正文改短。轮询仍是**唯一**的完成判定来源。
         """
+        live = live if live is not None else _LiveText()
         started = time.monotonic()
         timeout = float(self._settings.turn_timeout_seconds or DEFAULT_TIMEOUT)
         deadline = started + timeout
 
-        seen_text: dict[str, str] = {}
         seen_tool: dict[str, str] = {}
         engine_errors = 0
         idle_since: float | None = None
@@ -592,7 +947,7 @@ class TurnRunner:
                     # 但也别把“读不到”说成“没有内容”，要在收尾说明里讲清楚。
                     read_failed = True
                     messages = []
-                self._sync(conn, turn, self._new_messages(messages, baseline), seen_text, seen_tool)
+                self._sync(conn, turn, self._new_messages(messages, baseline), live, seen_tool)
                 detail = "已停止本轮：后续步骤不再执行；已完成的工具调用结果保留。"
                 if read_failed:
                     detail += "（停止时无法读取引擎消息，本轮尚未保存的中间输出可能已丢失。）"
@@ -623,7 +978,7 @@ class TurnRunner:
                 continue
 
             new_messages = self._new_messages(messages, baseline)
-            self._sync(conn, turn, new_messages, seen_text, seen_tool)
+            self._sync(conn, turn, new_messages, live, seen_tool)
 
             if state == "idle":
                 if idle_since is None:
@@ -696,7 +1051,7 @@ class TurnRunner:
 
     # ------------------------------------------------------------------ 事件同步
 
-    def _sync(self, conn, turn, messages: list[dict], seen_text: dict, seen_tool: dict) -> None:
+    def _sync(self, conn, turn, messages: list[dict], live: _LiveText, seen_tool: dict) -> None:
         for item in messages:
             info = item.get("info") or {}
             if info.get("role") != "assistant":
@@ -711,12 +1066,12 @@ class TurnRunner:
                     if part.get("synthetic") or part.get("ignored"):
                         continue
                     text = str(part.get("text") or "")
-                    part_id = str(part.get("id") or message_id)
-                    if not text.strip() and not text:
+                    part_id = str(part.get("id") or message_id) or message_id
+                    if not text:
                         continue
-                    if seen_text.get(part_id) == text:
+                    # 与事件流共享同一份状态：只向前推进，不让旧快照把正文改短。
+                    if not live.update(part_id, text):
                         continue
-                    seen_text[part_id] = text
                     self._event(
                         conn,
                         turn,

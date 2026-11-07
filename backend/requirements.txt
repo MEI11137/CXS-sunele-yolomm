@@ -15,7 +15,7 @@ itsdangerous>=2.1,<3.0
 cryptography>=42
 # “检查连接”这一个显式动作使用的 HTTP 客户端（单次请求、超时受限、无重试）
 requests>=2.31
-# 私有 stdio 工具桥的服务端 SDK（只有本机子进程连得上）
+# 私有 stdio 工具桥的服务端 SDK + 外部 MCP 的 streamable-http 客户端（backend/mcp_client.py）
 mcp>=1.26,<2.0
 # mcp 的运行时依赖，显式声明以免离线环境漏装
 anyio>=4.4,<5.0
@@ -23,3 +23,9 @@ anyio>=4.4,<5.0
 Pillow>=10,<13
 # data.yaml 解析与生成：backend/services/datasets.py 在导入时就 import yaml
 PyYAML>=6.0,<7.0
+# 资料库解析：PDF 按页取文本、Word 取段落与表格（backend/services/documents.py）
+pypdf>=5,<7
+python-docx>=1.1,<2
+# 对外演示的 WSGI 服务器（deploy/serve.py 用 Waitress，不用 Flask 开发服务器）。
+# 纯 Python、Windows 上无需编译；只在启动器里 import，后端测试不需要它。
+waitress>=3.0,<4.0

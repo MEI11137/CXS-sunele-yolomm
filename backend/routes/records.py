@@ -13,9 +13,11 @@ from flask import Blueprint, request, send_file
 
 from backend import auth, db, security
 from backend.errors import ApiError, ok
-from backend.services import aireview, detection as detection_service
+from backend.services import aireview
+from backend.services import exports as export_service, detection as detection_service
 from backend.services import jobs as job_service
-from backend.services import pipelines, records as record_service
+from backend.services import pipelines, records as record_service, review as review_service
+from backend.services import projects as project_service
 
 bp = Blueprint("records", __name__)
 
@@ -24,6 +26,11 @@ def _user() -> dict:
     user = auth.current_user()
     assert user is not None
     return user
+
+
+def _assert_project(conn, project_id: str) -> None:
+    """别人的项目一律 404：列表不能拿空结果冒充“这里没有记录”。"""
+    project_service.get_owned(conn, project_id, int(_user()["id"]))
 
 
 def _key(payload: dict, prefix: str) -> str:
@@ -38,6 +45,7 @@ def _key(payload: dict, prefix: str) -> str:
 @auth.login_required
 def list_records(project_id: str):
     conn = db.get_db()
+    _assert_project(conn, project_id)
     has_hits = request.args.get("has_hits")
     result = detection_service.list_for_project(
         conn,
@@ -52,6 +60,7 @@ def list_records(project_id: str):
         limit=int(request.args.get("limit") or 20),
         before=(request.args.get("before") or "").strip() or None,
         deleted=(request.args.get("deleted") or "exclude").strip(),
+        q=(request.args.get("q") or "").strip() or None,
     )
     reviews = aireview.latest_for_records(
         conn,
@@ -59,8 +68,22 @@ def list_records(project_id: str):
         project_id,
         [item["id"] for item in result["records"]],
     )
+    statuses = review_service.statuses_for_records(
+        conn, int(_user()["id"]), [item["id"] for item in result["records"]]
+    )
+    feedback_statuses = review_service.feedback_statuses_for_records(
+        conn, int(_user()["id"]), [item["id"] for item in result["records"]]
+    )
     for item in result["records"]:
         item["latest_review"] = reviews.get(item["id"])
+        item["human_status"] = statuses.get(item["id"], {}).get("human_status", "pending")
+        item["review_version"] = statuses.get(item["id"], {}).get("review_version")
+        # 按当前人工确认版本的反馈状态（未入池/已入池/已回流），页面与 Agent 共用。
+        item["feedback_status"] = feedback_statuses.get(item["id"], "none")
+    # 主模态来自记录所用模型绑定的数据集：单 IR 记录的原图就是 IR。
+    detection_service.attach_primary_modality(
+        conn, int(_user()["id"]), project_id, result["records"]
+    )
     return ok(result)
 
 
@@ -70,9 +93,22 @@ def get_record(project_id: str, record_id: str):
     conn = db.get_db()
     row = detection_service.get_owned(conn, int(_user()["id"]), project_id, record_id)
     data = detection_service.public_with_labels(conn, int(_user()["id"]), project_id, row)
+    data["primary_modality"] = detection_service.primary_modality_of_record(
+        conn, int(_user()["id"]), project_id, row
+    )
     data["latest_review"] = aireview.latest_for_records(
         conn, int(_user()["id"]), project_id, [record_id]
     ).get(record_id)
+    # 深链/详情走同一条授权读取：人工状态与结论版本与列表页同一口径，
+    # 不能按 ID 打开后把"已确认"显示成"待人工"。
+    statuses = review_service.statuses_for_records(
+        conn, int(_user()["id"]), [str(record_id)]
+    )
+    data["human_status"] = statuses.get(str(record_id), {}).get("human_status", "pending")
+    data["review_version"] = statuses.get(str(record_id), {}).get("review_version")
+    data["feedback_status"] = review_service.feedback_statuses_for_records(
+        conn, int(_user()["id"]), [str(record_id)]
+    ).get(str(record_id), "none")
     return ok({"record": data})
 
 
@@ -231,6 +267,7 @@ def add_feedback(project_id: str, record_id: str):
 @auth.login_required
 def list_feedback(project_id: str):
     conn = db.get_db()
+    _assert_project(conn, project_id)
     return ok(
         record_service.list_feedback(
             conn,
@@ -240,3 +277,38 @@ def list_feedback(project_id: str):
             limit=int(request.args.get("limit") or 50),
         )
     )
+
+
+@bp.get("/projects/<project_id>/detections/export")
+@auth.login_required
+def export_records(project_id: str):
+    """CSV 导出：必须显式给 scope=page|selected，不做"整项目一把梭"。"""
+    from flask import send_file
+
+    conn = db.get_db()
+    scope = (request.args.get("scope") or "").strip()
+    ids = [item for item in (request.args.get("ids") or "").split(",") if item.strip()]
+    has_hits = request.args.get("has_hits")
+    meta = export_service.records_csv(
+        conn,
+        int(_user()["id"]),
+        project_id,
+        scope=scope,
+        ids=ids,
+        limit=int(request.args.get("limit") or 20),
+        filters={
+            "status": (request.args.get("status") or "").strip(),
+            "model_id": (request.args.get("model_id") or "").strip(),
+            "session_id": (request.args.get("session_id") or "").strip(),
+            "has_hits": (None if has_hits is None else has_hits.lower() in {"1", "true", "yes"}),
+            "date_from": (request.args.get("date_from") or "").strip(),
+            "date_to": (request.args.get("date_to") or "").strip(),
+            "deleted": (request.args.get("deleted") or "exclude").strip(),
+            "q": (request.args.get("q") or "").strip(),
+        },
+    )
+    from backend.services import storage
+
+    root = storage.project_root(conn, int(_user()["id"]), project_id)
+    path = storage.resolve_rel(root, meta["relative"], must_exist=True)
+    return send_file(path, mimetype="text/csv", as_attachment=True, download_name=meta["filename"], max_age=0)

@@ -26,9 +26,17 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   const messagesBySession = reactive<Record<string, ChatMessage[]>>({})
   const pagingBySession = reactive<Record<string, { hasMore: boolean; nextBefore: number | null }>>({})
   const currentSessionId = ref('')
+  /**
+   * 最近真正进入过的项目（侧栏跳设置时路由里没有 projectId）。
+   * 只用于给“按项目存放”的面板一个正确的初始选择，不参与任何权限判断。
+   */
+  const PROJECT_KEY = 'hx17.currentProject'
+  const currentProjectId = ref(localStorage.getItem(PROJECT_KEY) ?? '')
   /** sessionId -> 最近一次读取的代次；只有代次相同的返回才允许落盘。 */
   const loadGeneration = new Map<string, number>()
   const loading = ref(false)
+  /** 第一次成功读到项目列表。删当前项目后的路由收尾要等它，避免首屏空列表误跳。 */
+  const projectsReady = ref(false)
   const error = ref('')
 
   /** 当前打开的会话的消息；没有选中会话时是空数组。 */
@@ -56,6 +64,18 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     return projects.value.find((item) => item.id === id) ?? null
   }
 
+  /** 记录“最近进入的项目”；设置页的资料/MCP 面板用它做初始选择。 */
+  function rememberProject(id: string): void {
+    const value = String(id ?? '')
+    if (!value) return
+    currentProjectId.value = value
+    try {
+      localStorage.setItem(PROJECT_KEY, value)
+    } catch {
+      // 隐私模式下写不了本地存储：只影响下次打开设置时的初始选择，不影响业务。
+    }
+  }
+
   function upsertProject(project: Project): void {
     const index = projects.value.findIndex((item) => item.id === project.id)
     if (index >= 0) projects.value[index] = project
@@ -66,6 +86,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     await run(async () => {
       const data = await http.get<{ projects: Project[] }>('/projects')
       projects.value = data.projects
+      projectsReady.value = true
     })
   }
 
@@ -97,6 +118,15 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   async function renameProject(id: string, name: string): Promise<Project | null> {
     return run(async () => {
       const data = await http.put<{ project: Project }>(`/projects/${id}`, { name })
+      upsertProject(data.project)
+      return data.project
+    })
+  }
+
+  /** 项目要求：只影响助手的侧重点，不改任何权限。 */
+  async function saveRequirements(id: string, requirements: string): Promise<Project | null> {
+    return run(async () => {
+      const data = await http.put<{ project: Project }>(`/projects/${id}`, { requirements })
       upsertProject(data.project)
       return data.project
     })
@@ -269,6 +299,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     deletedProjects.value = []
     deletedSessions.value = []
     currentSessionId.value = ''
+    projectsReady.value = false
     error.value = ''
     // 清缓存的同时把代次推高：登出后旧账号还没回来的读取结果必须作废。
     for (const key of Object.keys(messagesBySession)) {
@@ -287,14 +318,18 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     messages,
     messagesBySession,
     currentSessionId,
+    currentProjectId,
+    projectsReady,
     hasOlderMessages,
     loading,
     error,
     projectById,
+    rememberProject,
     loadProjects,
     loadTrash,
     createProject,
     renameProject,
+    saveRequirements,
     deleteProject,
     restoreProject,
     bindRoot,

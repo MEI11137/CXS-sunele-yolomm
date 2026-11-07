@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import zipfile
@@ -35,6 +36,8 @@ MAX_ZIP_ENTRIES = 20000
 MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
 MAX_SAMPLES = 20000
 SUPPORTED_SECONDARY = {"ir", "edge", "depth", "x"}
+# 主模态：原图就是它。ir 单模态是真实数据集（热红外），不是“缺了 RGB 的错误数据”。
+PRIMARY_MODALITIES = {"rgb", "ir"}
 
 
 class DatasetError(ApiError):
@@ -43,11 +46,18 @@ class DatasetError(ApiError):
 
 def public(row: sqlite3.Row | dict) -> dict:
     data = dict(row)
+    modes = _loads(data["modalities"], [])
+    primary = str(modes[0]).lower() if modes else "rgb"
     return {
         "id": data["id"],
         "project_id": data["project_id"],
         "name": data["name"],
-        "modalities": _loads(data["modalities"], []),
+        "modalities": modes,
+        # 主模态 = 原图本身是什么。单 IR 数据集这里就是 "ir"，界面据此显示“IR 原图”，
+        # 不再把红外图叫成 RGB，也没有第二张凑数的配图。
+        "primary_modality": primary,
+        # 参考模态：导出/训练真正当作“主模态像素坐标”的那一侧（reflow 显式选择）。
+        "reference_modality": data.get("reference_modality") or primary,
         "secondary_modality": data["secondary_modality"],
         "classes": _loads(data["classes"], []),
         "root_rel": data["root_rel"],
@@ -104,11 +114,19 @@ def list_for_project(
 
 
 def soft_delete(conn, user_id: int, project_id: str, dataset_id: str) -> dict:
-    row = get_owned(conn, user_id, project_id, dataset_id)
+    # 重复删除要给出“已在回收站”，不是 404：Agent 重试同一动作时不能把
+    # “已经删过”误报成“这个数据集不存在”。找回记录时连同回收站一起查。
+    row = conn.execute(
+        "SELECT * FROM datasets WHERE id = ? AND project_id = ? AND owner_id = ?",
+        (str(dataset_id), str(project_id), int(user_id)),
+    ).fetchone()
+    if row is None:
+        raise ApiError(404, "DATASET_NOT_FOUND", "数据集不存在或不属于当前项目")
     if row["deleted_at"]:
         return {"dataset_id": str(dataset_id), "status": "unchanged"}
     conn.execute(
-        "UPDATE datasets SET deleted_at = ? WHERE id = ? AND project_id = ? AND owner_id = ?",
+        "UPDATE datasets SET deleted_at = ? WHERE id = ? AND project_id = ? AND owner_id = ?"
+        " AND deleted_at IS NULL",
         (security.now_iso(), str(dataset_id), str(project_id), int(user_id)),
     )
     conn.commit()
@@ -122,10 +140,43 @@ def restore(conn, user_id: int, project_id: str, dataset_id: str) -> dict:
     ).fetchone()
     if row is None:
         raise ApiError(404, "DATASET_NOT_FOUND", "数据集不存在或不属于当前项目")
-    conn.execute(
-        "UPDATE datasets SET deleted_at = NULL WHERE id = ? AND project_id = ? AND owner_id = ?",
-        (str(dataset_id), str(project_id), int(user_id)),
-    )
+    if row["deleted_at"] is not None:
+        # 软删期间可能已重新导入过同一内容：恢复会与活跃版本撞唯一索引。
+        # 提前查清并给出明确 409，原记录继续留在回收站，文件与历史不动。
+        # 指纹口径有三类：库里存的是 v2、库里存的是旧 v1、或为空；恢复侧
+        # 必须三种都能与活跃记录对上，不能只在指纹为空时重算。
+        active = _restore_conflict(conn, user_id, project_id, dataset_id, row)
+        if active is not None:
+            raise ApiError(
+                    409,
+                    "DATASET_RESTORE_CONFLICT",
+                    "回收站里这份与正在使用的数据集内容相同，不能同时恢复两份；"
+                    "如需换回旧版本，请先删除当前使用的那份。",
+                    details={
+                        "conflict_with": {
+                            "id": str(active["id"]),
+                            "name": str(active["name"]),
+                            "deleted_at": None,
+                        },
+                        "kept_in_trash": {"id": str(dataset_id), "name": str(row["name"])},
+                    },
+                )
+    try:
+        conn.execute(
+            "UPDATE datasets SET deleted_at = NULL WHERE id = ? AND project_id = ? AND owner_id = ?",
+            (str(dataset_id), str(project_id), int(user_id)),
+        )
+    except sqlite3.IntegrityError:
+        # 并发兜底：检查与 UPDATE 之间有人恢复了同内容版本。
+        conn.rollback()
+        active = _restore_conflict(conn, user_id, project_id, dataset_id, row)
+        raise ApiError(
+            409,
+            "DATASET_RESTORE_CONFLICT",
+            "恢复时检测到另一份相同内容已在用（并发），本次恢复未写入；"
+            f"当前可用：{active['name'] if active is not None else '见列表'}",
+            details={"conflict_with": {"id": str(active["id"])} if active is not None else None},
+        ) from None
     conn.commit()
     return {"dataset_id": str(dataset_id), "status": "restored"}
 
@@ -167,6 +218,224 @@ def samples(conn, user_id: int, project_id: str, dataset_id: str, *, split: str 
 # --------------------------------------------------------------------------- 导入
 
 
+
+# --------------------------------------------------------------------------- 内容指纹
+
+
+def _x_digest(root: Path, rel: str | None) -> str:
+    """X 模态图片按**字节**取摘要；读不到就明确记 missing，不当作相同。"""
+    if not rel:
+        return ""
+    try:
+        return hashlib.sha256(storage.resolve_rel(root, rel).read_bytes()).hexdigest()
+    except (ApiError, OSError):
+        return "missing"
+
+
+def _fingerprint_lines(modes: list[str], secondary: str | None, classes: list[str], rows: list[str]) -> str:
+    """v2：头部用确定性 JSON 结构编码，类别名里的 ``|``/换行等不再可能碰撞。
+
+    ``json.dumps`` + ``sort_keys`` + 紧凑分隔符对同数据是稳定的；``classes``
+    保持原顺序（类别表顺序有语义，不做排序）。
+    """
+    head = json.dumps(
+        {
+            "v": 2,
+            "modes": sorted(modes),
+            "secondary": secondary or "",
+            "classes": list(classes),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    # 排序后再哈希：压缩包里的文件顺序、时间戳、显示名称都不参与。
+    payload = (head + "\n" + "\n".join(sorted(rows))).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _v1_fingerprint_lines(modes: list[str], secondary: str | None, classes: list[str], rows: list[str]) -> str:
+    """v1 兼容算法：仅用于把旧库里的 v1 指纹对上（不能改历史，也不能丢复用）。"""
+    head = [
+        "v1",
+        "modes=" + ",".join(sorted(modes)),
+        "secondary=" + (secondary or ""),
+        "classes=" + "|".join(classes),
+    ]
+    return hashlib.sha256("\n".join(head + sorted(rows)).encode("utf-8")).hexdigest()
+
+
+def _scan_rows(scanned: dict, root: Path) -> list[str]:
+    """样本行（不含类别/模态头部）：划分 + 内容哈希 + X 字节摘要 + 标注。"""
+    rows: list[str] = []
+    for item in scanned["samples"]:
+        rows.append(
+            "\t".join(
+                [
+                    str(item["split"]),
+                    str(item.get("sha256") or ""),
+                    str(item.get("pixel_sha256") or ""),
+                    _x_digest(root, item.get("x_rel")),
+                    json.dumps(item.get("boxes") or [], ensure_ascii=False),
+                    json.dumps(item.get("class_ids") or [], ensure_ascii=False),
+                ]
+            )
+        )
+    return rows
+
+
+def _content_fingerprint(scanned: dict, modes: list[str], secondary: str | None, root: Path) -> str:
+    return _content_fingerprint_pair(scanned, modes, secondary, root)[0]
+
+
+def _content_fingerprint_pair(
+    scanned: dict, modes: list[str], secondary: str | None, root: Path
+) -> tuple[str, str]:
+    """返回 (v2, v1)。v1 只用于把库里旧规则算出的指纹对上，不再写入新记录。"""
+    rows = _scan_rows(scanned, root)
+    return (
+        _fingerprint_lines(modes, secondary, scanned["classes"], rows),
+        _v1_fingerprint_lines(modes, secondary, scanned["classes"], rows),
+    )
+
+
+def _stored_fingerprint_pair(conn, row, root: Path) -> tuple[str | None, str | None]:
+    """按已落库样本现场重算 (v2, v1)；X 图读不到就放弃比较，不猜。"""
+    samples = conn.execute(
+        "SELECT * FROM dataset_samples WHERE dataset_id = ?", (str(row["id"]),)
+    ).fetchall()
+    if not samples:
+        return None, None
+    rows: list[str] = []
+    for sample in samples:
+        x_sha = _x_digest(root, sample["x_rel"])
+        if x_sha == "missing":
+            return None, None
+        rows.append(
+            "\t".join(
+                [
+                    str(sample["split"]),
+                    str(sample["sha256"] or ""),
+                    str(sample["pixel_sha256"] or ""),
+                    x_sha,
+                    json.dumps(json.loads(sample["boxes"] or "[]"), ensure_ascii=False),
+                    json.dumps(json.loads(sample["class_ids"] or "[]"), ensure_ascii=False),
+                ]
+            )
+        )
+    modes = json.loads(row["modalities"] or "[]")
+    secondary = row["secondary_modality"]
+    classes = json.loads(row["classes"] or "[]")
+    return (
+        _fingerprint_lines(modes, secondary, classes, rows),
+        _v1_fingerprint_lines(modes, secondary, classes, rows),
+    )
+
+
+def _legacy_fingerprint(conn, row, root: Path) -> str | None:
+    """旧记录（无指纹）用已落库的样本重算（v2 口径）。"""
+    return _stored_fingerprint_pair(conn, row, root)[0]
+
+
+def _restore_conflict(conn, user_id: int, project_id: str, dataset_id: str, row):
+    """恢复前的冲突检查：回收站记录与活跃记录按内容对上就返回那个活跃行。
+
+    口径覆盖三类：存 v2、存旧 v1、为空。存了旧 v1 的记录直接比对会漏掉
+    活跃侧的 v2（反过来也一样），所以同时用样本现场重算 v2/v1 两条路查。
+    v1 算法 ``'|'.join`` 会碰撞，仅凭 v1 命中还须类别表逐项相等才算冲突。
+    """
+    root = storage.project_root(conn, user_id, project_id)
+    stored = str(row["content_fingerprint"] or "")
+    recomputed_v2, recomputed_v1 = _stored_fingerprint_pair(conn, row, root)
+    v1_values = {value for value in (stored, recomputed_v1) if value and value != recomputed_v2}
+    # 直接口径（v2 或库里存的值）：算法本身无碰撞，命中即冲突。
+    for value in {stored, recomputed_v2}:
+        if not value:
+            continue
+        active = conn.execute(
+            "SELECT * FROM datasets WHERE project_id = ? AND owner_id = ?"
+            " AND content_fingerprint = ? AND deleted_at IS NULL AND id != ?",
+            (str(project_id), int(user_id), value, str(dataset_id)),
+        ).fetchone()
+        if active is not None:
+            return active
+    # v1 口径：类别表逐项相等才认（同指纹不同类别是 v1 碰撞，不算冲突）。
+    own_classes = json.loads(row["classes"] or "[]")
+    for value in v1_values:
+        if not value:
+            continue
+        actives = conn.execute(
+            "SELECT * FROM datasets WHERE project_id = ? AND owner_id = ?"
+            " AND content_fingerprint = ? AND deleted_at IS NULL AND id != ?",
+            (str(project_id), int(user_id), value, str(dataset_id)),
+        ).fetchall()
+        for active in actives:
+            if json.loads(active["classes"] or "[]") == own_classes:
+                return active
+    return None
+
+
+def _find_duplicate(
+    conn,
+    user_id: int,
+    project_id: str,
+    fingerprint: str,
+    scanned: dict,
+    v1_fingerprint: str | None = None,
+):
+    """同项目/同所有者里已有相同内容就返回它；回收站不参与，绝不复活。
+
+    ``fingerprint`` 是新规则（v2）的值。库里可能还有两类旧记录：
+    - ``content_fingerprint IS NULL``：现场重算（v2）比对后顺手补齐；
+    - 存的是 v1 规则的指纹：用导入侧的 v1 值对上，再核对类别表逐项相等
+      （v1 的 ``'|'.join`` 会碰撞，不能只信指纹本身），对上后升级为 v2。
+    """
+    row = conn.execute(
+        "SELECT * FROM datasets WHERE project_id = ? AND owner_id = ?"
+        " AND content_fingerprint = ? AND deleted_at IS NULL",
+        (str(project_id), int(user_id), fingerprint),
+    ).fetchone()
+    if row is not None:
+        return row
+    root = storage.project_root(conn, user_id, project_id)
+    legacy = conn.execute(
+        "SELECT * FROM datasets WHERE project_id = ? AND owner_id = ?"
+        " AND content_fingerprint IS NULL AND deleted_at IS NULL AND sample_count = ?",
+        (str(project_id), int(user_id), len(scanned["samples"])),
+    ).fetchall()
+    for item in legacy:
+        if json.loads(item["split_counts"] or "{}") != scanned["split_counts"]:
+            continue
+        digest = _legacy_fingerprint(conn, item, root)
+        if digest is None or digest != fingerprint:
+            continue
+        # 顺手补齐：下次就不用再重算旧记录。
+        conn.execute(
+            "UPDATE datasets SET content_fingerprint = ? WHERE id = ?", (digest, str(item["id"]))
+        )
+        conn.commit()
+        return conn.execute("SELECT * FROM datasets WHERE id = ?", (str(item["id"]),)).fetchone()
+    v1_fingerprint = v1_fingerprint or ""
+    if v1_fingerprint:
+        old_rule = conn.execute(
+            "SELECT * FROM datasets WHERE project_id = ? AND owner_id = ?"
+            " AND content_fingerprint = ? AND deleted_at IS NULL",
+            (str(project_id), int(user_id), v1_fingerprint),
+        ).fetchall()
+        for item in old_rule:
+            if json.loads(item["classes"] or "[]") != list(scanned["classes"]):
+                # v1 头部用 '|' 拼接，['a|b','c'] 与 ['a','b|c'] 会撞出同一个指纹；
+                # 类别表逐项不等就不是同一份数据，绝不能复用。
+                continue
+            conn.execute(
+                "UPDATE datasets SET content_fingerprint = ? WHERE id = ?",
+                (fingerprint, str(item["id"])),
+            )
+            conn.commit()
+            return conn.execute("SELECT * FROM datasets WHERE id = ?", (str(item["id"]),)).fetchone()
+    return None
+
+
 def import_dataset(
     conn,
     user_id: int,
@@ -183,8 +452,19 @@ def import_dataset(
     if not label:
         raise ApiError(400, "VALIDATION", "数据集名称不能为空")
     modes = [str(item).strip().lower() for item in (modalities or ["rgb"]) if str(item).strip()]
-    if "rgb" not in modes:
-        raise ApiError(400, "VALIDATION", "数据集必须包含 rgb 模态")
+    # 去重但保留顺序：第一个元素就是**主模态**（原图放在 images/）。
+    deduped: list[str] = []
+    for item in modes:
+        if item not in deduped:
+            deduped.append(item)
+    modes = deduped
+    primary = modes[0] if modes else "rgb"
+    if primary not in PRIMARY_MODALITIES:
+        raise ApiError(
+            400,
+            "VALIDATION",
+            f"主模态只能是 {'/'.join(sorted(PRIMARY_MODALITIES))}；当前是 {primary}",
+        )
     secondary = str(secondary_modality or "").strip().lower() or None
     if secondary is not None and secondary not in SUPPORTED_SECONDARY:
         raise ApiError(400, "VALIDATION", f"第二模态只支持 {'/'.join(sorted(SUPPORTED_SECONDARY))}")
@@ -192,6 +472,15 @@ def import_dataset(
         modes.append(secondary)
     if secondary is None and len(modes) > 1:
         secondary = modes[1]
+    if secondary == primary:
+        raise ApiError(400, "VALIDATION", "第二模态不能和主模态相同")
+    if primary != "rgb" and secondary:
+        # 单 IR 的意思就是“原图本身是 IR”，不另配第二张图；需要 RGB+IR 时把 rgb 放第一位。
+        raise ApiError(
+            400,
+            "VALIDATION",
+            "主模态为 ir 时只记录 IR 原图，不再配对第二模态；RGB+IR 请把 rgb 放在 modalities 第一位",
+        )
 
     root = storage.project_root(conn, user_id, project_id)
     dataset_id = security.new_id("dst")
@@ -218,7 +507,15 @@ def import_dataset(
         else:
             raise ApiError(400, "SOURCE_REQUIRED", "需要提供 ZIP 资产或项目内目录")
 
-        scanned = _scan(raw, secondary=secondary, classes=classes, project_root=root)
+        scanned = _scan(raw, primary=primary, secondary=secondary, classes=classes, project_root=root)
+        fingerprint, v1_fingerprint = _content_fingerprint_pair(scanned, modes, secondary, root)
+        duplicate = _find_duplicate(
+            conn, user_id, project_id, fingerprint, scanned, v1_fingerprint=v1_fingerprint
+        )
+        if duplicate is not None:
+            # 本次复制出来的副本只是临时产物：只清理自己刚建的目录。
+            storage.remove_tree(root, base)
+            return {**public(duplicate), "reused": True}
         _write_yaml(root, base, scanned)
         _insert_dataset(
             conn,
@@ -232,7 +529,22 @@ def import_dataset(
             root_rel=storage.relative(root, base),
             source=source,
             source_asset_id=source_asset_id,
+            content_fingerprint=fingerprint,
         )
+    except sqlite3.IntegrityError:
+        # 并发：两请求同时通过查重，唯一索引只放一个进来；输的那方返回已存在的那份。
+        try:
+            storage.remove_tree(root, base)
+        except ApiError:
+            pass
+        existing = conn.execute(
+            "SELECT * FROM datasets WHERE project_id = ? AND owner_id = ?"
+            " AND content_fingerprint = ? AND deleted_at IS NULL",
+            (str(project_id), int(user_id), fingerprint),
+        ).fetchone()
+        if existing is None:
+            raise
+        return {**public(existing), "reused": True}
     except Exception:
         # 清理同样要过守卫：目标真实路径可能已经不在项目内，绝不递归删外面。
         try:
@@ -256,14 +568,16 @@ def _insert_dataset(
     root_rel: str,
     source: str,
     source_asset_id: str | None,
+    content_fingerprint: str | None = None,
 ) -> None:
     now = security.now_iso()
     conn.execute(
         """
         INSERT INTO datasets
             (id, project_id, owner_id, name, modalities, secondary_modality, classes,
-             root_rel, source, source_asset_id, sample_count, split_counts, status, notes, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)
+             root_rel, source, source_asset_id, sample_count, split_counts, status, notes, created_at,
+             content_fingerprint)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?)
         """,
         (
             dataset_id,
@@ -280,6 +594,7 @@ def _insert_dataset(
             json.dumps(scanned["split_counts"], ensure_ascii=False),
             scanned["notes"],
             now,
+            content_fingerprint,
         ),
     )
     conn.executemany(
@@ -372,7 +687,14 @@ def _find_yaml(raw: Path) -> Path | None:
     return None
 
 
-def _scan(raw: Path, *, secondary: str | None, classes: list[str] | None, project_root: Path) -> dict:
+def _scan(
+    raw: Path,
+    *,
+    primary: str = "rgb",
+    secondary: str | None,
+    classes: list[str] | None,
+    project_root: Path,
+) -> dict:
     yaml_path = _find_yaml(raw)
     base = yaml_path.parent if yaml_path is not None else raw
     config: dict = {}
@@ -419,6 +741,9 @@ def _scan(raw: Path, *, secondary: str | None, classes: list[str] | None, projec
             if secondary:
                 candidate = base / str(x_rel) / split / image_path.name
                 if candidate.is_file():
+                    # 配图要真读一遍：文件名存在但内容坏掉的 IR/其它 X 不是有效配对。
+                    # 尺寸单独解码，不把主图尺寸当配图元数据（两者可以合法不同）。
+                    _image_size(candidate)
                     x_path = candidate
                 elif secondary == "edge":
                     x_path = _derive_edge(image_path, project_root, base, split, stem)
@@ -455,12 +780,13 @@ def _scan(raw: Path, *, secondary: str | None, classes: list[str] | None, projec
         notes.append("所有图片都没有标注框（按背景图处理），请确认是否导错目录")
     if derived_edge:
         notes.append(f"{derived_edge} 张 X 图为 edge 派生（来源已记录，不是真实传感器数据）")
-    notes.append(f"配对: rgb={len(samples)}, x={sum(1 for s in samples if s['x_rel'])}")
+    notes.append(f"配对: {primary}={len(samples)}" + (f", x={sum(1 for s in samples if s['x_rel'])}" if secondary else ""))
     return {
         "classes": names,
         "samples": samples,
         "split_counts": split_counts,
         "notes": "；".join(notes),
+        "primary": primary,
         "secondary": secondary,
     }
 
@@ -568,12 +894,14 @@ def _write_yaml(root: Path, base: Path, scanned: dict) -> None:
     for split in SPLITS:
         if split in scanned["split_counts"]:
             payload[split] = f"images/{split}"
-    payload["modalities"] = {"rgb": "images"}
+    payload["modalities"] = {scanned.get("primary") or "rgb": "images"}
     if scanned["secondary"]:
         payload["modalities"][scanned["secondary"]] = (
             "images_edge" if scanned["secondary"] == "edge" else f"images_{scanned['secondary']}"
         )
-    payload["modality_used"] = ["rgb"] + ([scanned["secondary"]] if scanned["secondary"] else [])
+    payload["modality_used"] = [scanned.get("primary") or "rgb"] + (
+        [scanned["secondary"]] if scanned["secondary"] else []
+    )
     storage.write_bytes(
         root,
         base / "data.yaml",

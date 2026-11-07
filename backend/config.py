@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,11 +22,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIRNAME = "var"
 DEFAULT_PORT = 5080
 DEFAULT_SESSION_HOURS = 12
-STAGE = "WB17-04"
+STAGE = "WB17-05"
 
-# OpenCode 引擎：版本与可执行文件都可用环境变量覆盖，便于换机/换版本；
-# 默认值只对应本机已核验的组合（1.19.4 + E:/OpenCode/bin/opencode.exe）。
-DEFAULT_ENGINE_EXE = "E:/OpenCode/bin/opencode.exe"
+# OpenCode 引擎：换机只认三种来源，按顺序取第一个可用的：
+#   1. 显式 HX17_ENGINE_EXE（绝对路径或 PATH 里的命令名）；
+#   2. 当前 PATH 里的 opencode / opencode.exe；
+#   3. 都没有 → 空字符串，启动 Agent 时明确提示去配置，不猜目录、不从不可信位置捡 exe。
+# 版本闸门仍由 HX17_ENGINE_VERSION（默认 1.19.4）控制，与可执行文件来源无关。
+DEFAULT_ENGINE_EXE = ""
 DEFAULT_ENGINE_VERSION = "1.19.4"
 
 # 功能开关：True 表示“本轮真实现并有测试覆盖”，False 表示“界面必须显示未实现”。
@@ -52,8 +56,11 @@ FEATURES: dict[str, bool] = {
     "review": True,
     "feedback": True,
     "reflow": True,
-    # 训练评估在 WB17-05；未实现就不宣称。
-    "training": False,
+    # WB17-05 接入：训练子进程、单机锁、模型完整管理、资料库与外部 MCP。
+    "training": True,
+    "documents": True,
+    "manuals": True,
+    "external_mcp": True,
 }
 
 
@@ -75,6 +82,19 @@ def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
     if not minimum <= value <= maximum:
         raise SystemExit(f"{name} 超出 {minimum}-{maximum}")
     return value
+
+
+def _resolve_engine_exe() -> str:
+    """按“显式配置 → PATH → 未配置”的顺序定位 OpenCode。
+
+    只判断可执行文件是否存在，**不**替用户猜安装目录：从任意目录捡一个同名 exe
+    既可能版本不对，也可能是别的程序。真的找不到就返回空串，等启动 Agent 时给出
+    明确配置引导（``HX17_ENGINE_EXE``）。
+    """
+    explicit = (os.environ.get("HX17_ENGINE_EXE") or "").strip()
+    if explicit:
+        return explicit
+    return shutil.which("opencode") or shutil.which("opencode.exe") or ""
 
 
 def version() -> str:
@@ -110,7 +130,7 @@ class Settings:
     serve_dist: bool
     cookie_secure: bool
     session_ttl_hours: int
-    engine_exe: str = DEFAULT_ENGINE_EXE
+    engine_exe: str = ""
     engine_python: str = ""
     engine_version: str = DEFAULT_ENGINE_VERSION
     engine_strict_version: bool = True
@@ -163,7 +183,7 @@ def load_settings(
         session_ttl_hours=_env_int(
             "HX17_SESSION_HOURS", DEFAULT_SESSION_HOURS, minimum=1, maximum=720
         ),
-        engine_exe=(os.environ.get("HX17_ENGINE_EXE") or DEFAULT_ENGINE_EXE).strip(),
+        engine_exe=_resolve_engine_exe(),
         engine_python=(
             os.environ.get("HX17_ENGINE_PYTHON") or sys.executable or ""
         ).strip(),

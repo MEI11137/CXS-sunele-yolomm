@@ -141,34 +141,77 @@ def add_feedback(
 
 
 def list_feedback(conn, user_id: int, project_id: str, *, status: str = "pending", limit: int = 50) -> dict:
-    clauses = ["project_id = ?", "owner_id = ?"]
+    """反馈池查询。网页与 Agent 共用这一份口径。
+
+    ``pending``（待整理）不是“表里 status='pending' 的行”，而是**当前仍然有效**的
+    待办：记录没有软删，且这条反馈绑定的复核版本就是该记录最近一次已提交版本、
+    状态为 confirmed。旧版本、后来被驳回的、记录已删的 pending 行仍留在表里做历史
+    （``status=all`` 可查），但不再进待整理队列。
+
+    过滤条件全部写在 SQL 的 LIMIT 之前：先截一页再在 Python 里过滤会漏项。
+    只改读取口径，不删行、不改 status，所以记录恢复后原反馈照样能取回。
+    """
+    page = max(1, min(int(limit or 50), 200))
     params: list[Any] = [str(project_id), int(user_id)]
-    if status:
-        clauses.append("status = ?")
-        params.append(str(status))
-    rows = conn.execute(
-        f"SELECT * FROM record_feedback WHERE {' AND '.join(clauses)} "
-        "ORDER BY created_at DESC LIMIT ?",
-        (*params, max(1, min(int(limit or 50), 200))),
-    ).fetchall()
+    scope = "f.project_id = ? AND f.owner_id = ?"
+    wanted = str(status or "").strip()
+    # ``all`` = 全量历史（含已过期/已删记录的行），不当作真实 status 值过滤。
+    if wanted and wanted != "all":
+        scope += " AND f.status = ?"
+        params.append(wanted)
+    if wanted == "pending":
+        # 该记录当前生效（最近已提交）的复核版本 ID；与 review.effective_review 同序。
+        effective = (
+            "SELECT v.id FROM review_versions v"
+            " WHERE v.detection_id = f.detection_id AND v.owner_id = f.owner_id"
+            " AND v.status != 'draft' ORDER BY v.version DESC LIMIT 1"
+        )
+        rows = conn.execute(
+            "SELECT f.* FROM record_feedback f"
+            " JOIN detections d ON d.id = f.detection_id"
+            " AND d.owner_id = f.owner_id AND d.project_id = f.project_id"
+            " JOIN review_versions v ON v.id = f.review_version_id AND v.owner_id = f.owner_id"
+            f" WHERE {scope} AND d.deleted_at IS NULL AND v.status = 'confirmed'"
+            f" AND v.id = ({effective})"
+            " ORDER BY f.created_at DESC LIMIT ?",
+            (*params, page),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"SELECT f.* FROM record_feedback f WHERE {scope} "
+            "ORDER BY f.created_at DESC LIMIT ?",
+            (*params, page),
+        ).fetchall()
     return {"feedback": [_public_feedback(conn, row) for row in rows]}
 
 
 def _public_feedback(conn, row) -> dict:
     data = dict(row)
     version = conn.execute(
-        "SELECT version, status, outcome, boxes, image_width, image_height FROM review_versions "
-        "WHERE id = ? AND owner_id = ?",
+        "SELECT version, status, outcome, boxes, x_boxes, image_width, image_height,"
+        " x_image_width, x_image_height, reference_modality, secondary_modality"
+        " FROM review_versions WHERE id = ? AND owner_id = ?",
         (str(data["review_version_id"]), int(data["owner_id"])),
     ).fetchone()
     review = None
     if version is not None:
         boxes = json.loads(version["boxes"] or "[]")
+        x_boxes = json.loads(version["x_boxes"] or "[]")
         review = {
             "version": int(version["version"]),
             "outcome": version["outcome"],
+            # box_count 保持“参考模态框数”旧语义；X 侧单独给 x_box_count。
             "box_count": len(boxes),
+            "x_box_count": len(x_boxes),
+            "x_modality": version["secondary_modality"],
+            "reference_modality": version["reference_modality"],
+            "secondary_modality": version["secondary_modality"],
             "image": {"width": int(version["image_width"]), "height": int(version["image_height"])},
+            "x_image": (
+                {"width": int(version["x_image_width"]), "height": int(version["x_image_height"])}
+                if version["x_image_width"] and version["x_image_height"]
+                else None
+            ),
         }
     return {
         "id": data["id"],

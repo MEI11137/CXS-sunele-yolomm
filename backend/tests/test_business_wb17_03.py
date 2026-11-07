@@ -37,6 +37,7 @@ from backend.services import aireview, detection as detection_service, storage
 from backend.services import assets as assets_service
 from backend.services import datasets as dataset_service
 from backend.services import jobs as job_service
+from backend.tests.weights import write_real_weight
 from backend.vision import runtime as vision_runtime
 from backend.tests.support import Harness, body, csrf_headers, login
 
@@ -186,10 +187,10 @@ class BusinessBase(unittest.TestCase):
 
     def make_model(self, *, mode: str = "single", secondary: str | None = None) -> dict:
         weight = self.root / "weights" / "best.pt"
-        weight.parent.mkdir(parents=True, exist_ok=True)
-        payload = b"not-a-real-weight"  # 只在被“加载”时才需要是真权重
-        weight.write_bytes(payload)
-        weight_sha = hashlib.sha256(payload).hexdigest()
+        # 真的可校验权重（极小 DetectionModel）：发布/登记都会真读一遍，
+        # 文本文件或只有 names 的字典已经过不了校验。
+        write_real_weight(weight)
+        weight_sha = hashlib.sha256(weight.read_bytes()).hexdigest()
         conn = self.conn()
         try:
             model_id = f"mdl_{secrets.token_hex(8)}"

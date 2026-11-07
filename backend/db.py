@@ -646,11 +646,286 @@ CREATE INDEX IF NOT EXISTS idx_review_followups_scope
 
 # v11：样本身份的**文件戳**。03 导入的样本在 04 才有 sha256/pixel_sha256 列，
 # 老行全为 NULL，匹配器只比这两列就把它当“新图”。这里不预填指纹（那等于编造），
-# 只加两个可空列记录“算指纹时文件的 size/mtime”：命中就免读盘，不命中就重算并比对，
-# 于是缓存永远服从当前真实文件，不会用旧指纹盖掉文件已被改的事实。
+# 只加两个可空列记录“算指纹时文件的 size/mtime”：它们只用于诊断与“要不要顺手刷新”，
+# **不是**内容未变的证据——读字节算 sha256 才是（改写文件再 os.utime 还原 mtime 的
+# 反例已证明戳可以被伪造）。
 SCHEMA_V11 = """
 ALTER TABLE dataset_samples ADD COLUMN identity_size INTEGER;
 ALTER TABLE dataset_samples ADD COLUMN identity_mtime_ns INTEGER;
+"""
+
+
+# v12：训练运行、单机训练锁，以及模型表补齐“来源/父模型/指标/软删/被取代”。
+#
+# 为什么重建 models：SQLite 改不了 CHECK 约束，而发布新模型必须能把同项目里
+# 被取代的旧模型标成 superseded（而不是 archived——归档是用户主动收起，
+# 被取代是“有更新的版本上线了”，两者在界面上要分开说）。
+# 其他表没有指向 models 的外键，所以重建只影响本表。
+#
+# training_runs 与 jobs 的分工：*run* 存训练域字段（参数、日志、PID、父子模型），
+# *job* 只做既有的事件流与轮次查询（沿用 WB17-03 的后台任务骨架，不另建一套）。
+# 抢锁先于建 run：没有锁就不产生“训练中”的记录，避免重启后看似有训练在跑。
+SCHEMA_V12 = """
+ALTER TABLE models RENAME TO models_v11;
+CREATE TABLE models (
+    id                 TEXT    PRIMARY KEY,
+    project_id         TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    owner_id           INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name               TEXT    NOT NULL,
+    family             TEXT    NOT NULL CHECK (family IN ('yolo', 'yolomm')),
+    model_mode         TEXT    NOT NULL CHECK (model_mode IN ('single', 'multimodal')),
+    secondary_modality TEXT,
+    dataset_id         TEXT,
+    weight_rel         TEXT    NOT NULL,
+    weight_sha256      TEXT    NOT NULL,
+    weight_size        INTEGER NOT NULL DEFAULT 0,
+    classes            TEXT    NOT NULL DEFAULT '[]',
+    class_map          TEXT    NOT NULL DEFAULT '{}',
+    status             TEXT    NOT NULL CHECK (status IN
+                           ('imported', 'published', 'superseded', 'failed', 'archived')),
+    published_at       TEXT,
+    notes              TEXT    NOT NULL DEFAULT '',
+    created_at         TEXT    NOT NULL,
+    source             TEXT    NOT NULL DEFAULT 'imported'
+                       CHECK (source IN ('imported', 'trained')),
+    parent_model_id    TEXT,
+    training_run_id    TEXT,
+    metrics            TEXT    NOT NULL DEFAULT '{}',
+    deleted_at         TEXT,
+    UNIQUE (project_id, name)
+);
+INSERT INTO models
+    (id, project_id, owner_id, name, family, model_mode, secondary_modality, dataset_id,
+     weight_rel, weight_sha256, weight_size, classes, class_map, status, published_at,
+     notes, created_at, source)
+SELECT
+    id, project_id, owner_id, name, family, model_mode, secondary_modality, dataset_id,
+    weight_rel, weight_sha256, weight_size, classes, class_map, status, published_at,
+    notes, created_at, 'imported'
+FROM models_v11;
+DROP TABLE models_v11;
+CREATE INDEX idx_models_project ON models(project_id, owner_id, status);
+
+CREATE TABLE IF NOT EXISTS training_runs (
+    id             TEXT    PRIMARY KEY,
+    project_id     TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    owner_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    job_id         TEXT,
+    dataset_id     TEXT    NOT NULL,
+    parent_model_id TEXT,
+    base_weight_rel TEXT   NOT NULL DEFAULT '',
+    name           TEXT    NOT NULL,
+    status         TEXT    NOT NULL CHECK (status IN
+                       ('queued', 'running', 'succeeded', 'failed', 'cancelled', 'interrupted')),
+    params         TEXT    NOT NULL DEFAULT '{}',
+    metrics        TEXT    NOT NULL DEFAULT '{}',
+    conditions     TEXT    NOT NULL DEFAULT '{}',
+    run_dir_rel    TEXT    NOT NULL DEFAULT '',
+    log_rel        TEXT    NOT NULL DEFAULT '',
+    pid            INTEGER,
+    pid_started_at REAL,
+    output_model_id TEXT,
+    error_code     TEXT,
+    error_message  TEXT,
+    request_key    TEXT    NOT NULL,
+    session_id     TEXT,
+    turn_id        TEXT,
+    created_at     TEXT    NOT NULL,
+    started_at     TEXT,
+    finished_at    TEXT,
+    UNIQUE (project_id, request_key)
+);
+CREATE INDEX IF NOT EXISTS idx_training_project
+    ON training_runs(project_id, owner_id, created_at);
+
+CREATE TABLE IF NOT EXISTS training_locks (
+    id           TEXT    PRIMARY KEY,
+    project_id   TEXT    NOT NULL,
+    owner_id     INTEGER NOT NULL,
+    run_id       TEXT    NOT NULL,
+    pid          INTEGER,
+    acquired_at  TEXT    NOT NULL,
+    heartbeat_at TEXT
+);
+"""
+
+
+# v13：资料库（项目内文档 + 分页原文）与手册（内置 + 个人版本）。
+#
+# * 文档属于**项目 + 所有者**：跨项目读不到，与管理员的全局知识库不是一回事。
+# * 页面文本单独一张表：检索按页命中，读原文也按页取，避免一次把整本书塞进上下文。
+# * 手册有版本：编辑产生新版本，可显式选择启用哪一版；内置手册（project_id/owner_id 为
+#   NULL 或 builtin=1）只读，个人手册可编辑。手册内容只是**说明文字**，永远不会
+#   被当成权限来源——工具与目录边界只由服务端策略决定。
+SCHEMA_V13 = """
+CREATE TABLE IF NOT EXISTS documents (
+    id            TEXT    PRIMARY KEY,
+    project_id    TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    owner_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name          TEXT    NOT NULL,
+    filename      TEXT    NOT NULL,
+    rel_path      TEXT    NOT NULL,
+    kind          TEXT    NOT NULL CHECK (kind IN ('pdf', 'docx', 'txt', 'md')),
+    size          INTEGER NOT NULL DEFAULT 0,
+    sha256        TEXT    NOT NULL DEFAULT '',
+    page_count    INTEGER NOT NULL DEFAULT 0,
+    char_count    INTEGER NOT NULL DEFAULT 0,
+    status        TEXT    NOT NULL CHECK (status IN ('ready', 'failed')),
+    error_code    TEXT,
+    error_message TEXT,
+    created_at    TEXT    NOT NULL,
+    deleted_at    TEXT,
+    UNIQUE (project_id, owner_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_documents_project
+    ON documents(project_id, owner_id, created_at);
+
+CREATE TABLE IF NOT EXISTS document_pages (
+    document_id TEXT    NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    page_no     INTEGER NOT NULL,
+    text        TEXT    NOT NULL,
+    PRIMARY KEY (document_id, page_no)
+);
+
+CREATE TABLE IF NOT EXISTS manuals (
+    id                TEXT    PRIMARY KEY,
+    project_id        TEXT,
+    owner_id          INTEGER,
+    name              TEXT    NOT NULL,
+    description       TEXT    NOT NULL DEFAULT '',
+    builtin           INTEGER NOT NULL DEFAULT 0,
+    active_version_id TEXT,
+    created_at        TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_manuals_scope ON manuals(project_id, owner_id);
+
+CREATE TABLE IF NOT EXISTS manual_versions (
+    id         TEXT    PRIMARY KEY,
+    manual_id  TEXT    NOT NULL REFERENCES manuals(id) ON DELETE CASCADE,
+    version    INTEGER NOT NULL,
+    content    TEXT    NOT NULL,
+    note       TEXT    NOT NULL DEFAULT '',
+    created_at TEXT    NOT NULL,
+    created_by INTEGER,
+    UNIQUE (manual_id, version)
+);
+"""
+
+
+# v14：外部 MCP。三层分离是有意的——
+#   mcp_servers 存配置（凭据只存密文与掩码），
+#   mcp_tools   存发现到的工具与**逐项授权**（默认 pending，不默认放行），
+#   mcp_calls   存每次真实调用的审计（谁、什么时候、成功失败）。
+SCHEMA_V14 = """
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    id                  TEXT    PRIMARY KEY,
+    project_id          TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    owner_id            INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name                TEXT    NOT NULL,
+    transport           TEXT    NOT NULL CHECK (transport IN ('stdio', 'http')),
+    command             TEXT    NOT NULL DEFAULT '',
+    args                TEXT    NOT NULL DEFAULT '[]',
+    cwd_rel             TEXT    NOT NULL DEFAULT '',
+    url                 TEXT    NOT NULL DEFAULT '',
+    secrets_cipher      TEXT    NOT NULL DEFAULT '',
+    secret_hints        TEXT    NOT NULL DEFAULT '{}',
+    enabled             INTEGER NOT NULL DEFAULT 0,
+    auto_allow_read_only INTEGER NOT NULL DEFAULT 0,
+    status              TEXT    NOT NULL DEFAULT 'unknown'
+                                CHECK (status IN ('unknown', 'connected', 'error', 'disabled')),
+    last_error          TEXT,
+    last_seen_at        TEXT,
+    created_at          TEXT    NOT NULL,
+    deleted_at          TEXT,
+    UNIQUE (project_id, owner_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS mcp_tools (
+    server_id     TEXT    NOT NULL REFERENCES mcp_servers(id) ON DELETE CASCADE,
+    name          TEXT    NOT NULL,
+    title         TEXT    NOT NULL DEFAULT '',
+    description   TEXT    NOT NULL DEFAULT '',
+    schema        TEXT    NOT NULL DEFAULT '{}',
+    read_only     INTEGER NOT NULL DEFAULT 0,
+    authorization TEXT    NOT NULL DEFAULT 'pending'
+                          CHECK (authorization IN ('pending', 'allowed', 'denied')),
+    discovered_at TEXT    NOT NULL,
+    PRIMARY KEY (server_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS mcp_calls (
+    id          TEXT    PRIMARY KEY,
+    server_id   TEXT    NOT NULL,
+    tool_name   TEXT    NOT NULL,
+    actor_id    INTEGER NOT NULL,
+    turn_id     TEXT,
+    request_key TEXT,
+    ok          INTEGER NOT NULL DEFAULT 0,
+    error       TEXT,
+    result      TEXT,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_calls_server ON mcp_calls(server_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_calls_key
+    ON mcp_calls(server_id, request_key) WHERE request_key IS NOT NULL;
+"""
+
+
+SCHEMA_V15 = """
+ALTER TABLE projects ADD COLUMN requirements TEXT NOT NULL DEFAULT '';
+"""
+
+SCHEMA_V16 = """
+-- 训练分派：YOLO / YOLOMM 按“真实数据模态 + 父模型”决定，记录进 run 行，
+-- 供产物登记（create_trained）写 models.family / model_mode / secondary_modality。
+ALTER TABLE training_runs ADD COLUMN family TEXT NOT NULL DEFAULT 'yolo';
+ALTER TABLE training_runs ADD COLUMN secondary_modality TEXT;
+"""
+
+
+SCHEMA_V17 = """
+-- 训练启动交接：'preparing'（准备/校验中，可取消）→ 'launching'（已认领启动权，
+-- 进程即将或已经起来，取消不能提前宣称成功）。NULL 表示没有在途的启动交接。
+ALTER TABLE training_runs ADD COLUMN launch_state TEXT;
+"""
+
+
+SCHEMA_V18 = """
+-- 数据集内容指纹：同一项目/所有者内，内容+模态+类别+标注+划分相同就不再建第二份。
+-- 只按内容算（sha/pixel_sha/boxes/class_ids/划分），不含名称、ZIP 时间戳、绝对路径。
+ALTER TABLE datasets ADD COLUMN content_fingerprint TEXT;
+DROP INDEX IF EXISTS idx_datasets_fingerprint;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_datasets_fingerprint
+    ON datasets(project_id, owner_id, content_fingerprint)
+    WHERE content_fingerprint IS NOT NULL AND deleted_at IS NULL;
+"""
+
+
+SCHEMA_V20 = """
+-- 个人手册的删除改成软删：删除只是从列表/读取里隐藏，内容仍在库里，
+-- 可以恢复；内置手册永远只读，不走这条路。
+ALTER TABLE manuals ADD COLUMN deleted_at TEXT;
+"""
+
+
+SCHEMA_V21 = """
+-- 双模态复核：主模态与辅模态各自一套标注，各用各的原图像素坐标。
+-- boxes / image_width / image_height 继续表示**参考模态**（记录的主图）的标注与尺寸；
+-- x_boxes / x_image_width / x_image_height 表示**辅模态**（如 IR）的标注与尺寸。
+-- 旧记录这三列为 NULL，读取时按“没有辅模态标注”处理，不改变原行为。
+ALTER TABLE review_versions ADD COLUMN x_boxes TEXT;
+ALTER TABLE review_versions ADD COLUMN x_image_width INTEGER;
+ALTER TABLE review_versions ADD COLUMN x_image_height INTEGER;
+-- 记录这两套坐标分别属于哪个模态，导出/训练据此判断怎么消费，禁止隐式互换。
+ALTER TABLE review_versions ADD COLUMN reference_modality TEXT;
+ALTER TABLE review_versions ADD COLUMN secondary_modality TEXT;
+-- 数据集显式记录“标注参考模态”：训练读取 images/ 与 labels/ 时以它为准，
+-- 不再靠目录名猜。
+ALTER TABLE datasets ADD COLUMN reference_modality TEXT;
+-- 辅模态标注文件（如 labels_ir/<split>/<stem>.txt）：与 labels/ 分开存，
+-- 和 datasets/<id>/manifest.json 里的 reference/secondary 信息一起可追溯。
+ALTER TABLE dataset_samples ADD COLUMN labels_ir_rel TEXT;
 """
 
 
@@ -666,6 +941,23 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
     (9, SCHEMA_V9),
     (10, SCHEMA_V10),
     (11, SCHEMA_V11),
+    (12, SCHEMA_V12),
+    (13, SCHEMA_V13),
+    (14, SCHEMA_V14),
+    (15, SCHEMA_V15),
+    (16, SCHEMA_V16),
+    (17, SCHEMA_V17),
+    (18, SCHEMA_V18),
+    # v19：同一份索引加上“回收站不参与”，让已迁移过的库也换掉旧谓词。
+    (
+        19,
+        "DROP INDEX IF EXISTS idx_datasets_fingerprint;"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_datasets_fingerprint"
+        " ON datasets(project_id, owner_id, content_fingerprint)"
+        " WHERE content_fingerprint IS NOT NULL AND deleted_at IS NULL;",
+    ),
+    (20, SCHEMA_V20),
+    (21, SCHEMA_V21),
 )
 
 

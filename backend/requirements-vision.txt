@@ -8,13 +8,50 @@
 # 三条硬约束（与 backend/vision/runtime.py 一致）：
 # 1. 服务端**不会**自动安装、自动下载模型或静默降级。缺包时报 VISION_DEPENDENCY_MISSING，
 #    缺权重时报 VISION_WEIGHT_MISSING，不会伪造空结果。
-# 2. torch / torchvision 必须与部署机的 CUDA 驱动或 CPU 环境匹配，所以只写最低版本，
-#    实际版本由部署方决定（本机实测见 docs/workbuddy-development/WB17-03.md）。
+# 2. torch / torchvision 必须与部署机的 CUDA 驱动或 CPU 环境匹配；下面只是**最低**
+#    版本，实际组合由部署方按驱动选择（不要照搬开发机的 wheel）。
+#    下限为何是 2.6：backend/vision/safe_weight.py 直接用
+#    torch.serialization.get_unsafe_globals_in_checkpoint，该 API 在 2.6.0 才进入
+#    torch.serialization.__all__（2.5.1 没有）。低于它时服务端会显式报
+#    TORCH_TOO_OLD，而不是把权重误判成损坏；绝不会退回 weights_only=False。
 # 3. ultralytics 不从 PyPI 安装：推理只用 backend/vendor/ultralytics（AGPL-3.0）。
 #    这里列出的 einops / timm / ultralytics-thop 是它运行时 import 的依赖。
+# 4. albumentations 是**双模态（YOLOMM）训练/数据增强的硬依赖**，不是可选项：
+#    vendor 的 MultiModalAlbumentations（backend/vendor/ultralytics/data/）在构造数据
+#    管线时要求 albumentations>=1.0.3，缺少时训练子进程失败并如实报 TRAINING_ERROR
+#    （2026-11-07 真实训练现场：ImportError: MultiModalAlbumentations requires
+#    'albumentations>=1.0.3'）。开发机实测版本 albumentations==2.0.8 + albucore==0.0.24。
+#    albumentations 自己声明 opencv-python-headless；本项目已用 opencv-python（同一个
+#    cv2 模块）。两者装在一起会尝试覆盖正在使用的 cv2.pyd（Windows WinError 5），
+#    因此**不要在运行服务时**直接 pip install albumentations；按下面的 --no-deps
+#    方式单独装，并保留已有 opencv-python / simsimd / stringzilla。
+#
+# 5. grad-cam 及其依赖是**双模态（YOLOMM）路径的硬依赖**，不是可选项：
+#    vendor 的 models/yolo/model.py 在模块导入期就会加载
+#    models/yolo/multimodal/visualize/（heatmap.py: ``import pytorch_grad_cam``）。
+#    因此 activate_vendor() 在第一次 import ultralytics 时就会检查它；缺包同样报
+#    VISION_DEPENDENCY_MISSING（2026-11-07 现场精确 cause：ModuleNotFoundError
+#    name=pytorch_grad_cam）。缺了它，连**普通**权重检查都过不去。
+#    grad-cam 自己声明 opencv-python-headless；本文件已用 opencv-python（同一 cv2
+#    模块），二者装其一即可，不要同时装两份。
+#
+# 安装顺序建议（保持 torch 不被依赖解析器换掉）：
+#   python -m pip install -r backend/requirements-vision.txt
+#   python -m pip install --no-deps grad-cam ttach scikit-learn joblib threadpoolctl cloudpickle narwhals
+#   python -m pip install --no-deps albumentations==2.0.8 albucore==0.0.24
+# 若部署机 pip 缓存目录不可写（Windows 常见 WinError 5），先设 PIP_CACHE_DIR 到可写目录。
+# 5. AMP 校验（可选联网行为）：worker 默认 amp=False，正常训练不下载任何基准权重。
+#    只有显式设置 HX17_TRAINING_AMP=1 时，vendor 的 check_amp() 会首次在线下载
+#    5.35MB 的 yolo11n.pt 做 CUDA AMP 校验（落在 run_dir，失败自动关闭 AMP）。
+#    离线部署保持默认即可；不要声称“任何配置都不会下载”。
+#
+# 若 albumentations 第一次没装成功且服务正占用 cv2，先把服务停掉再装，或按上面的
+# --no-deps 方式装（推荐后者，不影响正在运行的服务）。
+# 安装后自检见 docs/WB17-06-换机部署.md「视觉依赖自检」一节。
 
-torch>=2.2
-torchvision>=0.17
+torch>=2.6
+# 与所选 torch 配套：torch 2.6 ↔ torchvision 0.21（按官方兼容表选，不要单独升级）。
+torchvision>=0.21
 numpy>=1.24
 opencv-python>=4.8
 Pillow>=10,<13
@@ -28,3 +65,14 @@ requests>=2.31
 einops>=0.7
 timm>=0.9
 ultralytics-thop>=2.0
+# —— 双模态训练/数据增强依赖（vendor MultiModalAlbumentations 硬依赖，见上面第 4 条） ——
+albumentations>=1.0.3
+albucore>=0.0.24
+# —— 双模态可视化依赖（vendor 导入链硬依赖，见上面第 5 条） ——
+grad-cam>=1.5
+ttach>=0.0.3
+scikit-learn>=1.3
+joblib>=1.3
+threadpoolctl>=3.1
+cloudpickle>=3.0
+narwhals>=2.0

@@ -26,7 +26,7 @@ class PublicSurfaceTest(unittest.TestCase):
         self.assertEqual(data["status"], "ok")
         self.assertEqual(data["service"], "haixun-1.7-backend")
         self.assertEqual(data["version"], "1.7.0")
-        self.assertEqual(data["stage"], "WB17-04")
+        self.assertEqual(data["stage"], "WB17-05")
         # 绝对路径不应出现在匿名可读的响应里。
         self.assertNotIn("data_dir", data)
         self.assertNotIn(str(self.harness.data_dir), response.get_data(as_text=True))
@@ -56,10 +56,16 @@ class PublicSurfaceTest(unittest.TestCase):
         self.assertTrue(features["datasets"])
         self.assertTrue(features["models"])
         # 未实现的必须保持 False，界面据此显示“未实现”。
+        # WB17-05 起训练、资料库、手册与外部 MCP 都是真实实现。
         self.assertTrue(features["review"])
         self.assertTrue(features["feedback"])
         self.assertTrue(features["reflow"])
-        self.assertFalse(features["training"])
+        self.assertTrue(features["training"])
+        self.assertTrue(features["documents"])
+        self.assertTrue(features["manuals"])
+        self.assertTrue(features["external_mcp"])
+        # 原生命令执行仍不开放：网页与助手都只走"可证明范围"的受控通道。
+        self.assertFalse(features["agent_shell"])
 
     def test_meta_reports_initialized_after_account_created(self):
         self.harness.create_user("alice", role="admin")

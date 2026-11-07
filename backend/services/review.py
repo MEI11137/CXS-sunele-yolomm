@@ -39,6 +39,12 @@ def public_version(row: sqlite3.Row | dict) -> dict:
         "status": data["status"],
         "outcome": data.get("outcome"),
         "boxes": _loads(data.get("boxes"), []),
+        # 辅模态标注与其自身像素尺寸：与主模态 boxes 分开存，不能用主图尺寸校验。
+        "x_boxes": _loads(data.get("x_boxes"), []),
+        "x_image_width": int(data.get("x_image_width") or 0),
+        "x_image_height": int(data.get("x_image_height") or 0),
+        "reference_modality": data.get("reference_modality"),
+        "secondary_modality": data.get("secondary_modality"),
         "class_table": _loads(data.get("class_table"), []),
         "image_width": int(data.get("image_width") or 0),
         "image_height": int(data.get("image_height") or 0),
@@ -122,6 +128,85 @@ def _draft(conn, detection_id: str, owner_id: int) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def _draft_supersedes(latest: sqlite3.Row | None, draft: sqlite3.Row | None) -> bool:
+    """这份草稿是不是“当前编辑中的状态”。
+
+    只看“存在草稿”不够，只看“最近已提交是 rejected”也不够：显式重开会新建一份
+    版本号更大的草稿，但最近**已提交**版本仍是那条驳回。两边单看都会把重开后的
+    记录判回“已驳回/不可编辑”。统一规则是：没有草稿 → 否；没有已提交版本（首次
+    复核）→ 是；否则草稿版本更大才算当前。
+
+    注意这不改变**生效结论**：``effective_review`` 仍取最近已提交版本，所以重开后
+    旧驳回继续生效、旧 confirmed 不能复活去加反馈；只有真正再提交才产生新结论。
+    """
+    if draft is None:
+        return False
+    if latest is None:
+        return True
+    return int(draft["version"]) > int(latest["version"])
+
+
+def _bucket_for(latest: sqlite3.Row | None, draft: sqlite3.Row | None) -> str:
+    """列表/state/queue 共用的唯一分桶。
+
+    只有两种情况把草稿算作当前状态：
+    * 还没有任何已提交版本（首次复核的草稿）；
+    * 最近已提交是 **rejected**，且重开/编辑生成了版本更大的草稿。
+    已确认记录上另存的草稿只是“再次编辑的草稿”，不能把已确认结论降级成 draft，
+    否则记录页的反馈入口会因为 human_status 变了而误锁。
+    """
+    if latest is None:
+        return "draft" if draft is not None else "pending"
+    if latest["status"] == "rejected" and _draft_supersedes(latest, draft):
+        return "draft"
+    return _queue_name(latest)
+
+
+def statuses_for_records(conn, user_id: int, record_ids: list[str]) -> dict[str, dict]:
+    """批量给出记录的**人工**状态（与 AI 核查分开展示）。
+
+    口径与单条 `state()` 一致：最近已提交版本 confirmed/rejected 优先，
+    其次看有没有草稿，都没有就是 pending。列表页用，不替代复核接口的
+    ``{"state": ...}`` 信封。
+    """
+    out: dict[str, dict] = {}
+    for record_id in {str(item) for item in record_ids}:
+        latest = _latest_submitted(conn, record_id, user_id)
+        draft = _draft(conn, record_id, user_id)
+        # 与单条 state()/queue() 同一份分桶规则：显式重开后的新草稿可编辑、
+        # 在草稿队列；列表不能还把这条记录显示成“已驳回”。
+        human_status = _bucket_for(latest, draft)
+        out[str(record_id)] = {
+            "human_status": human_status,
+            "review_version": int(latest["version"]) if latest is not None else None,
+        }
+    return out
+
+
+def feedback_statuses_for_records(conn, user_id: int, record_ids: list[str]) -> dict[str, str]:
+    """按**当前生效人工版本**给出反馈状态：``none`` / ``pending`` / ``reflowed``。
+
+    只认生效版本：旧版本回流过不代表新人工版本已入池；反过来旧版本在池里
+    也不能挡住新版本再次加入（版本变了就是另一条反馈）。页面与 Agent 工具
+    共用这份口径，前端不自行猜，也不复制一套反馈数据库逻辑。
+    """
+    out: dict[str, str] = {}
+    for record_id in {str(item) for item in record_ids}:
+        effective = effective_review(conn, record_id, user_id)
+        if effective is None or effective["status"] != "confirmed":
+            out[record_id] = "none"
+            continue
+        row = conn.execute(
+            "SELECT status FROM record_feedback WHERE detection_id = ? AND owner_id = ?"
+            " AND review_version_id = ?",
+            (record_id, int(user_id), str(effective["id"])),
+        ).fetchone()
+        status = str(row["status"]) if row is not None else "none"
+        # 'void' 不在池里，按未入池处理。
+        out[record_id] = status if status in {"pending", "reflowed"} else "none"
+    return out
+
+
 def _latest_any(conn, detection_id: str, owner_id: int) -> sqlite3.Row | None:
     """最近一条版本，**草稿也算**。草稿的编辑基线要用它，不能用已提交版本。"""
     return conn.execute(
@@ -152,17 +237,22 @@ def state(conn, user_id: int, project_id: str, record_id: str) -> dict:
     )
     rejected = next((row for row in reversed(versions) if row["status"] == "rejected"), None)
     detection = detection_service.public_with_labels(conn, user_id, project_id, record)
+    if not detection.get("primary_modality"):
+        detection["primary_modality"] = detection_service.primary_modality_of_record(
+            conn, user_id, project_id, record
+        )
     from backend.services import aireview
 
     ai_review = aireview.latest_for_records(conn, user_id, project_id, [str(record_id)]).get(str(record_id))
+    # 唯一分桶：显式重开后的新草稿是“当前编辑中”，旧驳回仍是最新生效结论。
+    bucket = _bucket_for(latest_submitted, draft)
+    primary_width, primary_height = _asset_size(conn, user_id, project_id, record)
+    x_width, x_height = _x_asset_size(conn, user_id, project_id, record)
+    reference_modality = str(detection.get("primary_modality") or "rgb")
     return {
         "record": detection,
         "ai_review": ai_review,
-        "human_status": (
-            "confirmed" if latest_submitted and latest_submitted["status"] == "confirmed"
-            else "rejected" if latest_submitted and latest_submitted["status"] == "rejected"
-            else "draft" if draft else "pending"
-        ),
+        "human_status": bucket,
         "class_options": options,
         "versions": [public_version(row) for row in versions],
         "draft": public_version(draft) if draft else None,
@@ -170,11 +260,18 @@ def state(conn, user_id: int, project_id: str, record_id: str) -> dict:
         "latest_submitted": public_version(latest_submitted) if latest_submitted else None,
         "latest_confirmed": public_version(confirmed) if confirmed else None,
         "latest_rejected": public_version(rejected) if rejected else None,
-        "pending": latest_submitted is None,
-        "queue": _queue_name(latest_submitted),
+        "pending": latest_submitted is None and draft is None,
+        "queue": bucket,
+        # 显式重开：驳回之后又生成了版本更大的草稿。界面用它显示“重开后可编辑”，
+        # 但生效结论仍是 latest_submitted（rejected），不能当成已确认。
+        "reopened": bool(
+            latest_submitted
+            and latest_submitted["status"] == "rejected"
+            and _draft_supersedes(latest_submitted, draft)
+        ),
         "image": {
-            "width": _asset_size(conn, user_id, project_id, record)[0],
-            "height": _asset_size(conn, user_id, project_id, record)[1],
+            "width": primary_width,
+            "height": primary_height,
             "rgb_url": detection["image_url"],
             "x_url": (
                 f"/api/projects/{project_id}/assets/{record['x_asset_id']}/content"
@@ -182,7 +279,13 @@ def state(conn, user_id: int, project_id: str, record_id: str) -> dict:
                 else None
             ),
             "x_modality": _x_modality(conn, user_id, project_id, record),
+        "x_modality_token": _x_modality_token(conn, user_id, project_id, record),
+            "x_width": x_width,
+            "x_height": x_height,
             "result_url": detection["result_url"],
+            # 主图到底是什么模态：单 IR 记录的 rgb_url 指的是 IR 原图，
+            # 界面不能一律写“可见光 RGB”。同理辅模态也不能默认写 IR。
+            "primary_modality": reference_modality,
         },
     }
 
@@ -201,6 +304,20 @@ def _x_modality(conn, user_id: int, project_id: str, record) -> str | None:
     return aireview._modality_label(row)
 
 
+def _x_modality_token(conn, user_id: int, project_id: str, record) -> str | None:
+    """辅模态的原始 token（ir/rgb/edge/depth）；显示用的中文说明仍在 image.x_modality。"""
+    if not record["x_asset_id"]:
+        return None
+    row = conn.execute(
+        "SELECT role FROM assets WHERE id = ? AND project_id = ? AND owner_id = ?",
+        (str(record["x_asset_id"]), str(project_id), int(user_id)),
+    ).fetchone()
+    if row is None:
+        return None
+    role = str(row["role"] or "").strip().lower()
+    return role or None
+
+
 def _asset_size(conn, user_id: int, project_id: str, record) -> tuple[int, int]:
     row = conn.execute(
         "SELECT width, height FROM assets WHERE id = ? AND project_id = ? AND owner_id = ?",
@@ -209,6 +326,96 @@ def _asset_size(conn, user_id: int, project_id: str, record) -> tuple[int, int]:
     if row is None:
         return 0, 0
     return int(row["width"] or 0), int(row["height"] or 0)
+
+
+def _x_asset_size(conn, user_id: int, project_id: str, record) -> tuple[int, int]:
+    """辅模态原图自己的像素尺寸：辅模态标注只能按这个尺寸校验。
+
+    主图（参考模态）和辅模态可能是不同分辨率（例如 RGB 1280x1024、IR 640x512），
+    把一套框套到另一套图上就是伪造配准，所以这里必须分开读取。
+    """
+    if not record["x_asset_id"]:
+        return 0, 0
+    row = conn.execute(
+        "SELECT width, height FROM assets WHERE id = ? AND project_id = ? AND owner_id = ?",
+        (str(record["x_asset_id"]), str(project_id), int(user_id)),
+    ).fetchone()
+    if row is None:
+        return 0, 0
+    return int(row["width"] or 0), int(row["height"] or 0)
+
+
+def _stored_x_boxes(row: sqlite3.Row | None) -> list[dict]:
+    if row is None:
+        return []
+    value = _loads(dict(row).get("x_boxes"), [])
+    return value if isinstance(value, list) else []
+
+
+def _effective_x_boxes(
+    draft: sqlite3.Row | None, submitted: sqlite3.Row | None
+) -> list[dict]:
+    """旧客户端省略 x_boxes 时应沿用的已保存值。
+
+    **不能**用 ``a or b`` 判断：显式清空后的草稿存的是 ``[]``，是有效值，
+    不能被已提交版本里的旧框“复活”。只有列本身为 NULL（旧数据/未迁移）才回退：
+    - 草稿存在且 x_boxes 列非 NULL（含 []）→ 用它；
+    - 否则看最近提交；同样只有列非 NULL 才用；
+    - 都没有 → []。
+    """
+    for row in (draft, submitted):
+        if row is None:
+            continue
+        raw = dict(row).get("x_boxes")
+        if raw is None:
+            continue
+        value = _loads(raw, [])
+        return value if isinstance(value, list) else []
+    return []
+
+
+def _resolve_x_boxes(
+    data: dict,
+    draft: sqlite3.Row | None,
+    submitted: sqlite3.Row | None,
+    x_boxes: Any,
+) -> tuple[list[dict], bool]:
+    """决定这次写版本时辅模态框是什么。
+
+    - ``x_boxes is None``（旧客户端不带这个字段）：沿用已保存的辅模态框——
+      先看当前草稿，再看最近一次提交；**不能因为旧客户端不传就清空**。
+    - 显式 ``[]``：明确清空，按新值写入。
+    - 数组：按辅模态自己的宽高校验后写入。
+
+    返回 ``(clean_x_boxes, has_secondary)``。
+    """
+    image = data["image"]
+    secondary = image.get("x_modality")
+    x_width, x_height = int(image.get("x_width") or 0), int(image.get("x_height") or 0)
+    if x_boxes is None:
+        carried = _effective_x_boxes(draft, submitted)
+        if not carried:
+            return [], bool(secondary)
+        if not secondary or not x_width or not x_height:
+            raise ApiError(
+                409,
+                "SECONDARY_MODALITY_UNAVAILABLE",
+                "这条记录没有可用的辅模态原图或尺寸，无法保留已保存的辅模态标注；"
+                "请联系管理员核对记录资产后再编辑。",
+            )
+        return _validate_boxes(carried, data["class_options"], x_width, x_height), True
+    if not secondary:
+        if x_boxes:
+            raise ApiError(
+                400,
+                "NO_SECONDARY_MODALITY",
+                "这条记录只有一张原图，没有第二条模态；不能保存辅模态标注框。",
+            )
+        return [], False
+    if not x_width or not x_height:
+        raise ApiError(409, "IMAGE_SIZE_UNKNOWN", "辅模态原图没有登记尺寸，不能编辑辅模态标注")
+    clean = _validate_boxes(x_boxes, data["class_options"], x_width, x_height)
+    return clean, True
 
 
 def _queue_name(latest: sqlite3.Row | None) -> str:
@@ -304,6 +511,7 @@ def save_draft(
     record_id: str,
     *,
     boxes: Any,
+    x_boxes: Any = None,
     note: str = "",
     base_version: int = 0,
 ) -> dict:
@@ -312,6 +520,13 @@ def save_draft(
     if not width or not height:
         raise ApiError(409, "IMAGE_SIZE_UNKNOWN", "这张原图没有登记尺寸，不能编辑标注")
     clean = _validate_boxes(boxes, data["class_options"], width, height)
+    # 辅模态框单独存、按辅模态自己的尺寸校验；不传就沿用已保存的，显式 [] 才清空。
+    draft_existing = _draft(conn, record_id, user_id)
+    submitted_existing = _latest_submitted(conn, record_id, user_id)
+    clean_x, has_secondary = _resolve_x_boxes(data, draft_existing, submitted_existing, x_boxes)
+    x_width, x_height = int(data["image"].get("x_width") or 0), int(data["image"].get("x_height") or 0)
+    reference_modality = str(data["image"].get("primary_modality") or "rgb")
+    secondary_modality = data["image"].get("x_modality_token") if has_secondary else None
     # 草稿的并发基线是“最近一条版本”，**草稿本身也算**：每保存一次就前进一版，
     # 这样两个页面拿同一个旧基线保存时，后到的那个必须 409，不能最后写入者覆盖。
     # 已提交版本仍然只由 submit/reject 推进，编号不受草稿编辑影响太大（见下方 version 计算）。
@@ -334,8 +549,10 @@ def save_draft(
         if draft is None:
             conn.execute(
                 "INSERT INTO review_versions (id, project_id, owner_id, detection_id, version,"
-                " status, boxes, class_table, image_width, image_height, model_id, dataset_id,"
-                " note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " status, boxes, x_boxes, class_table, image_width, image_height, x_image_width,"
+                " x_image_height, reference_modality, secondary_modality, model_id, dataset_id,"
+                " note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?,"
+                " ?, ?, ?, ?, ?, ?, ?)",
                 (
                     security.new_id("rvw"),
                     str(project_id),
@@ -343,9 +560,14 @@ def save_draft(
                     str(record_id),
                     version,
                     json.dumps(clean, ensure_ascii=False),
+                    json.dumps(clean_x, ensure_ascii=False),
                     json.dumps(_frozen_class_table(data["class_options"]), ensure_ascii=False),
                     width,
                     height,
+                    x_width,
+                    x_height,
+                    reference_modality,
+                    secondary_modality,
                     str(data["record"]["model_id"]),
                     data["record"]["dataset_id"],
                     str(note or "")[:1000],
@@ -355,14 +577,20 @@ def save_draft(
             )
         else:
             changed = conn.execute(
-                "UPDATE review_versions SET boxes = ?, class_table = ?, image_width = ?,"
-                " image_height = ?, note = ?, version = ?, updated_at = ?"
+                "UPDATE review_versions SET boxes = ?, x_boxes = ?, class_table = ?,"
+                " image_width = ?, image_height = ?, x_image_width = ?, x_image_height = ?,"
+                " reference_modality = ?, secondary_modality = ?, note = ?, version = ?, updated_at = ?"
                 " WHERE id = ? AND status = 'draft' AND version = ?",
                 (
                     json.dumps(clean, ensure_ascii=False),
+                    json.dumps(clean_x, ensure_ascii=False),
                     json.dumps(_frozen_class_table(data["class_options"]), ensure_ascii=False),
                     width,
                     height,
+                    x_width,
+                    x_height,
+                    reference_modality,
+                    secondary_modality,
                     str(note or "")[:1000],
                     version,
                     now,
@@ -397,13 +625,18 @@ def submit(
     record_id: str,
     *,
     boxes: Any,
+    x_boxes: Any = None,
     outcome: str,
     note: str = "",
     base_version: int = 0,
     request_key: str = "",
     session_id: str | None = None,
 ) -> tuple[dict, bool]:
-    """提交人工结论。只有本人页面能调用；返回 ``(version, created)``。"""
+    """提交人工结论。只有本人页面能调用；返回 ``(version, created)``。
+
+    ``boxes`` 是参考模态（记录主图）的框，``x_boxes`` 是辅模态的框；两者各用各的
+    像素尺寸校验。旧客户端不传 ``x_boxes`` 时沿用已保存的辅模态框，不会静默清空。
+    """
     key = str(request_key or "").strip()
     existing = _request_replay(conn, project_id, user_id, record_id, key)
     if existing is not None:
@@ -415,10 +648,20 @@ def submit(
     data = state(conn, user_id, project_id, record_id)
     width, height = data["image"]["width"], data["image"]["height"]
     clean = _validate_boxes(boxes, data["class_options"], width, height)
-    if value == "no_defect" and clean:
+    draft = _draft(conn, record_id, user_id)
+    clean_x, has_secondary = _resolve_x_boxes(
+        data, draft, _latest_submitted(conn, record_id, user_id), x_boxes
+    )
+    x_width = int(data["image"].get("x_width") or 0)
+    x_height = int(data["image"].get("x_height") or 0)
+    reference_modality = str(data["image"].get("primary_modality") or "rgb")
+    secondary_modality = data["image"].get("x_modality_token") if has_secondary else None
+    # 有缺陷可以是任一真实模态可见：只要有一套框就可以确认 defect；
+    # 确认无缺陷则两套框都必须为空，不能留一套旧框假装“无缺陷”。
+    if value == "no_defect" and (clean or clean_x):
         raise ApiError(400, "BOXES_NOT_EMPTY", "确认无缺陷时不能保留标注框")
-    if value == "defect" and not clean:
-        raise ApiError(400, "BOXES_REQUIRED", "确认有缺陷时至少需要一个标注框")
+    if value == "defect" and not clean and not clean_x:
+        raise ApiError(400, "BOXES_REQUIRED", "确认有缺陷时至少需要一个标注框（任一模态）")
 
     latest = data["latest_submitted"]["version"] if data["latest_submitted"] else 0
     if int(base_version) != int(latest):
@@ -433,15 +676,15 @@ def submit(
     version = int(latest) + 1
     now = security.now_iso()
     review_id = security.new_id("rvw")
-    draft = _draft(conn, record_id, user_id)
     try:
         if draft is not None:
             conn.execute("DELETE FROM review_versions WHERE id = ? AND status = 'draft'", (str(draft["id"]),))
         conn.execute(
             "INSERT INTO review_versions (id, project_id, owner_id, detection_id, version, status,"
-            " outcome, boxes, class_table, image_width, image_height, model_id, dataset_id, note,"
+            " outcome, boxes, x_boxes, class_table, image_width, image_height, x_image_width,"
+            " x_image_height, reference_modality, secondary_modality, model_id, dataset_id, note,"
             " request_key, created_at, updated_at, submitted_at)"
-            " VALUES (?, ?, ?, ?, ?, 'confirmed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " VALUES (?, ?, ?, ?, ?, 'confirmed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 review_id,
                 str(project_id),
@@ -450,9 +693,14 @@ def submit(
                 version,
                 value,
                 json.dumps(clean, ensure_ascii=False),
+                json.dumps(clean_x, ensure_ascii=False),
                 json.dumps(_frozen_class_table(data["class_options"]), ensure_ascii=False),
                 width,
                 height,
+                x_width,
+                x_height,
+                reference_modality,
+                secondary_modality,
                 str(data["record"]["model_id"]),
                 data["record"]["dataset_id"],
                 str(note or "")[:1000],
@@ -482,7 +730,7 @@ def submit(
         version=version,
         action="confirmed",
         outcome=value,
-        boxes=len(clean),
+        boxes=len(clean) + len(clean_x),
     )
     return public_version(row), True
 
@@ -504,8 +752,13 @@ def reject(
         return public_version(existing), False
     data = state(conn, user_id, project_id, record_id)
     latest_row = data["latest_submitted"]
+    draft = _draft(conn, record_id, user_id)
     # 已经在驳回状态：重复点不涨版本，也不需要“无限驳回”。
-    if latest_row and latest_row["status"] == "rejected":
+    # 但如果显式重开后又生成了版本更大的草稿，这次驳回是**新的意图**，
+    # 必须落成新版本并清掉草稿；否则用户重开、改完再驳回会被静默吞掉。
+    if latest_row and latest_row["status"] == "rejected" and not _draft_supersedes(
+        latest_row, draft
+    ):
         return latest_row, False
     latest = latest_row["version"] if latest_row else 0
     if int(base_version) != int(latest):
@@ -520,15 +773,19 @@ def reject(
     version = int(latest) + 1
     now = security.now_iso()
     review_id = security.new_id("rvw")
-    draft = _draft(conn, record_id, user_id)
     try:
         if draft is not None:
             conn.execute("DELETE FROM review_versions WHERE id = ? AND status = 'draft'", (str(draft["id"]),))
+        # 驳回代表“这份结论不被接受”，两套标注都清空；但记录仍保留两套坐标的
+        # 模态归属，方便后续重开时知道原始主/辅模态是什么。
+        x_width = int(data["image"].get("x_width") or 0)
+        x_height = int(data["image"].get("x_height") or 0)
         conn.execute(
             "INSERT INTO review_versions (id, project_id, owner_id, detection_id, version, status,"
-            " boxes, class_table, image_width, image_height, model_id, dataset_id, note,"
+            " boxes, x_boxes, class_table, image_width, image_height, x_image_width, x_image_height,"
+            " reference_modality, secondary_modality, model_id, dataset_id, note,"
             " reject_reason, request_key, created_at, updated_at, submitted_at)"
-            " VALUES (?, ?, ?, ?, ?, 'rejected', '[]', '[]', ?, ?, ?, ?, '', ?, ?, ?, ?, ?)",
+            " VALUES (?, ?, ?, ?, ?, 'rejected', '[]', '[]', '[]', ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)",
             (
                 review_id,
                 str(project_id),
@@ -537,6 +794,10 @@ def reject(
                 version,
                 int(data["image"]["width"]),
                 int(data["image"]["height"]),
+                x_width,
+                x_height,
+                str(data["image"].get("primary_modality") or "rgb"),
+                data["image"].get("x_modality"),
                 str(data["record"]["model_id"]),
                 data["record"]["dataset_id"],
                 str(reason or "")[:500],
@@ -592,10 +853,12 @@ def reopen(
     version = int(latest_row["version"]) + 1
     source = data["latest_confirmed"]
     boxes = source["boxes"] if source else data["record"]["boxes"]
+    x_boxes = source.get("x_boxes", []) if source else []
     conn.execute(
         "INSERT INTO review_versions (id, project_id, owner_id, detection_id, version, status,"
-        " boxes, class_table, image_width, image_height, model_id, dataset_id, note, request_key,"
-        " created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, '', ?, ?, ?)",
+        " boxes, x_boxes, class_table, image_width, image_height, x_image_width, x_image_height,"
+        " reference_modality, secondary_modality, model_id, dataset_id, note, request_key,"
+        " created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)",
         (
             security.new_id("rvw"),
             str(project_id),
@@ -603,9 +866,14 @@ def reopen(
             str(record_id),
             version,
             json.dumps(boxes, ensure_ascii=False),
+            json.dumps(x_boxes, ensure_ascii=False),
             json.dumps(_frozen_class_table(data["class_options"]), ensure_ascii=False),
             int(data["image"]["width"]),
             int(data["image"]["height"]),
+            int(data["image"].get("x_width") or 0),
+            int(data["image"].get("x_height") or 0),
+            str(data["image"].get("primary_modality") or "rgb"),
+            data["image"].get("x_modality"),
             str(data["record"]["model_id"]),
             data["record"]["dataset_id"],
             key or None,
@@ -647,7 +915,8 @@ def queue(
     for row in rows:
         latest = _latest_submitted(conn, row["id"], user_id)
         draft = _draft(conn, row["id"], user_id)
-        bucket = _queue_name(latest) if latest is not None else ("draft" if draft else "pending")
+        # 显式重开后的新草稿回到草稿队列；生效结论仍是最新已提交的 rejected。
+        bucket = _bucket_for(latest, draft)
         item = detection_service.public_with_labels(conn, user_id, project_id, row)
         item["review"] = public_version(latest) if latest else None
         item["draft"] = public_version(draft) if draft else None

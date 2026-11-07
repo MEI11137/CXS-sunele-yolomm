@@ -49,6 +49,7 @@ def create_project():
         int(_user()["id"]),
         name=str(payload.get("name") or ""),
         description=str(payload.get("description") or ""),
+        requirements=payload.get("requirements"),
     )
     return ok({"project": projects.public(row)})
 
@@ -73,6 +74,7 @@ def update_project(project_id: str):
         row,
         name=payload.get("name") if "name" in payload else None,
         description=payload.get("description") if "description" in payload else None,
+        requirements=payload.get("requirements") if "requirements" in payload else None,
     )
     return ok({"project": projects.public(updated)})
 

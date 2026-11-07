@@ -42,6 +42,8 @@ export interface Project {
   id: string
   name: string
   description: string
+  /** 用户自己写的项目要求：注入助手提示词，但**不能**改变工具与权限。 */
+  requirements: string
   root_path: string | null
   root_bound_at: string | null
   status: 'active' | 'deleted'
@@ -303,10 +305,16 @@ export interface AssetSummary {
 }
 
 export interface DatasetSummary {
+  /** 导入时命中已有内容：返回的是既有数据集，不是新建。 */
+  reused?: boolean;
   id: string
   project_id: string
   name: string
   modalities: string[]
+  /** 主模态：原图本身是什么（rgb / ir）。单 IR 数据集这里是 ir。 */
+  primary_modality?: string
+  /** 参考模态：labels 坐标空间对应的模态；reflow 显式选择后可能不同于导入时。 */
+  reference_modality?: string | null
   secondary_modality: string | null
   classes: string[]
   root_rel: string
@@ -356,14 +364,97 @@ export interface ModelSummary {
   model_mode: 'single' | 'multimodal'
   secondary_modality: string | null
   dataset_id: string | null
+  /** 绑定数据集的主模态（rgb / ir）：单 IR 模型的输入原图就是红外图 */
+  dataset_primary_modality?: string | null
   weight_sha256: string
   weight_size: number
   classes: ModelClass[]
   class_map: Record<string, number>
-  status: 'imported' | 'published' | 'archived'
+  status: 'imported' | 'published' | 'superseded' | 'failed' | 'archived'
   published_at: string | null
   notes: string
   created_at: string
+  source?: 'imported' | 'trained'
+  parent_model_id?: string | null
+  training_run_id?: string | null
+  metrics?: ModelMetrics
+  deleted_at?: string | null
+  /** 发布接口额外返回：这次发布取代了本项目哪些旧模型。 */
+  replaced?: { id: string; name: string }[]
+}
+
+export interface ModelMetrics {
+  values?: Record<string, number | null>
+  conditions?: Record<string, string | number | null>
+  split?: string
+  source?: string
+  dataset_id?: string
+  run_id?: string
+  images?: number | null
+  epochs_run?: number | null
+}
+
+export interface TrainingRun {
+  id: string
+  project_id: string
+  dataset_id: string
+  parent_model_id: string | null
+  base_weight_rel: string
+  name: string
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
+  params: Record<string, number | string>
+  metrics: ModelMetrics
+  conditions: Record<string, string | number | null>
+  run_dir_rel: string
+  log_rel: string
+  pid: number | null
+  output_model_id: string | null
+  error: { code: string | null; message: string | null } | null
+  job_id: string | null
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+}
+
+export interface TrainingPlan {
+  dataset: { id: string; name: string; samples: number; classes: string[] }
+  parent: { id: string; name: string; dataset_id: string | null; metrics?: ModelMetrics } | null
+  base_weight_rel: string
+  params: Record<string, number | string | boolean>
+  conditions: Record<string, string | number | null>
+  name: string
+  warnings: string[]
+  ready: boolean
+  single_ir?: boolean
+  primary_modality?: string | null
+}
+
+/** 训练设备真实能力（部署机探测结果，不是写死的产品限制） */
+export interface TrainingDeviceCapabilities {
+  cpu: boolean
+  cuda_available: boolean
+  /** 可用 GPU 卡数（探测可用时 > 0，用于生成 cuda:N 选项） */
+  cuda_count: number
+  detail: string
+}
+
+export interface TrainingComparison {
+  run: TrainingRun
+  parent: {
+    model: { id: string; name: string } | null
+    values: Record<string, number | null>
+    conditions: Record<string, string | number | null>
+  }
+  child: {
+    values: Record<string, number | null>
+    conditions: Record<string, string | number | null>
+    split?: string
+    source?: string
+  }
+  delta: Record<string, number>
+  comparable: boolean
+  differences: { key: string; parent: unknown; child: unknown }[]
+  note: string
 }
 
 export interface ReviewSummary {
@@ -404,6 +495,10 @@ export interface DetectionRecord {
   class_summary: Record<string, number>
   hit_count: number
   rgb_asset_id: string
+  /** RGB 原图的真实文件名（列表展示用，身份仍以资产 ID 为准） */
+  rgb_filename?: string | null
+  /** 主模态（来自模型绑定的数据集）：ir 表示这张“原图”是红外图，不是可见光 */
+  primary_modality?: 'rgb' | 'ir'
   x_asset_id: string | null
   x_origin: string
   created_at: string
@@ -416,6 +511,10 @@ export interface DetectionRecord {
   request_key: string
   latest_review?: ReviewSummary | null
   human_status?: 'pending' | 'draft' | 'confirmed' | 'rejected'
+  /** 最近一次已提交人工结论的版本号（草稿不算；与 human_status 一起返回） */
+  review_version?: number | null
+  /** 当前人工确认版本的反馈状态：未入池 none / 已入反馈池 pending / 已回流 reflowed（服务端口径） */
+  feedback_status?: 'none' | 'pending' | 'reflowed'
   bucket?: string
   draft?: ReviewVersion | null
   review?: ReviewVersion | null
@@ -427,6 +526,8 @@ export interface RecordFiltersState {
   has_hits: boolean | null
   date_from: string
   date_to: string
+  /** 按原图文件名模糊搜索 */
+  q: string
 }
 
 export interface RecordPage {
@@ -484,9 +585,15 @@ export interface ReviewVersion {
   status: 'draft' | 'confirmed' | 'rejected'
   outcome: 'defect' | 'no_defect' | null
   boxes: DetectionBox[]
+  /** 辅模态（X）框：与 boxes 各用各的原图像素坐标，互不复制/换算。 */
+  x_boxes?: DetectionBox[]
   class_table: { index: number; name: string }[]
   image_width: number
   image_height: number
+  x_image_width?: number | null
+  x_image_height?: number | null
+  reference_modality?: string | null
+  secondary_modality?: string | null
   model_id: string | null
   dataset_id: string | null
   note: string
@@ -517,13 +624,22 @@ export interface ReviewState {
   latest_rejected: ReviewVersion | null
   pending: boolean
   queue: 'pending' | 'draft' | 'rejected' | 'confirmed'
+  /** 驳回后又显式重开（生成版本更大的草稿）：可编辑，但生效结论仍是驳回。 */
+  reopened?: boolean
   image: {
     width: number
     height: number
     rgb_url: string
     x_url: string | null
     x_modality: string | null
+    /** 辅模态原始 token（ir/rgb/...）；x_modality 仍是显示文案。 */
+    x_modality_token?: string | null
+    /** 辅模态原图的真实像素尺寸；单模态或旧记录为 0。 */
+    x_width?: number
+    x_height?: number
     result_url: string | null
+    /** 主图真实模态：单 IR 记录这里是 ir，原图本身就是红外图。 */
+    primary_modality?: 'rgb' | 'ir'
   }
 }
 
@@ -536,7 +652,19 @@ export interface FeedbackSummary {
   note: string
   created_at: string
   reflowed_at: string | null
-  review: { version: number; outcome: string | null; box_count: number; image: { width: number; height: number } } | null
+  review: {
+    version: number
+    outcome: string | null
+    // 参考模态的框数；旧字段保持原语义，不把辅模态（X）框合进来。
+    box_count: number
+    image: { width: number; height: number }
+    // 双模态：辅模态的框数与真实尺寸各自独立，缺失时按单模态显示。
+    x_box_count?: number
+    x_modality?: string | null
+    x_image?: { width: number; height: number } | null
+    reference_modality?: string | null
+    secondary_modality?: string | null
+  } | null
 }
 
 export interface DatasetReport {
@@ -584,6 +712,8 @@ export interface ReflowPlan {
   dataset_id: string | null
   parent_dataset_id: string | null
   counts: { replace: number; append: number; excluded: number; kept: number; conflicts: number }
+  reference_modality?: string | null
+  secondary_modality?: string | null
   items: {
     record_id: string
     action: string
@@ -591,6 +721,9 @@ export interface ReflowPlan {
     stem: string | null
     outcome: string | null
     boxes: number
+    x_boxes?: number
+    reference_modality?: string | null
+    secondary_modality?: string | null
     target_sample_id?: string | null
     matches: { sample_id: string; split: string; stem: string }[]
   }[]
@@ -599,4 +732,149 @@ export interface ReflowPlan {
   splits?: Record<string, number>
   note?: string
   signature?: string
+}
+
+// --------------------------------------------------------------- 资料与手册（WB17-05）
+
+export interface ProjectDocument {
+  id: string
+  project_id: string
+  name: string
+  filename: string
+  kind: 'pdf' | 'docx' | 'txt' | 'md'
+  kind_label: string
+  size: number
+  page_count: number
+  char_count: number
+  status: 'ready' | 'failed'
+  created_at: string
+  deleted_at: string | null
+  error: { code: string; message: string } | null
+  /** page = PDF 真实页；logical = Word/txt/md 按段落聚合的逻辑页 */
+  paging: 'page' | 'logical'
+}
+
+export interface DocumentPage {
+  page: number
+  text: string
+}
+
+export interface DocumentWindow {
+  document: ProjectDocument
+  page: number
+  span: number
+  total_pages: number
+  pages: DocumentPage[]
+  note: string
+}
+
+export interface DocumentStats {
+  documents: number
+  pages: number
+  chars: number
+}
+
+export interface DocumentHit {
+  document_id: string
+  name: string
+  kind: string
+  page: number
+  count: number
+  snippet: string
+}
+
+export interface DocumentSearchResult {
+  query: string
+  hits: DocumentHit[]
+  total: number
+  note: string
+}
+
+export interface ManualSummary {
+  id: string
+  name: string
+  description: string
+  builtin: boolean
+  project_id: string | null
+  active_version_id: string | null
+  active_version: number | null
+  created_at: string
+  editable: boolean
+  note: string
+}
+
+export interface ManualVersion {
+  id: string
+  version: number
+  note: string
+  created_at: string
+}
+
+export interface ManualDetail {
+  manual: ManualSummary
+  active_version: number | null
+  content: string
+  versions: ManualVersion[]
+  note: string
+}
+
+// --------------------------------------------------------------- 外部 MCP（WB17-05）
+
+export interface McpTool {
+  name: string
+  title: string
+  description: string
+  schema: Record<string, unknown>
+  read_only: boolean
+  authorization: 'pending' | 'allowed' | 'denied'
+  discovered_at: string
+  callable: boolean
+}
+
+export interface McpServer {
+  id: string
+  name: string
+  transport: 'stdio' | 'http'
+  command: string
+  args: string[]
+  cwd_rel: string
+  url: string
+  enabled: boolean
+  admin_only: boolean
+  status: 'unknown' | 'connected' | 'error' | 'disabled'
+  last_error: string | null
+  last_seen_at: string | null
+  created_at: string
+  secret_keys: string[]
+  secret_hints: Record<string, string>
+  note: string
+  tools: McpTool[]
+}
+
+export interface McpDiscoverResult {
+  ok: boolean
+  server: McpServer
+  new_tools?: string[]
+  dropped_tools?: string[]
+  error?: { code: string; message: string }
+  note: string
+}
+
+export interface McpCallResult {
+  ok: boolean
+  tool: string
+  text: string
+  duration_ms: number
+  error?: { code: string; message: string } | null
+  replayed?: boolean
+  note?: string
+}
+
+export interface McpCallAudit {
+  id: string
+  tool: string
+  ok: boolean
+  error: string | null
+  duration_ms: number
+  created_at: string
 }

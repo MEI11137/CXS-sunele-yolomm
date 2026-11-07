@@ -177,6 +177,20 @@ export function toolStateLabel(state: string): string {
   return TOOL_STATE_LABELS[state] ?? state
 }
 
+/**
+ * 折叠起来的工具过程标题：默认不铺开，但状态要一眼能看到。
+ *
+ * 只放"几次调用 + 最近一次的状态和标题"，不放工具的返回摘要——
+ * 摘要是给排查用的，展开才看，不能当成回答上屏。
+ */
+export function toolFoldSummary(cards: { title: string; state: string }[]): string {
+  if (!cards.length) return '本轮工具调用'
+  const last = cards[cards.length - 1]
+  const head = cards.length === 1 ? '1 次工具调用' : `${cards.length} 次工具调用`
+  const tail = [toolStateLabel(last.state), last.title].filter(Boolean).join(' · ')
+  return tail ? `${head} · 最近：${tail}` : head
+}
+
 const TURN_STATUS_LABELS: Record<string, string> = {
   queued: '排队中',
   running: '正在处理',

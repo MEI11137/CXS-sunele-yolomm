@@ -449,7 +449,8 @@ class EngineManager:
         if not exe.is_file():
             raise EngineUnavailable(
                 "ENGINE_MISSING",
-                "找不到本机 OpenCode 可执行文件，请设置 HX17_ENGINE_EXE 指向 opencode.exe",
+                "找不到本机 OpenCode 可执行文件。请把 opencode.exe 放进 PATH，"
+                "或设置 HX17_ENGINE_EXE 指向它的绝对路径（需 1.19.4 版本）。",
             )
         for name in ("home", "config", "cache", "data", "state", "tmp", "logs"):
             (work_dir / name).mkdir(parents=True, exist_ok=True)
@@ -681,6 +682,63 @@ class EngineManager:
             instance, "GET", f"/session/{session_id}/message?limit={int(limit)}"
         )
         return data if isinstance(data, list) else []
+
+    # ------------------------------------------------------------------ 事件流
+
+    def open_events(self, instance: EngineInstance, *, timeout: tuple[float, float] = (5.0, 600.0)):
+        """订阅本实例的 ``GET /event``（SSE）。
+
+        只用于**实时性**：``/session/{id}/message`` 是权威事实来源，事件流读到的
+        内容永远不当成“这一轮已完成”的依据。调用方负责 ``close()``。
+        """
+        try:
+            response = requests.get(
+                instance.base_url + "/event",
+                auth=(self._auth_user, instance.handle.password),
+                stream=True,
+                timeout=timeout,
+                headers={"Accept": "text/event-stream", "Cache-Control": "no-cache"},
+                allow_redirects=False,
+            )
+        except requests.Timeout:
+            raise EngineUnavailable("ENGINE_TIMEOUT", "订阅引擎事件流超时") from None
+        except requests.RequestException:
+            raise EngineUnavailable("ENGINE_UNREACHABLE", "无法订阅引擎事件流") from None
+        if response.status_code >= 400:
+            response.close()
+            raise EngineUnavailable(
+                "ENGINE_HTTP_ERROR",
+                f"引擎事件流返回 HTTP {response.status_code}",
+                status=response.status_code,
+            )
+        return response
+
+    @staticmethod
+    def iter_events(response):
+        """逐条解析 SSE：只认 ``data:`` 行，注释（keep-alive）与空行跳过。"""
+        try:
+            lines = response.iter_lines(decode_unicode=False)
+            for raw in lines:
+                if raw is None:
+                    continue
+                line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+                if not line or line.startswith(":"):
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload or payload == "[DONE]":
+                    continue
+                try:
+                    data = json.loads(payload)
+                except ValueError:
+                    continue
+                if isinstance(data, dict):
+                    yield data
+        except (requests.RequestException, OSError, ValueError):
+            # 连接被关闭（正常停止）或引擎重启：都按“事件流结束”处理，
+            # 由轮询继续提供事实，不在这里制造第二轮失败。
+            return
 
     def status(self, instance: EngineInstance) -> dict:
         data = self._request(instance, "GET", "/session/status")

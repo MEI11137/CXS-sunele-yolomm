@@ -1,4 +1,6 @@
-# 运行数据：数据库、上传文件、日志、临时产物
+# 运行数据：数据库、上传文件、日志、临时产物、部署自测输出
+# var/ 里同时有 haixun.db、secrets/、engines/、训练产物、部署 venv 与冒烟证据，
+# 全部是本机运行态，不属于源代码包。
 var/
 *.sqlite3
 *.db
@@ -7,11 +9,25 @@ var/
 # 前端
 frontend/node_modules/
 frontend/dist/
+*.tsbuildinfo
 
 # Python
 __pycache__/
 *.py[cod]
 .venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# vendor 运行期生成的错误报告（*.txt，不是源码；不删报告、不改 vendor 源码）
+backend/vendor/logs/
+
+# 训练数据与权重：不进代码仓库（体积大、含业务数据，且可能与部署机 CUDA 不匹配）
+*.pt
+*.pth
+*.onnx
+*.engine
+*.zip
 
 # 本机私有配置与凭据：任何情况下都不入库
 *.local.json

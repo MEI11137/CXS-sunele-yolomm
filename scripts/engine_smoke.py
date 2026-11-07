@@ -44,8 +44,11 @@ def main() -> int:
     workspace.mkdir(parents=True)
 
     settings = config.load_settings(data_dir=data_dir, serve_dist=False, port=0)
-    exe = Path(str(settings.engine_exe))
-    check(exe.is_file(), f"引擎可执行文件存在：{exe.name}")
+    exe = Path(str(settings.engine_exe)) if settings.engine_exe else None
+    check(
+        exe is not None and exe.is_file(),
+        f"引擎可执行文件存在：{exe.name if exe else '未配置（设 HX17_ENGINE_EXE 或把 opencode 放进 PATH）'}",
+    )
 
     manager = engine_module.EngineManager(settings)
     spec = engine_module.EngineSpec(

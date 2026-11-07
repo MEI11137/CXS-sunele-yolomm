@@ -81,28 +81,34 @@ watch([view, projectId, flowId, requestedIds], load)
 
     <p v-if="error" class="banner banner-error" role="alert">{{ error }}</p>
 
-    <div class="inline-form queue-tabs">
-      <button
-        v-for="bucket in (['pending', 'draft', 'rejected', 'confirmed'] as const)"
-        :key="bucket"
-        :class="view === bucket ? 'primary small' : 'ghost small'"
-        type="button"
-        @click="view = bucket"
-      >
-        {{ label(bucket) }}（{{ counts[bucket] ?? 0 }}）
-      </button>
-      <span class="hint">已选 {{ selected.length }} 条</span>
+    <div class="queue-bar">
+      <div class="segmented" role="group" aria-label="复核视图">
+        <button
+          v-for="bucket in (['pending', 'draft', 'rejected', 'confirmed'] as const)"
+          :key="bucket"
+          type="button"
+          :aria-pressed="view === bucket"
+          @click="view = bucket"
+        >
+          {{ label(bucket) }} {{ counts[bucket] ?? 0 }}
+        </button>
+      </div>
+      <span class="hint">
+        {{ selected.length ? `已选 ${selected.length} 条` : `${visible.length} 条记录` }}
+      </span>
     </div>
 
     <div v-if="flowIds.length" class="card">
       <p class="card-head">本项目的巡检批次</p>
-      <button
-        v-for="id in flowIds"
-        :key="id"
-        class="link small"
-        type="button"
-        @click="withFlow(id)"
-      >{{ id }}</button>
+      <div class="flow-list">
+        <button
+          v-for="id in flowIds"
+          :key="id"
+          class="link small"
+          type="button"
+          @click="withFlow(id)"
+        >{{ id }}</button>
+      </div>
     </div>
 
     <table v-if="visible.length" class="table">
@@ -129,5 +135,17 @@ watch([view, projectId, flowId, requestedIds], load)
 </template>
 
 <style scoped>
-.queue-tabs { flex-wrap: wrap; margin-bottom: 12px; }
+.queue-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.flow-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+}
 </style>
