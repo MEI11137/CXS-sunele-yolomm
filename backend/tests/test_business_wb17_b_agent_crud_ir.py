@@ -459,6 +459,62 @@ class SingleIrTest(AgentCallBase):
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
         return body(response)["data"]["dataset"]
 
+    def import_ir_rgb(self) -> dict:
+        """IR 参考 + RGB 辅助布局：两套图尺寸不同、两套标注都在，模拟 reflow 导出。"""
+        base = self.ir_source_dir("ir-rgb-ds")
+        for split in ("train", "val"):
+            (base / "images_ir" / split).mkdir(parents=True, exist_ok=True)
+            (base / "labels_ir" / split).mkdir(parents=True, exist_ok=True)
+            for image in (base / "images" / split).glob("*.png"):
+                (base / "images_ir" / split / image.name).write_bytes(
+                    png_bytes(width=64, height=48, color=(200, 40, 40))
+                )
+                (base / "labels_ir" / split / f"{image.stem}.txt").write_text(
+                    "0 0.25 0.25 0.2 0.2\n", encoding="utf-8"
+                )
+        config = yaml.safe_load((base / "data.yaml").read_text(encoding="utf-8"))
+        config["modalities"] = {"ir": "images", "rgb": "images_ir"}
+        (base / "data.yaml").write_text(
+            yaml.safe_dump(config, allow_unicode=True), encoding="utf-8"
+        )
+        response = self.client.post(
+            f"/api/projects/{self.project['id']}/datasets",
+            json={
+                "name": "红外参考配 RGB",
+                "rel_path": "ir-rgb-ds",
+                "modalities": ["ir", "rgb"],
+                "secondary_modality": "rgb",
+                "reference_modality": "ir",
+            },
+            headers=csrf_headers(self.client),
+        )
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        return body(response)["data"]["dataset"]
+
+    def test_agent_training_plan_keeps_ir_reference_with_rgb_auxiliary(self):
+        """普通账号 Agent 工具与训练服务同判定：显式 single_ir 才放行，否则明确拒绝。"""
+        dataset = self.import_ir_rgb()
+        self.assertEqual(dataset["reference_modality"], "ir")
+        self.assertEqual(dataset["secondary_modality"], "rgb")
+        self.assertEqual(dataset["primary_modality"], "ir")
+
+        token = self.open_turn(mode="full")
+        planned = self.ok_call(
+            token,
+            "hx_training_plan",
+            {"dataset_id": dataset["id"], "params": {"epochs": 1, "single_ir": True}},
+        )
+        self.assertEqual(planned["family"], "yolo")
+        self.assertTrue(planned["single_ir"])
+        self.assertEqual(planned["primary_modality"], "ir")
+        self.assertIsNone(planned["secondary_modality"])
+
+        refused = self.call(token, "hx_training_plan", {"dataset_id": dataset["id"]})
+        self.assertEqual(refused.status_code, 200, refused.text)
+        payload = refused.json()["data"]
+        self.assertEqual(payload["status"], "error", payload)
+        self.assertEqual(payload["error"]["code"], "DATASET_REFERENCE_IR_UNSUPPORTED")
+
     def test_single_ir_import_export_and_training_dispatch(self):
         self._ir_dataset_and_record()
 
@@ -577,7 +633,7 @@ class SingleIrTest(AgentCallBase):
         self.assertEqual(config["modality_used"], ["ir"])
         self.assertTrue((root / "images" / "train").is_dir())
 
-    def test_single_ir_cannot_declare_a_second_modality(self):
+    def test_single_ir_cannot_declare_non_rgb_second_modality(self):
         self.ir_source_dir()
         response = self.client.post(
             f"/api/projects/{self.project['id']}/datasets",
@@ -585,7 +641,7 @@ class SingleIrTest(AgentCallBase):
                 "name": "假双模态",
                 "rel_path": "ir-ds",
                 "modalities": ["ir"],
-                "secondary_modality": "rgb",
+                "secondary_modality": "edge",
             },
             headers=csrf_headers(self.client),
         )

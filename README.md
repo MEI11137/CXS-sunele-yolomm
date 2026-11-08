@@ -48,7 +48,12 @@ backend/
   tests/            540+ 项 unittest 用例（机器上有 pytest 也能跑；真实网关/文件/轮次/训练编排/权重校验/部署接口…）
 frontend/           Vue 3 + TypeScript + Pinia + Vite（npm run build 后由后端同源托管）
 deploy/serve.py     单端口启动器：Waitress WSGI + frontend/dist + 运行记录/停止核验
+deploy/workbuddy/   WorkBuddy 云端入口：server.js（网关）+ connector.js（本机连接器）
+                    + prepare.mjs（从 frontend/dist 生成 web/）+ preflight.mjs（启动前自检）
+deploy/cloudflare/  自有域名 Tunnel 配置模板（真实域名、占位 UUID，不代表已上线）
+测试工作区/          数据集/权重/输出骨架：给评委账号授权的业务目录（真实内容不入库）
 启动海巡智检.cmd / 停止海巡智检.cmd / 准备运行环境.cmd    Windows 双击入口
+启动WorkBuddy云端连接.cmd                              云端入口的本机连接器（先跑 preflight 再连）
 docs/               开发日志与验收记录
 scripts/            smoke/contract/engine 协议检查、deploy_smoke.py（部署启停冒烟）
 ```
@@ -60,7 +65,8 @@ scripts/            smoke/contract/engine 协议检查、deploy_smoke.py（部�
   不要用“提高版本”掩盖兼容问题，也不要升级用户原有 YOLO 环境——用项目独立 venv。
 - **Node 22.6+**（本机验证 22.22.2）：`npm run test:logic` 依赖
   `--experimental-strip-types`；构建本身 18+ 也能跑，但部署建议直接用 22.6+。
-  运行服务**不需要** Node。
+  **后端服务本身不需要 Node**；需要 Node 的是两件事：构建前端，以及运行 WorkBuddy
+  云端连接器 `deploy/workbuddy/connector.js`（它只读 Node 标准库，不用 `npm install`）。
 - 视觉推理（可选）：`backend/requirements-vision.txt`，**torch>=2.6**
   （`safe_weight.py` 用的 `torch.serialization.get_unsafe_globals_in_checkpoint`
   在 2.6.0 才进入 `__all__`；低于它服务端显式报 `TORCH_TOO_OLD`，不会误报权重损坏，
@@ -78,7 +84,33 @@ scripts/            smoke/contract/engine 协议检查、deploy_smoke.py（部�
    有进行中的对话/业务/训练时会明确拒绝，确认加 `--force` 才停。
    端口被陌生程序占用时只报错退出，**不杀任何进程**。
 
-换机部署（GitHub 拉取、目录授权、Cloudflare 入口等）见 `docs/WB17-06-换机部署.md`。
+换机部署（GitHub 拉取、目录授权、Cloudflare 入口等）见 `docs/WB17-06-换机部署.md`
+与 `docs/WorkBuddy固定网址与自有域名_另一台Windows部署指南.md`。
+
+### WorkBuddy 云端入口（可选）
+
+固定分享链接在浏览器里看到的是「云端网关 + 本机后端」，本机只需要跑连接器：
+
+```powershell
+# 1) 生成发布用的 web/（首次或前端改动后；只跑后端+连接器时不需要）
+node deploy\workbuddy\prepare.mjs
+
+# 2) 先起后端（上一步的 启动海巡智检.cmd），再双击根目录的
+#    启动WorkBuddy云端连接.cmd
+#    等价命令（--public 不能省，否则连接器会以退出码 2 直接退出）：
+node deploy\workbuddy\connector.js --public "https://haixun-inspection.app.workbuddy.host/?sharecode=YHJNHOFRKT" --upstream http://127.0.0.1:8080 --lanes 4
+```
+
+- `deploy/workbuddy/.tunnel-token` 是**私有凭据**，不入库、不打印、不重生成；换机时单独私密传输。
+- 双击启动器会先跑 `preflight.mjs` 检查 Node / 令牌 / 本机后端（并核对健康响应确实是本产品），
+  缺哪样报哪样、失败时退出码非 0；`HX17_DRY_RUN=1` 只自检不连云端。
+- 换机场景：**Git 里的源码足够完整运行**（网关与连接器都在 `deploy/workbuddy/`，`web/` 用 prepare 生成），
+  但**网站账号、模型 API Key 每台机器各自配置**，`.tunnel-token` 单独私密带过去。
+- 同一个云入口**不能同时接两台不同数据库的机器**：切换时先停旧机连接器，再启新机连接器。
+  现在这台正在被用户使用，**不要重启或替换它在跑的连接器**。
+- 发布更新要在 WorkBuddy 里打开**原来那个应用**并核对应用 ID / 名称 / 归属账号；目录相同不代表平台自动
+  认成同一个应用，管理发布仍需原账号（服务器跑连接器不需要登录）。
+- 详情（发布材料、限制、安全边界）见 `deploy/workbuddy/README.md`。
 
 ## 首次初始化（没有默认账号）
 
@@ -91,6 +123,8 @@ scripts/            smoke/contract/engine 协议检查、deploy_smoke.py（部�
 # 密码在交互提示中输入，不要写进命令或脚本；另一个示例：judge_local --role member
 
 # 授权普通用户可以绑定的服务器目录（只能是具体目录，不能是磁盘根）
+# 仓库里的 测试工作区\ 就是给评委准备的现成骨架（数据集/权重/输出），
+# 授权这个具体目录即可；不要授权源码根目录或磁盘根。
 .venv\Scripts\python -m backend.cli add-root "D:\巡检数据" --label 训练与巡检数据 --grant-to 你的用户名
 .venv\Scripts\python -m backend.cli grant-root "D:\巡检数据" --username 另一个账号
 ```

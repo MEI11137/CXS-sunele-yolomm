@@ -34,6 +34,25 @@ backend/vendor/logs/
 *.key
 .env
 .env.*
+# 按文件名忽略：导出包/新目录里换了层级也不会把隧道凭据带进 Git
+.tunnel-token
+
+# WorkBuddy 云端入口：web/ 由 prepare.mjs 从 frontend/dist 生成；
+# 它旁边的 .web-prepare-*/ 与 .web-old-*/ 是 prepare 的临时目录（正常情况下会自行清理）
+deploy/workbuddy/web/
+deploy/workbuddy/.web-prepare-*/
+deploy/workbuddy/.web-old-*/
+
+# 测试工作区：只跟踪目录结构与说明，真实数据/权重/产物按目录忽略
+测试工作区/数据集/*
+!测试工作区/数据集/.gitkeep
+!测试工作区/数据集/README.md
+测试工作区/权重/*
+!测试工作区/权重/.gitkeep
+!测试工作区/权重/README.md
+测试工作区/输出/*
+!测试工作区/输出/.gitkeep
+!测试工作区/输出/README.md
 
 # 编辑器与系统
 .vscode/

@@ -132,6 +132,7 @@ export async function importDataset(
     asset_id?: string
     modalities?: string[]
     secondary_modality?: string | null
+    reference_modality?: 'rgb' | 'ir' | null
     classes?: string[] | null
   },
 ): Promise<{ dataset: DatasetSummary }> {

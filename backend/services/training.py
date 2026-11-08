@@ -408,17 +408,10 @@ FAMILIES = ("yolo", "yolomm")
 
 
 def _dataset_reference(dataset) -> str:
-    """数据集的标注参考模态：reference_modality 优先，其次 modalities[0]。"""
-    data = dict(dataset)
-    declared = str(data.get("reference_modality") or "").strip().lower()
-    if declared in {"rgb", "ir", "edge", "depth"}:
-        return declared
-    try:
-        loaded = json.loads(data.get("modalities") or "[]")
-    except (ValueError, TypeError):
-        loaded = []
-    modes = [str(item).lower() for item in loaded] if isinstance(loaded, list) else []
-    return modes[0] if modes else "rgb"
+    """数据集的标注参考模态：统一委托 datasets.reference_modality（显式列优先）。"""
+    from backend.services import datasets as dataset_service
+
+    return dataset_service.reference_modality(dataset)
 
 
 def _dataset_secondary(dataset) -> str | None:

@@ -1,16 +1,25 @@
 """数据集导入：目录 / ZIP，RGB 或 RGB+X，严格校验后登记样本清单。
 
+支持的合法布局（都是平台自己会导出的）：
+
+* RGB 主图 ``images/`` + 第二模态 ``images_<modality>/``（ir / edge / depth / x）；
+* IR 参考主图 ``images/`` + RGB 辅助图 ``images_ir/``（reflow 导出布局；此时
+  参考标注在 ``labels/``、辅助标注在 ``labels_ir/``，两套各自对应自己的图片坐标）。
+
 校验清单（每一项都真的读过内容，不是看文件名）：
 
 * data.yaml 的类别表（``names`` / ``nc``）；
 * train/val/test 划分目录必须真实存在且非空；
 * 每张图都要能被 PIL 真实解码（顺带拿到真实宽高）；
 * 标注逐行校验：5 列、class 索引在 ``[0, nc)``、bbox 归一化到 [0,1] 且宽高为正；
-* RGB 与 X 按**同名 stem** 配对，缺 X 时：``edge`` 允许派生并记录来源，
+* 辅图按**同名 stem** 配对，缺辅图时：``edge`` 允许派生并记录来源，
   其它模态一律拒绝（绝不用 RGB 冒充红外，也不补零图）；
+* 辅助标注 ``labels_ir/`` 存在时同样逐行校验，并登记到 samples，参与内容指纹；
 * ZIP 解压防路径穿越、防符号链接逃逸、防解压炸弹（条目数与总字节上限）。
 
-类别名不猜：yaml 里没有、调用方也没给，就直接报 ``NEED_CLASSES``。
+外来 ``manifest.json`` 只是数据不是权威：owner / record ID / 跨项目路径一律不信，
+只按真实文件与 data.yaml 扫描；类别名不猜，yaml 里没有、调用方也没给就报
+``NEED_CLASSES``。
 """
 
 from __future__ import annotations
@@ -35,7 +44,9 @@ SPLITS = ("train", "val", "test")
 MAX_ZIP_ENTRIES = 20000
 MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
 MAX_SAMPLES = 20000
-SUPPORTED_SECONDARY = {"ir", "edge", "depth", "x"}
+SUPPORTED_SECONDARY = {"ir", "edge", "depth", "x", "rgb"}
+# IR 参考数据集只允许 RGB 作为辅助模态：这是 reflow 导出/再导入的既有合法布局。
+IR_REFERENCE_AUXILIARIES = {"rgb"}
 # 主模态：原图就是它。ir 单模态是真实数据集（热红外），不是“缺了 RGB 的错误数据”。
 PRIMARY_MODALITIES = {"rgb", "ir"}
 
@@ -47,7 +58,11 @@ class DatasetError(ApiError):
 def public(row: sqlite3.Row | dict) -> dict:
     data = dict(row)
     modes = _loads(data["modalities"], [])
-    primary = str(modes[0]).lower() if modes else "rgb"
+    reference = reference_modality(data)
+    # 主模态/参考模态以显式 reference_modality 为准：legacy 行 modalities 顺序可能
+    # 是 [rgb, ir] 但 reference_modality 已明确为 ir，不能按 0 号位误判成 RGB。
+    mode = str(modes[0]).lower() if modes else "rgb"
+    primary = reference if reference in PRIMARY_MODALITIES else mode
     return {
         "id": data["id"],
         "project_id": data["project_id"],
@@ -57,7 +72,7 @@ def public(row: sqlite3.Row | dict) -> dict:
         # 不再把红外图叫成 RGB，也没有第二张凑数的配图。
         "primary_modality": primary,
         # 参考模态：导出/训练真正当作“主模态像素坐标”的那一侧（reflow 显式选择）。
-        "reference_modality": data.get("reference_modality") or primary,
+        "reference_modality": reference,
         "secondary_modality": data["secondary_modality"],
         "classes": _loads(data["classes"], []),
         "root_rel": data["root_rel"],
@@ -88,6 +103,21 @@ def _loads(raw: Any, fallback: Any) -> Any:
     except (ValueError, TypeError):
         return fallback
     return value if isinstance(value, type(fallback)) else fallback
+
+
+def reference_modality(row: sqlite3.Row | dict) -> str:
+    """数据集的参考模态：显式 ``reference_modality`` 优先，其次 ``modalities[0]``。
+
+    导出/训练/发布/复核都以参考模态像素为准；legacy 行的 modalities 顺序可能与
+    显式参考列不一致（例如 reference=ir 但 modalities=[rgb,ir]），此时一律信列。
+    """
+    data = dict(row)
+    declared = str(data.get("reference_modality") or "").strip().lower()
+    if declared in {"rgb", "ir", "edge", "depth"}:
+        return declared
+    modes = _loads(data.get("modalities"), [])
+    first = str(modes[0]).lower() if modes else "rgb"
+    return first if first in {"rgb", "ir", "edge", "depth"} else "rgb"
 
 
 def get_owned(conn, user_id: int, project_id: str, dataset_id: str) -> sqlite3.Row:
@@ -201,6 +231,7 @@ def samples(conn, user_id: int, project_id: str, dataset_id: str, *, split: str 
                 "rgb_rel": row["rgb_rel"],
                 "x_rel": row["x_rel"],
                 "label_rel": row["label_rel"],
+                "labels_ir_rel": row["labels_ir_rel"] if "labels_ir_rel" in row.keys() else None,
                 "width": row["width"],
                 "height": row["height"],
                 "boxes": _loads(row["boxes"], []),
@@ -224,6 +255,16 @@ def samples(conn, user_id: int, project_id: str, dataset_id: str, *, split: str 
 
 def _x_digest(root: Path, rel: str | None) -> str:
     """X 模态图片按**字节**取摘要；读不到就明确记 missing，不当作相同。"""
+    if not rel:
+        return ""
+    try:
+        return hashlib.sha256(storage.resolve_rel(root, rel).read_bytes()).hexdigest()
+    except (ApiError, OSError):
+        return "missing"
+
+
+def _label_digest(root: Path, rel: str | None) -> str:
+    """辅助标注按**字节**取摘要；读不到同样记 missing，不当作相同。"""
     if not rel:
         return ""
     try:
@@ -266,21 +307,25 @@ def _v1_fingerprint_lines(modes: list[str], secondary: str | None, classes: list
 
 
 def _scan_rows(scanned: dict, root: Path) -> list[str]:
-    """样本行（不含类别/模态头部）：划分 + 内容哈希 + X 字节摘要 + 标注。"""
+    """样本行（不含类别/模态头部）：划分 + 内容哈希 + X 字节摘要 + 标注。
+
+    存在辅助标注时，每行再追加 ``labels_ir`` 的字节摘要：只改了辅助标签的
+    数据集不能被去重复用（旧数据集没有该列，行格式保持不变，指纹继续兼容）。
+    """
     rows: list[str] = []
+    with_aux_labels = any(item.get("labels_ir_rel") for item in scanned["samples"])
     for item in scanned["samples"]:
-        rows.append(
-            "\t".join(
-                [
-                    str(item["split"]),
-                    str(item.get("sha256") or ""),
-                    str(item.get("pixel_sha256") or ""),
-                    _x_digest(root, item.get("x_rel")),
-                    json.dumps(item.get("boxes") or [], ensure_ascii=False),
-                    json.dumps(item.get("class_ids") or [], ensure_ascii=False),
-                ]
-            )
-        )
+        fields = [
+            str(item["split"]),
+            str(item.get("sha256") or ""),
+            str(item.get("pixel_sha256") or ""),
+            _x_digest(root, item.get("x_rel")),
+            json.dumps(item.get("boxes") or [], ensure_ascii=False),
+            json.dumps(item.get("class_ids") or [], ensure_ascii=False),
+        ]
+        if with_aux_labels:
+            fields.append(_label_digest(root, item.get("labels_ir_rel")))
+        rows.append("\t".join(fields))
     return rows
 
 
@@ -300,29 +345,33 @@ def _content_fingerprint_pair(
 
 
 def _stored_fingerprint_pair(conn, row, root: Path) -> tuple[str | None, str | None]:
-    """按已落库样本现场重算 (v2, v1)；X 图读不到就放弃比较，不猜。"""
+    """按已落库样本现场重算 (v2, v1)；X 图或辅助标注读不到就放弃比较，不猜。"""
     samples = conn.execute(
         "SELECT * FROM dataset_samples WHERE dataset_id = ?", (str(row["id"]),)
     ).fetchall()
     if not samples:
         return None, None
+    has_aux_column = "labels_ir_rel" in samples[0].keys()
+    with_aux_labels = has_aux_column and any(sample["labels_ir_rel"] for sample in samples)
     rows: list[str] = []
     for sample in samples:
         x_sha = _x_digest(root, sample["x_rel"])
         if x_sha == "missing":
             return None, None
-        rows.append(
-            "\t".join(
-                [
-                    str(sample["split"]),
-                    str(sample["sha256"] or ""),
-                    str(sample["pixel_sha256"] or ""),
-                    x_sha,
-                    json.dumps(json.loads(sample["boxes"] or "[]"), ensure_ascii=False),
-                    json.dumps(json.loads(sample["class_ids"] or "[]"), ensure_ascii=False),
-                ]
-            )
-        )
+        fields = [
+            str(sample["split"]),
+            str(sample["sha256"] or ""),
+            str(sample["pixel_sha256"] or ""),
+            x_sha,
+            json.dumps(json.loads(sample["boxes"] or "[]"), ensure_ascii=False),
+            json.dumps(json.loads(sample["class_ids"] or "[]"), ensure_ascii=False),
+        ]
+        if with_aux_labels:
+            label_sha = _label_digest(root, sample["labels_ir_rel"])
+            if label_sha == "missing":
+                return None, None
+            fields.append(label_sha)
+        rows.append("\t".join(fields))
     modes = json.loads(row["modalities"] or "[]")
     secondary = row["secondary_modality"]
     classes = json.loads(row["classes"] or "[]")
@@ -444,6 +493,7 @@ def import_dataset(
     name: str,
     modalities: list[str],
     secondary_modality: str | None = None,
+    reference_modality: str | None = None,
     classes: list[str] | None = None,
     asset_id: str | None = None,
     rel_path: str | None = None,
@@ -451,6 +501,13 @@ def import_dataset(
     label = str(name or "").strip()
     if not label:
         raise ApiError(400, "VALIDATION", "数据集名称不能为空")
+    declared_reference = str(reference_modality or "").strip().lower() or None
+    if declared_reference is not None and declared_reference not in PRIMARY_MODALITIES:
+        raise ApiError(
+            400,
+            "VALIDATION",
+            f"参考模态只能是 {'/'.join(sorted(PRIMARY_MODALITIES))}；当前是 {declared_reference}",
+        )
     modes = [str(item).strip().lower() for item in (modalities or ["rgb"]) if str(item).strip()]
     # 去重但保留顺序：第一个元素就是**主模态**（原图放在 images/）。
     deduped: list[str] = []
@@ -458,7 +515,12 @@ def import_dataset(
         if item not in deduped:
             deduped.append(item)
     modes = deduped
-    primary = modes[0] if modes else "rgb"
+    if declared_reference is not None:
+        if declared_reference not in modes:
+            raise ApiError(400, "VALIDATION", "参考模态必须在 modalities 中声明")
+        # 显式参考模态就是主模态：legacy modalities 顺序（如 [rgb, ir]）不改变像素口径。
+        modes = [declared_reference] + [item for item in modes if item != declared_reference]
+    primary = declared_reference or (modes[0] if modes else "rgb")
     if primary not in PRIMARY_MODALITIES:
         raise ApiError(
             400,
@@ -468,19 +530,22 @@ def import_dataset(
     secondary = str(secondary_modality or "").strip().lower() or None
     if secondary is not None and secondary not in SUPPORTED_SECONDARY:
         raise ApiError(400, "VALIDATION", f"第二模态只支持 {'/'.join(sorted(SUPPORTED_SECONDARY))}")
-    if secondary and secondary not in modes:
-        modes.append(secondary)
     if secondary is None and len(modes) > 1:
         secondary = modes[1]
     if secondary == primary:
         raise ApiError(400, "VALIDATION", "第二模态不能和主模态相同")
-    if primary != "rgb" and secondary:
-        # 单 IR 的意思就是“原图本身是 IR”，不另配第二张图；需要 RGB+IR 时把 rgb 放第一位。
-        raise ApiError(
-            400,
-            "VALIDATION",
-            "主模态为 ir 时只记录 IR 原图，不再配对第二模态；RGB+IR 请把 rgb 放在 modalities 第一位",
-        )
+    if primary == "ir":
+        # IR 参考 + RGB 辅助是 reflow 导出的既有合法布局；其它组合仍只走 RGB 主模态。
+        if secondary is not None and secondary not in IR_REFERENCE_AUXILIARIES:
+            raise ApiError(
+                400,
+                "VALIDATION",
+                "IR 参考数据集只支持 RGB 作为辅助模态；其它模态请把 RGB 放在 modalities 第一位",
+            )
+    if secondary is not None and secondary not in modes:
+        modes.append(secondary)
+    # 落库的 modalities 只保留“主模态 + 辅助模态”两项，不额外扩未知多模态。
+    modes = [primary] + ([secondary] if secondary else [])
 
     root = storage.project_root(conn, user_id, project_id)
     dataset_id = security.new_id("dst")
@@ -508,6 +573,7 @@ def import_dataset(
             raise ApiError(400, "SOURCE_REQUIRED", "需要提供 ZIP 资产或项目内目录")
 
         scanned = _scan(raw, primary=primary, secondary=secondary, classes=classes, project_root=root)
+        scanned["reference"] = primary
         fingerprint, v1_fingerprint = _content_fingerprint_pair(scanned, modes, secondary, root)
         duplicate = _find_duplicate(
             conn, user_id, project_id, fingerprint, scanned, v1_fingerprint=v1_fingerprint
@@ -525,6 +591,7 @@ def import_dataset(
             name=label,
             modalities=modes,
             secondary=secondary,
+            reference=primary,
             scanned=scanned,
             root_rel=storage.relative(root, base),
             source=source,
@@ -564,6 +631,7 @@ def _insert_dataset(
     name: str,
     modalities: list[str],
     secondary: str | None,
+    reference: str | None = None,
     scanned: dict,
     root_rel: str,
     source: str,
@@ -571,13 +639,16 @@ def _insert_dataset(
     content_fingerprint: str | None = None,
 ) -> None:
     now = security.now_iso()
+    # reference_modality 是“像素坐标以哪一侧为准”，与 modalities 顺序解耦；
+    # 训练/导出/复核都读这一列，不能只依赖 modalities[0]。
+    inferred_reference = reference or (modalities[0] if modalities else "rgb")
     conn.execute(
         """
         INSERT INTO datasets
-            (id, project_id, owner_id, name, modalities, secondary_modality, classes,
-             root_rel, source, source_asset_id, sample_count, split_counts, status, notes, created_at,
-             content_fingerprint)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?)
+            (id, project_id, owner_id, name, modalities, secondary_modality, reference_modality,
+             classes, root_rel, source, source_asset_id, sample_count, split_counts, status, notes,
+             created_at, content_fingerprint)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?)
         """,
         (
             dataset_id,
@@ -586,6 +657,7 @@ def _insert_dataset(
             name,
             json.dumps(modalities, ensure_ascii=False),
             secondary,
+            inferred_reference,
             json.dumps(scanned["classes"], ensure_ascii=False),
             root_rel,
             source,
@@ -600,9 +672,9 @@ def _insert_dataset(
     conn.executemany(
         """
         INSERT INTO dataset_samples
-            (id, dataset_id, split, stem, rgb_rel, x_rel, label_rel, width, height, boxes,
-             class_ids, created_at, sha256, pixel_sha256, origin_sample_key)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, dataset_id, split, stem, rgb_rel, x_rel, label_rel, labels_ir_rel,
+             width, height, boxes, class_ids, created_at, sha256, pixel_sha256, origin_sample_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -613,6 +685,7 @@ def _insert_dataset(
                 item["rgb_rel"],
                 item["x_rel"],
                 item["label_rel"],
+                item.get("labels_ir_rel"),
                 item["width"],
                 item["height"],
                 json.dumps(item["boxes"], ensure_ascii=False),
@@ -709,8 +782,19 @@ def _scan(
 
     names = _class_names(config, classes)
     modalities = config.get("modalities") if isinstance(config.get("modalities"), dict) else {}
-    rgb_rel = str(modalities.get("rgb") or "images")
-    x_rel = str(modalities.get(secondary) or f"images_{secondary}") if secondary else None
+    # 辅图目录：以 data.yaml 的 modalities 声明为准；reflow 导出 IR 参考时写
+    # {"ir": "images", "rgb": "images_ir"}，所以 RGB 辅助图在 images_ir/。
+    if secondary:
+        if modalities.get(secondary):
+            x_rel = str(modalities[secondary])
+        elif secondary == "edge":
+            x_rel = "images_edge"
+        elif secondary == "rgb":
+            x_rel = "images_ir" if primary != "rgb" else "images_rgb"
+        else:
+            x_rel = f"images_{secondary}"
+    else:
+        x_rel = None
 
     split_dirs = _split_dirs(base, config)
     if not split_dirs:
@@ -731,6 +815,13 @@ def _scan(
             width, height = _image_size(image_path)
             label_path = base / "labels" / split / f"{stem}.txt"
             boxes, class_ids = _read_label(label_path, len(names))
+            labels_ir_rel: str | None = None
+            if secondary:
+                aux_label = base / "labels_ir" / split / f"{stem}.txt"
+                if aux_label.is_file():
+                    # 辅助标注对应辅图自己的像素坐标，逐行同样校验；它不参与主标注框。
+                    _read_label(aux_label, len(names))
+                    labels_ir_rel = storage.relative(project_root, aux_label)
             # 身份按真实字节 + 解码像素登记；同名/大小/时间都不参与判定。
             from backend.services import identity as identity_service
 
@@ -753,7 +844,11 @@ def _scan(
                         409,
                         "MISSING_MODALITY",
                         f"{split}/{image_path.name} 缺少 {secondary} 配图；"
-                        "非 edge 模态不允许用 RGB 或零图顶替",
+                        + (
+                            "IR 参考数据集必须成对提供 RGB 辅助图"
+                            if secondary == "rgb"
+                            else "非 edge 模态不允许用 RGB 或零图顶替"
+                        ),
                     )
             samples.append(
                 {
@@ -762,6 +857,7 @@ def _scan(
                     "rgb_rel": storage.relative(project_root, image_path),
                     "x_rel": storage.relative(project_root, x_path) if x_path else None,
                     "label_rel": storage.relative(project_root, label_path) if label_path.is_file() else None,
+                    "labels_ir_rel": labels_ir_rel,
                     "width": width,
                     "height": height,
                     "boxes": boxes,
@@ -780,6 +876,9 @@ def _scan(
         notes.append("所有图片都没有标注框（按背景图处理），请确认是否导错目录")
     if derived_edge:
         notes.append(f"{derived_edge} 张 X 图为 edge 派生（来源已记录，不是真实传感器数据）")
+    auxiliary_labels = sum(1 for item in samples if item.get("labels_ir_rel"))
+    if auxiliary_labels:
+        notes.append(f"{auxiliary_labels} 张辅助标注已登记（labels_ir/，对应辅图坐标）")
     notes.append(f"配对: {primary}={len(samples)}" + (f", x={sum(1 for s in samples if s['x_rel'])}" if secondary else ""))
     return {
         "classes": names,
@@ -885,23 +984,56 @@ def _derive_edge(image_path: Path, root: Path, base: Path, split: str, stem: str
     return storage.write_bytes(root, base / "images_edge" / split / f"{stem}.png", encoded.tobytes())
 
 
+def _raw_relative(raw_rel: Path, sample_rel: str | None) -> PurePosixPath:
+    """把样本的“项目内相对路径”换算成“raw/ 内相对路径”，并确认它真的在 raw/ 下。"""
+    text = str(sample_rel or "").replace("\\", "/")
+    parts = PurePosixPath(text).parts
+    if not text or parts[: len(raw_rel.parts)] != raw_rel.parts:
+        raise DatasetError(500, "SCAN_PATH", f"样本路径不在导入目录内：{sample_rel}")
+    relative = parts[len(raw_rel.parts) :]
+    if not relative:
+        raise DatasetError(500, "SCAN_PATH", f"样本路径缺少相对目录：{sample_rel}")
+    return PurePosixPath(*relative)
+
+
 def _write_yaml(root: Path, base: Path, scanned: dict) -> None:
+    """写导入后的 data.yaml：目录一律从**真实样本路径**反推，不猜固定目录名。
+
+    reflow 导出的“IR 参考 + RGB 辅助”布局是 images/ 与 images_ir/；按样本实际
+    所在目录写，才能原样再导入（辅助目录不会被误写成 images_rgb）。
+    """
     payload: dict[str, Any] = {
         "path": "raw",
         "nc": len(scanned["classes"]),
         "names": list(scanned["classes"]),
     }
+    raw_rel = Path(storage.relative(root, base / "raw"))
+    primary = scanned.get("reference") or scanned.get("primary") or "rgb"
+    secondary = scanned["secondary"]
+    split_dirs: dict[str, str] = {}
+    primary_root: str | None = None
+    secondary_root: str | None = None
+    for item in scanned["samples"]:
+        split = str(item["split"])
+        primary_rel = _raw_relative(raw_rel, item["rgb_rel"])
+        directory = primary_rel.parent.as_posix()
+        known = split_dirs.get(split)
+        if known is not None and known != directory:
+            raise DatasetError(500, "SPLIT_LAYOUT", f"{split} 划分内的样本目录不一致")
+        split_dirs[split] = directory
+        primary_root = primary_root or primary_rel.parts[0]
+        if secondary:
+            if not item.get("x_rel"):
+                raise DatasetError(500, "SPLIT_LAYOUT", f"{split}/{item['stem']} 缺少辅助图路径")
+            secondary_rel = _raw_relative(raw_rel, item["x_rel"])
+            secondary_root = secondary_root or secondary_rel.parts[0]
     for split in SPLITS:
-        if split in scanned["split_counts"]:
-            payload[split] = f"images/{split}"
-    payload["modalities"] = {scanned.get("primary") or "rgb": "images"}
-    if scanned["secondary"]:
-        payload["modalities"][scanned["secondary"]] = (
-            "images_edge" if scanned["secondary"] == "edge" else f"images_{scanned['secondary']}"
-        )
-    payload["modality_used"] = [scanned.get("primary") or "rgb"] + (
-        [scanned["secondary"]] if scanned["secondary"] else []
-    )
+        if split in split_dirs:
+            payload[split] = split_dirs[split]
+    payload["modalities"] = {primary: primary_root or "images"}
+    if secondary:
+        payload["modalities"][secondary] = secondary_root or f"images_{secondary}"
+    payload["modality_used"] = [primary] + ([secondary] if secondary else [])
     storage.write_bytes(
         root,
         base / "data.yaml",

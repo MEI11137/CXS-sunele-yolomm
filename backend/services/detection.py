@@ -140,12 +140,15 @@ def attach_primary_modality(conn, user_id: int, project_id: str, records: list[d
         dataset_ids = sorted({str(row["dataset_id"] or "") for row in rows} - {""})
         primaries: dict[str, str] = {}
         if dataset_ids:
+            from backend.services import datasets as dataset_service
+
             marks = ", ".join("?" for _ in dataset_ids)
             for dataset in conn.execute(
-                f"SELECT id, modalities FROM datasets WHERE id IN ({marks})", tuple(dataset_ids)
+                f"SELECT id, modalities, reference_modality FROM datasets WHERE id IN ({marks})",
+                tuple(dataset_ids),
             ).fetchall():
-                modes = _loads(dataset["modalities"], [])
-                primaries[str(dataset["id"])] = str(modes[0]).lower() if modes else "rgb"
+                # 与 models/datasets 使用同一判定：显式参考模态优先，不看 modalities 顺序。
+                primaries[str(dataset["id"])] = dataset_service.reference_modality(dataset)
         mapping = {
             str(row["id"]): primaries.get(str(row["dataset_id"] or ""), "rgb") for row in rows
         }

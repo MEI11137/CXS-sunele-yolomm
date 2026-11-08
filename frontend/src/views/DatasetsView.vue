@@ -285,11 +285,22 @@ const form = ref({
   source: 'dir' as Source,
   relPath: '',
   assetId: '',
-  // 主模态：原图本身是 RGB 还是 IR。单 IR 数据集不需要也不接受第二张配图。
+  // 主模态：原图本身是 RGB 还是 IR。单 IR 数据集不需要第二张配图；
+// reflow 导出的“IR 参考 + RGB 辅助”布局则把 RGB 作为辅助图（images_ir/）。
   primary: 'rgb' as 'rgb' | 'ir',
-  secondary: '' as '' | 'ir' | 'edge' | 'depth',
+  secondary: '' as '' | 'ir' | 'edge' | 'depth' | 'rgb',
   classes: '',
 })
+
+// 切换主模态时清掉当前布局不支持的辅助模态，避免把 rgb/ir 配图角色带错。
+watch(
+  () => form.value.primary,
+  (primary) => {
+    const secondary = form.value.secondary
+    if (primary === 'ir' && secondary !== '' && secondary !== 'rgb') form.value.secondary = ''
+    if (primary === 'rgb' && secondary === 'rgb') form.value.secondary = ''
+  },
+)
 
 const archives = ref<{ id: string; filename: string; size: number }[]>([])
 const uploading = ref(false)
@@ -403,12 +414,25 @@ async function submitImport(): Promise<void> {
     return
   }
 
-  // 单 IR：原图就是红外图，只声明 ir，不造第二张图；RGB+配图保持原来的两模态语义。
+  // 参考模态=主模态；IR 参考可带 RGB 辅助（reflow 导出的既有布局），
+  // RGB 主模态仍只接受 ir/edge/depth 配图。切换模态残留的无效值在这里归一化。
+  const primary = form.value.primary
+  const secondary = form.value.secondary
+  const validSecondary =
+    primary === 'ir'
+      ? secondary === 'rgb'
+        ? 'rgb'
+        : ''
+      : secondary && secondary !== 'rgb'
+        ? secondary
+        : ''
   const modalities =
-    form.value.primary === 'ir'
-      ? ['ir']
-      : form.value.secondary
-        ? ['rgb', form.value.secondary]
+    primary === 'ir'
+      ? validSecondary
+        ? ['ir', 'rgb']
+        : ['ir']
+      : validSecondary
+        ? ['rgb', validSecondary]
         : ['rgb']
   const classes = form.value.classes
     .split(/[,，\s]+/)
@@ -420,7 +444,8 @@ async function submitImport(): Promise<void> {
     rel_path: form.value.source === 'dir' ? form.value.relPath.trim() : undefined,
     asset_id: form.value.source === 'zip' ? form.value.assetId : undefined,
     modalities,
-    secondary_modality: form.value.primary === 'ir' ? null : form.value.secondary || null,
+    secondary_modality: validSecondary || null,
+    reference_modality: primary,
     classes: classes.length ? classes : null,
   })
   importing.value = false
@@ -604,7 +629,17 @@ watch(sampleSplit, () => void loadSamples())
             <option value="depth">RGB + 深度（需要配图）</option>
           </select>
         </label>
-        <p v-else class="hint">单 IR 数据集只记录红外原图，不需要第二张配图；若要做 RGB+IR 双模态，请把主模态设为 RGB 并选择配图。</p>
+        <label v-else class="field">
+          <span>辅助图（可选）</span>
+          <select v-model="form.secondary" aria-label="辅助图">
+            <option value="">不配图（仅 IR 原图）</option>
+            <option value="rgb">IR 参考 + RGB 辅助（平台导出/再导入布局）</option>
+          </select>
+        </label>
+        <p v-if="form.primary === 'ir'" class="hint">
+          单 IR 只记录红外原图；若导入平台导出的“IR 参考 + RGB 辅助”数据集，主图在
+          images/、辅助图在 images_ir/，labels/ 与 labels_ir/ 各自对应本图坐标，两套都会被校验并登记。
+        </p>
       </div>
 
       <DirectoryBrowser

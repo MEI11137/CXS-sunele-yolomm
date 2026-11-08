@@ -81,12 +81,15 @@ def list_for_project(conn, user_id: int, project_id: str, *, include_deleted: bo
     dataset_ids = sorted({str(item.get("dataset_id") or "") for item in items} - {""})
     primaries: dict[str, str] = {}
     if dataset_ids:
+        from backend.services import datasets as dataset_service
+
         marks = ", ".join("?" for _ in dataset_ids)
         for row in conn.execute(
-            f"SELECT id, modalities FROM datasets WHERE id IN ({marks})", tuple(dataset_ids)
+            f"SELECT id, modalities, reference_modality FROM datasets WHERE id IN ({marks})",
+            tuple(dataset_ids),
         ).fetchall():
-            modes = _loads(row["modalities"], [])
-            primaries[str(row["id"])] = str(modes[0]).lower() if modes else "rgb"
+            # 参考模态以显式列为准：legacy 行 modalities=[rgb,ir] 也可能是 IR 参考。
+            primaries[str(row["id"])] = dataset_service.reference_modality(row)
     for item in items:
         item["dataset_primary_modality"] = primaries.get(str(item.get("dataset_id") or ""))
     return {"models": items}

@@ -17,6 +17,25 @@
 说明：前端 `package-lock.json` 复用自本机已验证的 v1.6 前端构建基础（同一套锁定版本），
 仅用于锁定依赖版本，没有复制 v1.6 的业务源码。
 
+## WorkBuddy 云端入口（本工程自写，不引入第三方 npm 依赖）
+
+| 文件 | 作用 | 依赖 |
+| --- | --- | --- |
+| `deploy/workbuddy/server.js` | 云端单端口网关：静态托管 + `/api` 反向隧道 + `/api/service` 403 | 仅 Node 标准库（`http`/`https`/`fs`/`path`/`crypto`/`zlib`/`os`） |
+| `deploy/workbuddy/connector.js` | 本机连接器：主动外连云端、转发到 `127.0.0.1:8080` | 仅 Node 标准库 |
+| `deploy/workbuddy/prepare.mjs`、`preflight.mjs` | 生成 `web/`、启动前自检 | 仅 Node 标准库 |
+
+- `package.json` 里没有 `dependencies`/`devDependencies`，部署机不需要 `npm install`；
+  本文件因此不为它新增许可条目。
+- 来源：`server.js`、`connector.js` 是本工程在 WorkBuddy 发布阶段自行编写的同源网关与本机连接器，
+  2026-11-07 的公网浏览器验收使用的就是同一份实现；整合进本仓库时按字节复制
+  （`server.js` sha256 `065a06ccda7a…`），这一轮没有改动它们的逻辑，也没有引入第三方反向代理项目或第二套实现。
+  `prepare.mjs`、`preflight.mjs` 与 `scripts/workbuddy_gateway_check.mjs` 是这次整合新写的脚本。
+- 隧道协议（NDJSON 帧、`queued`/`inflight` 状态机、`Origin` 精确白名单）是本工程自定义的，
+  只在这两个文件之间使用。
+- WorkBuddy 平台（`*.app.workbuddy.host` 的托管与边缘）是**腾讯提供的服务**，
+  不随本仓库分发；发布材料只运行在用户自己账号下的站点里。
+
 ## 运行时依赖（Python 基础，见 backend/requirements.txt）
 
 | 组件 | 用途 | 许可（本机安装包元数据原文） |

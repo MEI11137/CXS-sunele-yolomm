@@ -1190,6 +1190,7 @@ def _import_dataset(ctx: ToolContext) -> dict:
             name=str(ctx.args.get("name") or ""),
             modalities=[str(item) for item in (ctx.args.get("modalities") or ["rgb"])],
             secondary_modality=ctx.args.get("secondary_modality"),
+            reference_modality=ctx.args.get("reference_modality"),
             classes=ctx.args.get("classes"),
             asset_id=ctx.args.get("asset_id"),
             rel_path=ctx.args.get("rel_path"),
@@ -1504,9 +1505,12 @@ register(
         description=(
             "从项目目录或已上传的 ZIP 导入 YOLO 数据集。modalities 的第一个值是**主模态**："
             "rgb（可见光）或 ir（原图本身就是热红外，单 IR 数据集不要求再配 RGB）。"
-            "需要第二张配图时把 rgb 放第一位并给 secondary_modality。会逐样本校验图片可解码、"
-            "标签为 5 列且类别索引与归一化框都在范围内；缺 data.yaml 时可以给 classes 生成，"
-            "但不会猜真实类别名。同一服务网页导入也在用。"
+            "需要第二张配图时把 rgb 放第一位并给 secondary_modality。"
+            "平台的 reflow 导出可能把 IR 当参考（主图在 images/、辅助图在 images_ir/），"
+            "这种布局用 modalities=[\"ir\",\"rgb\"] + secondary_modality=\"rgb\" + "
+            "reference_modality=\"ir\" 导入，辅助标注 labels_ir/ 会一起登记。"
+            "会逐样本校验图片可解码、标签为 5 列且类别索引与归一化框都在范围内；"
+            "缺 data.yaml 时可以给 classes 生成，但不会猜真实类别名。同一服务网页导入也在用。"
         ),
         risk=policy.RISK_WRITE,
         requires_root=True,
@@ -1517,7 +1521,8 @@ register(
                 "rel_path": _REL,
                 "asset_id": _ID,
                 "modalities": {"type": "array", "maxItems": 2},
-                "secondary_modality": {"type": "string", "pattern": "^(ir|edge|depth)$"},
+                "secondary_modality": {"type": "string", "pattern": "^(ir|edge|depth|rgb)$"},
+                "reference_modality": {"type": "string", "pattern": "^(rgb|ir)$"},
                 "classes": {"type": "array", "maxItems": 200},
             },
             "required": ["name"],

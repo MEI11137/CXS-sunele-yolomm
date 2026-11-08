@@ -59,6 +59,7 @@ def import_dataset(project_id: str):
         name=str(payload.get("name") or ""),
         modalities=[str(item) for item in modalities],
         secondary_modality=payload.get("secondary_modality"),
+        reference_modality=payload.get("reference_modality"),
         classes=[str(item) for item in classes] if classes else None,
         asset_id=payload.get("asset_id"),
         rel_path=payload.get("rel_path"),

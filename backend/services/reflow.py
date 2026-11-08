@@ -33,6 +33,7 @@ import yaml
 from backend import security
 from backend.errors import ApiError
 from backend.services import assets as asset_service
+from backend.services import datasets as dataset_service
 from backend.services import detection as detection_service
 from backend.services import identity as identity_service
 from backend.services import labels as label_service
@@ -798,13 +799,12 @@ def _resolve_reference(conn, user_id: int, project_id: str, parent, items: list[
         elif refs:
             chosen = refs[0]
         elif parent is not None:
-            modes = _loads(parent["modalities"], [])
-            chosen = str(modes[0]).lower() if modes else "rgb"
+            chosen = dataset_service.reference_modality(parent)
         else:
             chosen = "rgb"
     if parent is not None:
-        modes = _loads(parent["modalities"], [])
-        parent_primary = str(modes[0]).lower() if modes else "rgb"
+        # 父数据集的主模态/参考模态以显式列优先，不能按 modalities 顺序猜。
+        parent_primary = dataset_service.reference_modality(parent)
         if parent_primary != chosen:
             conflicts.append({
                 "record_id": "",
@@ -936,8 +936,7 @@ def _primary_for(conn, user_id: int, project_id: str, parent, items: list[dict])
     单 IR 数据集必须继续保持 ir，不能因为内部列名还叫 rgb_rel 就写成 rgb。
     """
     if parent is not None:
-        modes = _loads(parent["modalities"], [])
-        return str(modes[0]).lower() if modes else "rgb"
+        return dataset_service.reference_modality(parent)
     for item in items:
         model_id = str(item.get("model_id") or "")
         if not model_id:
@@ -948,12 +947,11 @@ def _primary_for(conn, user_id: int, project_id: str, parent, items: list[dict])
         ).fetchone()
         if row is not None and row["dataset_id"]:
             dataset = conn.execute(
-                "SELECT modalities FROM datasets WHERE id = ?", (str(row["dataset_id"]),)
+                "SELECT modalities, reference_modality FROM datasets WHERE id = ?",
+                (str(row["dataset_id"]),),
             ).fetchone()
             if dataset is not None:
-                modes = _loads(dataset["modalities"], [])
-                if modes:
-                    return str(modes[0]).lower()
+                return dataset_service.reference_modality(dataset)
     return "rgb"
 
 

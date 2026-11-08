@@ -1,0 +1,42 @@
+# 海巡智检 v1.7 · 自有域名（Cloudflare Tunnel）入口模板
+#
+# 这不是已经生效的配置，也不是“已上线”的证明：
+# * 域名 haixunzhijian.top 的 NS 已在阿里云改成 aaron.ns.cloudflare.com / kia.ns.cloudflare.com，
+#   但尚未核实 Zone 是否 Active；
+# * Tunnel UUID、凭据 JSON、cert.pem 都还没有创建，下面保留占位符；
+# * 本文件不包含、也不需要任何 exe / 证书 / token。
+#
+# 使用方法：复制为 config.yml，替换两处 REPLACE_，先 `cloudflared tunnel ingress validate`
+# 再启动；不要把它和 WorkBuddy 的 .tunnel-token 混为一谈（两者互不相关）。
+#
+# 路径写法：Windows 下用正斜杠或双反斜杠，不要用单反斜杠。
+# 服务目标固定为本机后端；端口与 deploy/serve.py 实际监听端口一致（默认 8080）。
+
+tunnel: REPLACE_WITH_TUNNEL_UUID
+credentials-file: REPLACE_WITH_ABSOLUTE_PATH_TO_TUNNEL_CREDENTIALS_JSON
+
+ingress:
+  # 管理接口（启动器状态/停止、服务令牌）不要经公网入口。
+  # 注意：这条正则只匹配**规范路径** /api/service/...；像 //api/service、%2Fservice
+  # 这类变形请求能不能被挡住，取决于后端管理路由自己的校验，本仓库**没有在 Cloudflare
+  # 边缘实测过**这些变形，因此不能声称“边缘已全拦截”。真正的边界仍然是后端的管理接口鉴权。
+  - hostname: demo.haixunzhijian.top
+    path: '^/api/service(/.*)?$'
+    service: http_status:403
+  - hostname: haixunzhijian.top
+    path: '^/api/service(/.*)?$'
+    service: http_status:403
+
+  # 主站与演示子域都直连同一个本机后端，Host 必须与浏览器地址一致，
+  # 否则后端 _same_origin 会把合法的写请求判成跨站（CSRF_ORIGIN）。
+  - hostname: demo.haixunzhijian.top
+    service: http://127.0.0.1:8080
+    originRequest:
+      httpHostHeader: demo.haixunzhijian.top
+  - hostname: haixunzhijian.top
+    service: http://127.0.0.1:8080
+    originRequest:
+      httpHostHeader: haixunzhijian.top
+
+  # 未列出的 Host 一律 404，不做兜底转发。
+  - service: http_status:404

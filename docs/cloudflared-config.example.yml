@@ -1,0 +1,8 @@
+# 已迁移：自有域名模板统一维护在 deploy/cloudflare/config.example.yml
+#
+# 那里是唯一一份带真实域名的模板（haixunzhijian.top / demo.haixunzhijian.top、
+# 本机 8080、Host 与浏览器地址一致、/api/service 403）。本文件保留只为避免旧链接失效，
+# 不再放具体配置，避免两份模板各自漂移。
+#
+# 注意：NS 已在阿里云改为 aaron.ns.cloudflare.com / kia.ns.cloudflare.com，
+# 但尚未核实 Zone 是否 Active；这也不代表公网入口已经上线。

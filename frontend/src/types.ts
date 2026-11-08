@@ -341,6 +341,7 @@ export interface DatasetSample {
   rgb_rel: string
   x_rel: string | null
   label_rel: string | null
+  labels_ir_rel?: string | null
   width: number
   height: number
   boxes: Record<string, unknown>[]
