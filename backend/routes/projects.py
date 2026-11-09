@@ -5,6 +5,7 @@ from __future__ import annotations
 from flask import Blueprint, current_app, request
 
 from backend import auth, db, paths
+from backend.agent.lifecycle import invalidate_project_turns
 from backend.errors import ok
 from backend.services import projects
 
@@ -18,12 +19,12 @@ def _user() -> dict:
 
 
 def _stop_project_turns(project_id: str, user_id: int, reason: str) -> None:
+    """绑定/解绑后终止旧轮次；与 Agent 工具共用 lifecycle helper。"""
     runtime = current_app.config.get("HX17_AGENT")
-    if runtime is None:
-        return
     try:
-        runtime.invalidate_project(user_id, project_id, reason=reason)
+        invalidate_project_turns(runtime, user_id, project_id, reason=reason)
     except Exception:
+        # 页面写操作已完成；运行时内部异常不能回滚绑定，保持原有尽力语义。
         pass
 
 

@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter, onBeforeRouteLeave, onBeforeRouteUpdate } from 'vue-router'
+import DialogShell from '@/components/DialogShell.vue'
 import * as api from '@/api/business'
 import { errorCode, errorMessage } from '@/api/http'
 import { toPayloadBox } from '@/lib/geometry'
@@ -14,6 +15,7 @@ import {
 import { clampPoint, fitView, panBy, toImage, zoomAt } from '@/lib/geometry'
 import { beginDrag, dragBoxes, endDrag, toolHint } from '@/lib/interaction'
 import type { Tool } from '@/lib/interaction'
+import { useAuthStore } from '@/stores/auth'
 import { useWorkspaceStore } from '@/stores/workspace'
 import type { ReviewClassOption, ReviewState } from '@/types'
 
@@ -28,10 +30,104 @@ import type { ReviewClassOption, ReviewState } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
+const auth = useAuthStore()
 const workspace = useWorkspaceStore()
 
 const projectId = computed(() => String(route.params.projectId ?? ''))
 const recordId = computed(() => String(route.params.recordId ?? ''))
+
+// 从复核队列进入时带 view/flow：提交后自动进入同队列下一项，不要求返回列表再点。
+const queueView = computed(() => String(route.query.view ?? '').trim())
+// 批次 flow 仍是前端可见范围：列表接口没有 flow 参数，先取够数据再按 flow_id 过滤。
+const queueFlow = computed(() => String(route.query.flow ?? '').trim())
+// 从复核队列“开始复核所选”进入时，队列被限定为这些 record_ids；
+// 刷新/上一项/下一项都保留同一限定，不能退回整个项目队列。
+const queueRecordIds = computed(() =>
+  String(route.query.record_ids ?? '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean),
+)
+const queueIds = ref<string[]>([])
+/**
+ * 复核详情加载代次：load() 返回时若代次已变、或路由 record/project 已切换，
+ * 就丢弃这次响应。否则慢返回的 A 记录会把 boxes/note 灌进 B 的画布，
+ * 下一次保存就会把 A 的数据写进 B。
+ */
+let loadEpoch = 0
+const queueIndex = computed(() => queueIds.value.indexOf(recordId.value))
+const prevRecordId = computed(() => (queueIndex.value > 0 ? queueIds.value[queueIndex.value - 1] : ''))
+const nextRecordId = computed(() => {
+  const index = queueIndex.value
+  return index >= 0 && index < queueIds.value.length - 1 ? queueIds.value[index + 1] : ''
+})
+
+let queueEpoch = 0
+
+async function loadQueue(): Promise<void> {
+  if (!queueView.value || !projectId.value) return
+  const epoch = ++queueEpoch
+  const project = projectId.value
+  const view = queueView.value
+  const flow = queueFlow.value
+  const fixedIds = [...queueRecordIds.value]
+  const stillCurrent = () =>
+    epoch === queueEpoch &&
+    project === projectId.value &&
+    view === queueView.value &&
+    flow === queueFlow.value
+  // 带明确 record_ids 时，这就是本轮人工队列的稳定范围：保存草稿(pending→draft)、
+  // 提交(→confirmed)只改变记录状态，不能因此按旧 view 过滤把已看项挤出去，
+  // 否则“上一项/下一项”会在中途失效。顺序沿用进入队列时的可见顺序。
+  // 记录本身是否仍存在/仍属于本账号，仍由每次 load() 的详情接口校验。
+  if (fixedIds.length) {
+    queueIds.value = fixedIds
+    return
+  }
+  try {
+    // 先让后端按 view/flow 收窄，再 limit：不能先取前 200 条再前端 filter，
+    // 否则稀疏的旧批次会被截断丢失。200 是接口允许的上限。
+    const data = await api.listReviewQueue(project, {
+      view,
+      flow: flow || undefined,
+      limit: 200,
+    })
+    if (!stillCurrent()) return
+    queueIds.value = data.items.map((item) => item.id)
+  } catch {
+    if (!stillCurrent()) return
+    queueIds.value = []
+  }
+}
+
+function goSibling(direction: 'prev' | 'next'): void {
+  const target = direction === 'prev' ? prevRecordId.value : nextRecordId.value
+  if (!target) return
+  void router.replace({ name: 'review', params: { projectId: projectId.value, recordId: target }, query: route.query })
+}
+
+function goQueue(): void {
+  void router.push({ name: 'reviewQueue', params: { projectId: projectId.value }, query: route.query })
+}
+
+function goReflow(): void {
+  const dataset = state.value?.record.dataset_id
+  void router.push({
+    name: 'reflow',
+    params: { projectId: projectId.value },
+    query: { ...(dataset ? { dataset_id: dataset } : {}), record_id: recordId.value, mode: 'revision' },
+  })
+}
+
+watch(recordId, () => {
+  if (!recordId.value) return
+  pendingRemote.value = null
+  recovery.value = null
+  notice.value = pendingNotice.value
+  pendingNotice.value = ''
+  void load()
+  void loadQueue()
+})
 const sessionId = computed(() => workspace.currentSessionId || undefined)
 
 type PaneKey = 'primary' | 'secondary'
@@ -44,7 +140,128 @@ const note = ref('')
 const busy = ref('')
 const error = ref('')
 const notice = ref('')
+// 驳回后需要跳到队列下一项时，目标记录的 watch(recordId) 会先清空 notice；
+// 这里把要跨路由保留的提示暂存，由 watch 在切换后重新显示。
+const pendingNotice = ref('')
 const pendingRemote = ref<{ version: number; updated_at: string } | null>(null)
+
+/**
+ * 登录失效时的本地应急草稿。
+ *
+ * 受保护接口 401 会立刻清登录态并卸载 AppLayout；dirty guard 来不及保护
+ * ReviewView 里尚未保存的框/备注。因此在 session-expiring 事件里同步把当前
+ * 编辑写进 localStorage，键按 user/project/record 隔离；只有重新登录同一账号、
+ * 打开同一记录时才提示恢复，并在恢复时对照 base_version 提示冲突。
+ */
+interface RecoveryBackup {
+  user_id: number
+  project_id: string
+  record_id: string
+  saved_at: string
+  base_version: number | null
+  boxes: Box[]
+  x_boxes: Box[]
+  note: string
+}
+const recovery = ref<{ key: string; data: RecoveryBackup } | null>(null)
+const RECOVERY_PREFIX = 'hx17:review-recovery:'
+
+function recoveryKey(userId: number): string {
+  return `${RECOVERY_PREFIX}${userId}|${projectId.value}|${recordId.value}`
+}
+
+/** 同步备份 dirty 编辑；401 监听器在清 auth 之前派发事件，所以这里还能拿到用户 id。 */
+function backupForSessionExpiry(userId: number | null): void {
+  if (!dirty.value || !state.value?.record || !userId) return
+  const data: RecoveryBackup = {
+    user_id: userId,
+    project_id: projectId.value,
+    record_id: recordId.value,
+    saved_at: new Date().toISOString(),
+    base_version: draftBase.value,
+    boxes: boxes.value.map((box) => ({ ...box, bbox: [...box.bbox] as Box['bbox'] })),
+    x_boxes: xBoxes.value.map((box) => ({ ...box, bbox: [...box.bbox] as Box['bbox'] })),
+    note: note.value,
+  }
+  try {
+    localStorage.setItem(recoveryKey(userId), JSON.stringify(data))
+  } catch {
+    // 本地存储不可用/满了不能默默当作“已备份”：同步提示用户，
+    // 此时页面尚未卸载，用户仍可看到/复制当前框与备注。
+    window.alert(
+      '浏览器本地存储不可用，登录失效前的未保存框/备注未能备份。' +
+        '请先复制或记下这些修改，再继续重新登录。',
+    )
+  }
+}
+
+function onSessionExpiring(event: Event): void {
+  const detail = (event as CustomEvent<{ userId?: number | null }>).detail
+  backupForSessionExpiry(detail?.userId ?? auth.user?.id ?? null)
+}
+
+/** 登录恢复后只对“同 user + 同项目 + 同记录”的备份提示恢复，绝不跨账号套用。 */
+function maybeOfferRecovery(): void {
+  recovery.value = null
+  const userId = auth.user?.id
+  if (!state.value?.record || !userId) return
+  const key = recoveryKey(userId)
+  const raw = localStorage.getItem(key)
+  if (!raw) return
+  try {
+    const data = JSON.parse(raw) as RecoveryBackup
+    if (
+      data.user_id !== userId ||
+      data.project_id !== projectId.value ||
+      data.record_id !== recordId.value
+    ) {
+      // 别的账号/别的记录留下的应急草稿：不展示、也绝不删除，
+      // 等原账号重新登录后仍能恢复（清缓存不能顺手清恢复材料）。
+      return
+    }
+    recovery.value = { key, data }
+  } catch {
+    // 损坏的备份不展示；同样不在这里删，避免误删其他账号的恢复材料。
+  }
+}
+
+function restoreRecovery(): void {
+  const pending = recovery.value
+  if (!pending) return
+  const data = pending.data
+  const baseMatches = (draftBase.value ?? null) === (data.base_version ?? null)
+  boxes.value = data.boxes.map((box) => ({ ...box, bbox: [...box.bbox] as Box['bbox'] }))
+  xBoxes.value = data.x_boxes.map((box) => ({ ...box, bbox: [...box.bbox] as Box['bbox'] }))
+  note.value = data.note
+  selected.primary = -1
+  selected.secondary = -1
+  undoStack.primary = []
+  undoStack.secondary = []
+  recovery.value = null
+  localStorage.removeItem(pending.key)
+  notice.value = baseMatches
+    ? '已恢复登录失效前未保存的框与备注，请核对后保存草稿。'
+    : '已恢复登录失效前的修改，但服务端草稿基线已变化（base_version 不一致），请逐项核对后再保存。'
+}
+
+function discardRecovery(): void {
+  const pending = recovery.value
+  if (!pending) return
+  localStorage.removeItem(pending.key)
+  recovery.value = null
+  notice.value = '已丢弃登录失效前的未保存修改。'
+}
+
+function clearRecoveryForCurrent(): void {
+  const userId = auth.user?.id
+  if (!userId) return
+  try {
+    localStorage.removeItem(recoveryKey(userId))
+  } catch {
+    // ignore
+  }
+  recovery.value = null
+}
 /** 每张画布自己的图片加载错误：404/坏图要落在对应画布里说清楚，不能只给空白。 */
 const paneImageError = reactive<Record<PaneKey, string>>({ primary: '', secondary: '' })
 const loadedProjection = ref('')
@@ -52,6 +269,14 @@ const loadedSignature = ref('')
 const activePane = ref<PaneKey>('primary')
 
 const selected = reactive<Record<PaneKey, number>>({ primary: -1, secondary: -1 })
+
+/** 面向评委的错误文案：内部错误码不直接暴露，404 给明确下一步。 */
+function formatError(exc: unknown): string {
+  const code = errorCode(exc)
+  const message = errorMessage(exc)
+  if (code === 'RECORD_NOT_FOUND') return '这条识别记录不存在或已被删除，请返回「识别记录」重新选择。'
+  return [code, message].filter(Boolean).join('：')
+}
 const tool = reactive<Record<PaneKey, Tool>>({ primary: 'select', secondary: 'select' })
 const undoStack = reactive<Record<PaneKey, Box[][]>>({ primary: [], secondary: [] })
 const pendingFit = reactive<Record<PaneKey, boolean>>({ primary: true, secondary: true })
@@ -183,11 +408,19 @@ async function load(
   options: { silent?: boolean; message?: string; preserveViewport?: boolean } = {},
 ): Promise<void> {
   if (!projectId.value || !recordId.value) return
+  const epoch = ++loadEpoch
+  const requestProject = projectId.value
+  const requestRecord = recordId.value
+  const stillCurrent = () =>
+    epoch === loadEpoch &&
+    requestProject === projectId.value &&
+    requestRecord === recordId.value
   if (!options.silent) busy.value = 'load'
   try {
-    const sameRecord = state.value?.record?.id === recordId.value
+    const sameRecord = state.value?.record?.id === requestRecord
     const keepViewport = Boolean(options.preserveViewport) && sameRecord && state.value !== null
-    const data = await api.getReviewState(projectId.value, recordId.value)
+    const data = await api.getReviewState(requestProject, requestRecord)
+    if (!stillCurrent()) return
     if (!data.state?.record) throw new Error('记录不存在或已被删除')
     state.value = data.state
     boxes.value = preferredBoxes(data.state) as Box[]
@@ -210,6 +443,8 @@ async function load(
     error.value = ''
     if (options.message) notice.value = options.message
     await nextTick()
+    // nextTick 期间也可能已经切到另一条记录：此时不再 measure/fit/setBaseline。
+    if (!stillCurrent()) return
     measureAll()
     if (!keepViewport) {
       fit('primary')
@@ -217,33 +452,48 @@ async function load(
       // 图片可能还没 decode 完；onImageLoad 会再补齐一次 fit。
     }
     setBaseline()
+    maybeOfferRecovery()
   } catch (exc) {
-    error.value = [errorCode(exc), errorMessage(exc)].filter(Boolean).join('：')
+    if (!stillCurrent()) return
+    error.value = formatError(exc)
   } finally {
-    if (busy.value === 'load') busy.value = ''
+    if (epoch === loadEpoch && busy.value === 'load') busy.value = ''
   }
+}
+
+// 写请求的收尾也绑定“发起时是哪条记录”。服务端可能已经执行成功，但用户已经
+// 放弃修改切到 B；这时只能丢弃旧 UI 回填，不能把 A 的响应写到 B，更不能重发。
+function captureView() {
+  return { epoch: loadEpoch, project: projectId.value, record: recordId.value }
+}
+function viewStillCurrent(snap: { epoch: number; project: string; record: string }): boolean {
+  return snap.epoch === loadEpoch && snap.project === projectId.value && snap.record === recordId.value
 }
 
 async function saveDraft(): Promise<void> {
   if (!state.value) return
+  const snap = captureView()
   busy.value = 'save'
   error.value = ''
   try {
-    const data = await api.saveReviewDraft(projectId.value, recordId.value, {
+    const data = await api.saveReviewDraft(snap.project, snap.record, {
       boxes: boxes.value.map(toPayloadBox),
       x_boxes: xBoxes.value.map(toPayloadBox),
       note: note.value,
       base_version: draftBase.value,
     })
+    if (!viewStillCurrent(snap)) return
     state.value = data.state
     setBaseline()
+    clearRecoveryForCurrent()
     notice.value = '草稿已保存'
   } catch (exc) {
+    if (!viewStillCurrent(snap)) return
     const code = errorCode(exc)
-    error.value = [code, errorMessage(exc)].filter(Boolean).join('：')
+    error.value = formatError(exc)
     if (code === 'REVIEW_CONFLICT') notice.value = '草稿已被其他页面更新；可点“刷新”载入最新版本后再改。'
   } finally {
-    busy.value = ''
+    if (viewStillCurrent(snap) && busy.value === 'save') busy.value = ''
   }
 }
 
@@ -255,22 +505,31 @@ async function submit(outcome: 'defect' | 'no_defect'): Promise<void> {
   }
   busy.value = 'submit'
   error.value = ''
+  const snap = captureView()
+  const nextTarget = nextRecordId.value
   try {
-    await api.submitReview(projectId.value, recordId.value, {
+    await api.submitReview(snap.project, snap.record, {
       boxes: outcome === 'defect' ? boxes.value.map(toPayloadBox) : [],
       x_boxes: outcome === 'defect' ? xBoxes.value.map(toPayloadBox) : [],
       outcome,
       note: note.value,
       base_version: submitBase.value,
-      request_key: `review-ui:${recordId.value}:${Date.now()}`,
+      request_key: `review-ui:${snap.record}:${Date.now()}`,
       session_id: sessionId.value,
     })
+    // 提交已真实落库；但用户若已切到别的记录，只丢弃旧 UI 回填，不能覆盖 B 的画布/提示。
+    if (!viewStillCurrent(snap)) return
     notice.value = outcome === 'defect' ? '已提交人工结论：有缺陷' : '已提交人工结论：无缺陷'
     await load()
+    if (recordId.value !== snap.record || projectId.value !== snap.project) return
+    if (queueView.value && nextTarget) {
+      void router.replace({ name: 'review', params: { projectId: projectId.value, recordId: nextTarget }, query: route.query })
+    }
   } catch (exc) {
-    error.value = [errorCode(exc), errorMessage(exc)].filter(Boolean).join('：')
+    if (!viewStillCurrent(snap)) return
+    error.value = formatError(exc)
   } finally {
-    busy.value = ''
+    if (viewStillCurrent(snap) && busy.value === 'submit') busy.value = ''
   }
 }
 
@@ -278,35 +537,54 @@ async function reject(): Promise<void> {
   if (!state.value) return
   const reason = window.prompt('驳回原因（可留空，会写入版本记录）', '')
   if (reason === null) return
+  const snap = captureView()
+  // 和提交一样固定“本次点击时的下一项”：驳回成功后才推进；失败/冲突不跳。
+  const nextTarget = nextRecordId.value
+  const inQueue = Boolean(queueView.value)
   busy.value = 'reject'
   error.value = ''
   try {
-    await api.rejectReview(projectId.value, recordId.value, {
+    await api.rejectReview(snap.project, snap.record, {
       reason,
       base_version: submitBase.value,
-      request_key: `review-reject:${recordId.value}:${Date.now()}`,
+      request_key: `review-reject:${snap.record}:${Date.now()}`,
       session_id: sessionId.value,
     })
-    notice.value = '已驳回，等待重新打开'
+    if (!viewStillCurrent(snap)) return
+    if (inQueue && nextTarget) {
+      notice.value = '已驳回，进入下一项'
+      pendingNotice.value = notice.value
+      await load()
+      // load() 会推进加载代次，不能再用旧 snap 判断；只用路由是否仍停在本条记录，
+      // 防止驳回期间用户已手动切走时把页面强行拉回队列。
+      if (recordId.value !== snap.record || projectId.value !== snap.project) return
+      void router.replace({ name: 'review', params: { projectId: projectId.value, recordId: nextTarget }, query: route.query })
+      return
+    }
+    notice.value = inQueue ? '已驳回，本轮队列已处理完' : '已驳回，等待重新打开'
     await load()
   } catch (exc) {
-    error.value = [errorCode(exc), errorMessage(exc)].filter(Boolean).join('：')
+    if (!viewStillCurrent(snap)) return
+    error.value = formatError(exc)
   } finally {
-    busy.value = ''
+    if (viewStillCurrent(snap) && busy.value === 'reject') busy.value = ''
   }
 }
 
 async function reopen(): Promise<void> {
+  const snap = captureView()
   busy.value = 'reopen'
   error.value = ''
   try {
-    await api.reopenReview(projectId.value, recordId.value)
+    await api.reopenReview(snap.project, snap.record)
+    if (!viewStillCurrent(snap)) return
     notice.value = '已重新打开，可继续编辑'
     await load()
   } catch (exc) {
-    error.value = [errorCode(exc), errorMessage(exc)].filter(Boolean).join('：')
+    if (!viewStillCurrent(snap)) return
+    error.value = formatError(exc)
   } finally {
-    busy.value = ''
+    if (viewStillCurrent(snap) && busy.value === 'reopen') busy.value = ''
   }
 }
 
@@ -348,6 +626,12 @@ function keepLocal(): void {
 }
 
 async function loadRemote(): Promise<void> {
+  // 载入远端版本会覆盖本地未保存编辑：dirty 时复用同一个三选决定，
+  // 不另造一套弹窗；取消则写清“已保留本地编辑”。
+  if (dirty.value && !(await confirmAndProceed('remote'))) {
+    notice.value = '已保留本地编辑；需要助手版本时再点“载入更新”。'
+    return
+  }
   pendingRemote.value = null
   await load({ preserveViewport: true, message: '已载入最新草稿（保留当前缩放/平移）。' })
 }
@@ -688,22 +972,108 @@ function onVisibility(): void {
   if (document.visibilityState === 'visible') void pollChanges()
 }
 
+function onBeforeUnload(event: BeforeUnloadEvent): void {
+  if (!dirty.value) return
+  event.preventDefault()
+  // 现代浏览器只显示通用提示；这是刷新/关页的最后一道防线。
+  event.returnValue = ''
+}
+
 onMounted(async () => {
   window.addEventListener('keydown', onKey)
   window.addEventListener('resize', onResize)
+  window.addEventListener('beforeunload', onBeforeUnload)
+  window.addEventListener('hx17:session-expiring', onSessionExpiring)
   document.addEventListener('visibilitychange', onVisibility)
   await load()
+  await loadQueue()
   pollTimer = window.setInterval(() => void pollChanges(), 2500)
 })
 
 onBeforeUnmount(() => {
+  // 卸载后任何在途详情响应都作废，避免已离开页面还去写状态。
+  loadEpoch += 1
   window.removeEventListener('keydown', onKey)
   window.removeEventListener('resize', onResize)
+  window.removeEventListener('beforeunload', onBeforeUnload)
+  window.removeEventListener('hx17:session-expiring', onSessionExpiring)
   document.removeEventListener('visibilitychange', onVisibility)
   if (pollTimer !== null) window.clearInterval(pollTimer)
 })
 
+// 路由内离开/上一项/下一项：dirty 时用一次三选弹窗（保存并离开/放弃修改/继续编辑），
+// 而不是连续两次 window.confirm。同组件 params 更新不会触发 onBeforeRouteLeave，
+// 所以必须同时覆盖 onBeforeRouteUpdate，否则“下一项”会直接丢未保存修改。
+type LeaveChoice = 'save' | 'discard' | 'cancel'
+type LeaveIntent = 'leave' | 'refresh' | 'remote'
+// 离开页面、刷新、载入远端版本都复用同一个三选弹窗，只是按钮文案不同；
+// 避免多个弹窗叠加，也避免刷新按钮绕过未保存修改保护。
+const leaveIntent = ref<LeaveIntent>('leave')
+const leaveOpen = ref(false)
+let leaveChoiceResolver: ((choice: LeaveChoice) => void) | null = null
+let leaveChoicePromise: Promise<LeaveChoice> | null = null
+
+function askLeaveChoice(intent: LeaveIntent = 'leave'): Promise<LeaveChoice> {
+  leaveIntent.value = intent
+  leaveOpen.value = true
+  // 复用同一个待决 Promise：等待期间再次触发导航（前进/后退/连点）不能覆盖 resolver。
+  if (!leaveChoicePromise) {
+    leaveChoicePromise = new Promise((resolve) => {
+      leaveChoiceResolver = resolve
+    })
+  }
+  return leaveChoicePromise
+}
+
+function resolveLeaveChoice(choice: LeaveChoice): void {
+  if (!leaveChoicePromise) return
+  leaveOpen.value = false
+  leaveChoiceResolver?.(choice)
+  leaveChoiceResolver = null
+  leaveChoicePromise = null
+}
+
+async function confirmAndProceed(intent: LeaveIntent = 'leave'): Promise<boolean> {
+  const choice = await askLeaveChoice(intent)
+  if (choice === 'cancel') return false
+  if (choice === 'save') {
+    await saveDraft()
+    // 保存失败（含 401 会话失效）时留在本页，绝不返回 true 造成“已保存”误判。
+    return !dirty.value
+  }
+  return true
+}
+
+/** 工具栏“刷新”：纯查看直接刷新；有本地修改时复用三选保护，不静默覆盖。 */
+async function refresh(): Promise<void> {
+  if (busy.value) return
+  if (dirty.value && !(await confirmAndProceed('refresh'))) return
+  await load({ preserveViewport: true, message: '已刷新为服务端最新版本（保留当前缩放/平移）。' })
+}
+
+onBeforeRouteLeave(async () => {
+  // 401 已触发会话失效：未保存编辑已在 session-expiring 里同步备份，
+  // 必须让统一登录跳转通过，不能再用 dirty 弹窗把用户留在已失效页面。
+  if (!auth.isAuthenticated) return true
+  if (!dirty.value) return true
+  return confirmAndProceed()
+})
+
+onBeforeRouteUpdate(async (to) => {
+  // 纯 query 变化（view/flow/record_ids）不改变当前记录，不打扰编辑。
+  if (!auth.isAuthenticated) return true
+  const sameRecord =
+    to.params.recordId === route.params.recordId && to.params.projectId === route.params.projectId
+  if (sameRecord || !dirty.value) return true
+  return confirmAndProceed()
+})
+
 function goBack(): void {
+  // 从队列进入时，返回应回到同一个队列/筛选，而不是总跳识别记录。
+  if (queueView.value) {
+    goQueue()
+    return
+  }
   if (projectId.value) void router.push(`/projects/${projectId.value}/records`)
   else void router.push('/projects')
 }
@@ -740,14 +1110,22 @@ const aiReview = computed(() => state.value?.ai_review ?? null)
         <span v-if="state" class="chip">
           参考 {{ primaryLabel }}<template v-if="hasSecondary"> + 辅 {{ secondaryLabel }}</template>
         </span>
-        <button class="small ghost" :disabled="busy === 'load'" @click="load()">刷新</button>
-        <button class="small ghost" @click="goBack">返回记录</button>
+        <button v-if="queueView" class="small ghost" :disabled="!prevRecordId" @click="goSibling('prev')">上一项</button>
+        <button v-if="queueView" class="small ghost" :disabled="!nextRecordId" @click="goSibling('next')">下一项</button>
+        <button v-if="state?.human_status === 'confirmed'" class="small ghost" @click="goReflow">去回流</button>
+        <button class="small ghost" :disabled="busy === 'load'" @click="refresh">刷新</button>
+        <button class="small ghost" @click="goBack">{{ queueView ? '返回队列' : '返回记录' }}</button>
       </div>
     </header>
 
     <p v-if="error" class="banner danger">{{ error }}</p>
     <p v-if="notice" class="banner notice-line">{{ notice }}</p>
 
+    <section v-if="recovery" class="banner remote-line recovery-line" role="status">
+      <span>检测到登录失效前未保存的框/备注（{{ recovery.data.saved_at }}）。</span>
+      <button class="small primary" type="button" @click="restoreRecovery">恢复修改</button>
+      <button class="small ghost" type="button" @click="discardRecovery">丢弃</button>
+    </section>
     <section v-if="pendingRemote" class="banner remote-line">
       <span>助手已更新这份复核（v{{ pendingRemote.version }}）。</span>
       <span class="remote-actions">
@@ -920,6 +1298,20 @@ const aiReview = computed(() => state.value?.ai_review ?? null)
         </section>
       </div>
     </details>
+
+    <DialogShell title="有未保存的修改" :open="leaveOpen" @close="resolveLeaveChoice('cancel')">
+      <p v-if="leaveIntent === 'refresh'">刷新会用服务端最新版本覆盖当前框和备注，要先保存本地草稿吗？</p>
+      <p v-else-if="leaveIntent === 'remote'">载入助手更新会覆盖当前框和备注，要先保存本地草稿吗？</p>
+      <p v-else>当前复核的框或备注还没有保存。离开前要先保存草稿吗？</p>
+      <p class="subtle">保存草稿不会生成人工结论；“放弃修改”只丢弃本次未保存的编辑。</p>
+      <template #footer>
+        <button class="ghost" type="button" @click="resolveLeaveChoice('cancel')">继续编辑</button>
+        <button class="ghost danger-text" type="button" @click="resolveLeaveChoice('discard')">放弃修改</button>
+        <button class="primary" type="button" :disabled="!!busy" @click="resolveLeaveChoice('save')">
+          {{ leaveIntent === 'refresh' ? '保存并刷新' : leaveIntent === 'remote' ? '保存并载入' : '保存并离开' }}
+        </button>
+      </template>
+    </DialogShell>
   </main>
 </template>
 

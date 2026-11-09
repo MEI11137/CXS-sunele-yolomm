@@ -35,6 +35,7 @@ class ToolContext:
     args: dict
     emit: Callable[[str, dict], None]
     jobs: dict[str, Callable[[str], dict]]
+    runtime: Any = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -743,7 +744,10 @@ register(
     ToolSpec(
         name="hx_create_project",
         title="新建项目",
-        description="为当前账号新建一个项目。目录绑定仍需用户本人在界面完成，工具不能绑定目录。",
+        description=(
+            "为当前账号新建一个空项目。新项目默认未绑定目录；"
+            "要绑定时请切到另一个已绑定项目的会话，再用 hx_project_bind 明确指定本项目。"
+        ),
         risk=policy.RISK_WRITE,
         schema={
             "type": "object",
@@ -1213,6 +1217,13 @@ def _list_models(ctx: ToolContext) -> dict:
 def _import_model(ctx: ToolContext) -> dict:
     from backend.services import models as model_service
 
+    # dual 是旧提示词/旧前端里的历史别名，服务端只认 multimodal。
+    # schema 保留 dual 只为兼容老调用，这里统一归一化，交给服务端按 family 决定，
+    # 避免合法的 yolomm 导入被 400 挡在门外。
+    mode = ctx.args.get("model_mode")
+    if isinstance(mode, str) and mode.strip().lower() in {"", "dual"}:
+        mode = None
+
     model = _service(
         lambda: model_service.import_model(
             ctx.conn,
@@ -1220,7 +1231,7 @@ def _import_model(ctx: ToolContext) -> dict:
             ctx.actor.project_id,
             name=str(ctx.args.get("name") or ""),
             family=str(ctx.args.get("family") or ""),
-            model_mode=ctx.args.get("model_mode"),
+            model_mode=mode,
             secondary_modality=ctx.args.get("secondary_modality"),
             dataset_id=ctx.args.get("dataset_id"),
             class_map=ctx.args.get("class_map"),
@@ -1548,8 +1559,15 @@ register(
         description=(
             "登记本地或已上传的 .pt 权重并校验可用性与类别索引。family=yolo 为单模态、yolomm 为双模态；"
             "必须与权重真实结构一致（不清楚就先调 hx_inspect_weight，别按文件名猜）。"
+            "model_mode 可省略：yolo 固定 single，yolomm 固定 multimodal；dual 是 multimodal 的旧别名，"
+            "服务端会归一化，不要因为看到 schema 里有 dual 就主动传它。"
             "类别名对齐必须显式：名称不一致时会返回 NEED_CLASS_MAPPING 与两份类别清单，"
-            "由你在对话里问用户后用 class_map 重试，不允许靠翻译猜。"
+            "由你在对话里问用户后用 class_map 重试，不允许靠翻译猜。class_map 格式为 "
+            '{"权重类别索引或名称": 数据集类别索引或名称}，例如 {"0": 1}；索引从 0 开始，'
+            "既可用索引也可用类别名，但必须把用户确认的对应关系写清楚。"
+            "class_map 只对齐类别索引，不会让权重获得它原本没有的检测能力："
+            "例如 COCO 80 类权重映射到只有 bird_nest 一类数据集，仍不是鸟巢检测模型，"
+            "必须如实说明并建议用真实标注训练新权重，不能把映射说成能获得鸟巢检测能力。"
         ),
         risk=policy.RISK_WRITE,
         requires_root=True,
@@ -1558,12 +1576,25 @@ register(
             "properties": {
                 "name": {"type": "string", "minLength": 1, "maxLength": 60},
                 "family": {"type": "string", "pattern": "^(yolo|yolomm)$"},
-                "model_mode": {"type": "string", "pattern": "^(single|dual)$"},
+                "model_mode": {
+                    "type": "string",
+                    "pattern": "^(single|multimodal|dual)$",
+                    "description": (
+                        "yolo 用 single，yolomm 用 multimodal；dual 是 multimodal 的旧别名。"
+                        "不确定时省略，服务端按 family 自动决定。"
+                    ),
+                },
                 "secondary_modality": {"type": "string", "pattern": "^(ir|edge|depth)$"},
                 "dataset_id": _ID,
                 "rel_path": _REL,
                 "asset_id": _ID,
-                "class_map": {"type": "object"},
+                "class_map": {
+                    "type": "object",
+                    "description": (
+                        '{"权重类别索引或名称": 数据集类别索引或名称}，例如 {"0": 1}；'
+                        "名称不一致时必须显式提供，不允许让服务端猜。"
+                    ),
+                },
                 "notes": {"type": "string", "maxLength": 500},
             },
             "required": ["name", "family"],
@@ -1804,6 +1835,7 @@ def _review_queue(ctx: ToolContext) -> dict:
             ctx.actor.project_id,
             view=str(ctx.args.get("view") or "pending"),
             record_ids=ctx.args.get("record_ids"),
+            flow_id=(str(ctx.args.get("flow_id") or "").strip() or None),
             limit=int(ctx.args.get("limit") or 20),
         )
     )
@@ -2076,6 +2108,92 @@ def _project_update(ctx: ToolContext) -> dict:
     }
 
 
+def _project_bind(ctx: ToolContext) -> dict:
+    """把另一个 owned 项目绑定到管理员已授权的目录内；不新增授权根、不猜默认路径。
+
+    当前对话所在项目不能由助手重绑：绑定会终止该项目的运行中轮次，包括本次回复。
+    当前项目请在项目详情页操作，或切到另一个已绑定项目的会话后再明确指定本项目。
+    """
+    from backend.agent.lifecycle import invalidate_project_turns
+    from backend.services import projects as project_service
+
+    project_id = str(ctx.args.get("project_id") or ctx.actor.project_id or "")
+    current_project_id = str(ctx.actor.project_id)
+    raw_path = str(ctx.args.get("path") or "").strip()
+    replace = bool(ctx.args.get("replace"))
+    if not raw_path:
+        raise ToolError("BAD_PATH", "必须提供要绑定的服务器绝对路径")
+    if project_id == current_project_id:
+        raise ToolError(
+            "CURRENT_PROJECT_REBIND",
+            "当前对话所在项目不能由助手重绑目录：会终止本轮回复。"
+            "请在项目详情页操作，或切到另一个已绑定项目的会话后，再明确指定本项目。",
+        )
+    if ctx.runtime is None:
+        raise ToolError(
+            "LIFECYCLE_UNAVAILABLE",
+            "当前环境无法通知运行中的轮次，不能在助手内绑定项目目录；请在项目详情页操作。",
+        )
+    row = _service(
+        lambda: project_service.get_owned(ctx.conn, project_id, int(ctx.actor.user_id))
+    )
+    before_root = str(row["root_path"] or "")
+    updated = _service(
+        lambda: project_service.bind_root(
+            ctx.conn, row, raw_path=raw_path, replace=replace
+        )
+    )
+    after_root = str(updated["root_path"] or "")
+    if before_root == after_root:
+        return {
+            "status": "unchanged",
+            "changed": False,
+            "project_id": updated["id"],
+            "root_path": after_root,
+            "replaced": False,
+            "lifecycle_notified": False,
+            "interrupted_turns": 0,
+            "note": "目录与当前绑定相同，未改动、未触发轮次终止。",
+        }
+    try:
+        interrupted = invalidate_project_turns(
+            ctx.runtime,
+            int(ctx.actor.user_id),
+            str(updated["id"]),
+            reason="项目目录已变更，运行中的轮次已终止",
+        )
+    except Exception as error:
+        raise ToolError(
+            "LIFECYCLE_FAILED",
+            "目录已更新，但运行时通知失败；未回滚目录，也不会自动重试。"
+            "请到项目详情页确认并处理该项目的旧轮次。",
+        ) from error
+    if interrupted is None:
+        raise ToolError(
+            "LIFECYCLE_FAILED",
+            "目录已更新，但没有可用的运行时来通知旧轮次；请到项目详情页确认。",
+        )
+    ctx.emit(
+        "projects.changed",
+        {"action": "bound_root", "project_id": updated["id"], "root_path": updated["root_path"]},
+    )
+    return {
+        "status": "bound",
+        "changed": True,
+        "project_id": updated["id"],
+        "root_path": updated["root_path"],
+        "replaced": replace,
+        "lifecycle_notified": True,
+        "interrupted_turns": interrupted,
+        "note": (
+            "只使用了管理员已授予的根目录；不会新增授权范围，也不会改动其它项目。"
+            "已通知运行时终止该项目旧轮次（中断记录数见 interrupted_turns，"
+            "不代表已确认引擎进程退出）。不会搬迁或重新关联已有文件，"
+            "之后文件工具从新绑定目录开始读取。"
+        ),
+    }
+
+
 def _manual_admin(ctx: ToolContext) -> dict:
     from backend.services import manuals as manual_service
 
@@ -2239,13 +2357,14 @@ register(
     ToolSpec(
         name="hx_review_queue",
         title="列出待复核 / 已驳回 / 已确认记录",
-        description="按视图列出真实记录 ID 与计数；驳回后的记录不再出现在待复核。",
+        description="按视图列出真实记录 ID 与计数；驳回后的记录不再出现在待复核。可用 flow_id 只看某一巡检批次。",
         risk=policy.RISK_READ,
         schema={
             "type": "object",
             "properties": {
                 "view": {"type": "string", "enum": ["pending", "draft", "rejected", "confirmed"]},
                 "record_ids": {"type": "array", "maxItems": 100},
+                "flow_id": {"type": "string", "maxLength": 64},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100},
             },
             "required": [],
@@ -3303,7 +3422,11 @@ def _compare_models(ctx: ToolContext) -> dict:
 
 
 def _directory_status(ctx: ToolContext) -> dict:
-    """只读：当前项目绑在哪个目录、有没有授权、能不能写。授权本身只能人工做。"""
+    """只读：当前项目绑在哪个目录、有哪些授权根、能不能写。
+
+    绑定（把项目指到已有授权根内的目录）可以用 ``hx_project_bind`` 完成；
+    新增授权根、扩大授权范围仍只能由管理员人工操作。
+    """
     from backend.services import projects as project_service
     from backend.services import roots as root_service
 
@@ -3336,7 +3459,8 @@ def _directory_status(ctx: ToolContext) -> dict:
         },
         "granted_roots": granted,
         "note": (
-            "这里只能看，不能改：绑定目录与授权由管理员/项目所有人在页面操作。"
+            "当前对话项目的目录绑定变更请在页面操作；另一个 owned 项目可切到该项目会话后用 "
+            "hx_project_bind 绑定。新增或扩大授权根仍只能由管理员在页面操作。"
             "文件工具的所有路径都必须落在绑定目录内。"
         ),
     }
@@ -3432,7 +3556,8 @@ register(
         title="查看目录绑定与授权状态",
         description=(
             "只读：当前项目绑定的目录、是否存在/可写，以及本人被授权的根目录清单。"
-            "绑定与授权只能由人在页面操作。"
+            "绑定**另一个** owned 项目可切到该项目会话后用 hx_project_bind（仅限已授权根内）；"
+            "当前对话项目本身不能由助手重绑。新增或扩大授权根只能由管理员在页面操作。"
         ),
         risk=policy.RISK_READ,
         schema={"type": "object", "properties": {}, "required": []},
@@ -3463,6 +3588,32 @@ register(
         },
         handler=_project_admin,
         summary=lambda args: f"{'删除' if args.get('action') == 'delete' else '恢复'}项目 {args.get('project_id') or '（当前）'}",
+    )
+)
+register(
+    ToolSpec(
+        name="hx_project_bind",
+        title="绑定另一个项目的目录",
+        description=(
+            "把**另一个**本人 owned 的项目绑定到服务器上的一个目录；仅限管理员已授予的根目录内部，"
+            "不会新增授权范围、不会自动选择整块盘。当前对话所在项目不能重绑（会终止本轮回复），"
+            "请在项目详情页操作，或切到另一个已绑定项目的会话后再明确指定本项目。"
+            "项目已绑定其它目录时必须显式 replace=true；"
+            "同一路径幂等。绑定后该项目的文件工具只能访问新目录内部；不会搬迁或重新关联已有文件，"
+            "绑定会终止该项目运行中的旧轮次。新增授权根/扩大授权范围仍需管理员人工操作。"
+        ),
+        risk=policy.RISK_WRITE,
+        schema={
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string", "pattern": "^prj_[0-9a-f]{16}$"},
+                "path": {"type": "string", "maxLength": 1024},
+                "replace": {"type": "boolean"},
+            },
+            "required": ["project_id", "path"],
+        },
+        handler=_project_bind,
+        summary=lambda args: f"绑定项目目录 {args.get('path')}",
     )
 )
 register(

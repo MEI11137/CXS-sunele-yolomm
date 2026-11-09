@@ -158,18 +158,54 @@ test('状态标签：未知值原样显示，不吞掉后端新状态', () => {
   assert.equal(turnStatusLabel('unknown_state'), 'unknown_state')
 })
 
-test('toolFoldSummary：折叠时只报次数与最近一次，不把输出摘要当回答', () => {
+test('toolFoldSummary：汇总失败/待确认/运行，不把最后一张卡当全部完成', () => {
   assert.equal(toolFoldSummary([]), '本轮工具调用')
 
-  const one = toolFoldSummary([{ title: '读取目录', state: 'completed' }])
-  assert.equal(one, '1 次工具调用 · 最近：已完成 · 读取目录')
+  // 全部结束也只说“工具调用已结束”，不替最终回答断言业务完成。
+  assert.equal(
+    toolFoldSummary([{ title: '读取目录', state: 'completed' }]),
+    '1 次工具调用 · 工具调用已结束',
+  )
 
-  const many = toolFoldSummary([
-    { title: '读取目录', state: 'completed' },
-    { title: '检测图片', state: 'running' },
-  ])
-  assert.equal(many, '2 次工具调用 · 最近：执行中 · 检测图片')
+  // 前面失败 + 最后成功：必须报失败，不能显示“全部完成”。
+  assert.equal(
+    toolFoldSummary([
+      { title: '读取不存在文件', state: 'error' },
+      { title: '检测图片', state: 'completed' },
+    ]),
+    '2 次工具调用 · 1 项失败',
+  )
 
-  // 未知状态原样出现，和 toolStateLabel 保持一致，不吞掉后端新状态。
-  assert.match(toolFoldSummary([{ title: 'x', state: 'weird' }]), /最近：weird · x$/)
+  // 多个失败按数量聚合，待确认优先于执行中。
+  assert.equal(
+    toolFoldSummary([
+      { title: 'a', state: 'error' },
+      { title: 'b', state: 'error' },
+      { title: 'c', state: 'pending_confirmation' },
+    ]),
+    '3 次工具调用 · 2 项失败',
+  )
+  assert.equal(
+    toolFoldSummary([
+      { title: '保存', state: 'pending_confirmation' },
+      { title: '检测', state: 'running' },
+    ]),
+    '2 次工具调用 · 1 项等待确认',
+  )
+  assert.equal(
+    toolFoldSummary([
+      { title: '检测', state: 'running' },
+      { title: '读取', state: 'pending' },
+    ]),
+    '2 次工具调用 · 2 项执行中',
+  )
+
+  // 不凭工具名推断后台作业/业务完成：completed 只是工具调用结束。
+  assert.equal(
+    toolFoldSummary([{ title: '启动训练', state: 'completed', tool: 'hx_training_start' }]),
+    '1 次工具调用 · 工具调用已结束',
+  )
+
+  // 未知状态不当成功：不显示“已结束”或“全部完成”，明确标状态未知。
+  assert.equal(toolFoldSummary([{ title: 'x', state: 'weird' }]), '1 次工具调用 · 1 项状态未知')
 })

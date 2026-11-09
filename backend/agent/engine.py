@@ -257,6 +257,25 @@ class EngineManager:
             self._instances.pop(instance.spec.key(), None)
             self._dispose(instance, remove_dir=False)
 
+    def quarantine_session(self, user_id: int, session_id: str) -> int:
+        """隔离某个会话的全部引擎实例（保留存储）。
+
+        用于“上一轮被用户主动停止”的场景：停止时确认空闲的引擎按生命周期
+        契约保留，但实测同一引擎在停止后会让下一轮空回答（NO_FINAL_TEXT）；
+        在下一轮开始前只替换这个会话的进程，其他会话不受影响。
+        """
+        with self._lock:
+            targets = [
+                item
+                for item in list(self._instances.values())
+                if item.spec.user_id == int(user_id)
+                and item.spec.session_id == str(session_id)
+            ]
+            for item in targets:
+                self._instances.pop(item.spec.key(), None)
+                self._dispose(item, remove_dir=False)
+            return len(targets)
+
     def _evict_stale(self, spec: EngineSpec) -> None:
         """同一会话换了连接或能力结论，旧进程不能继续服务新身份。"""
         stale = [

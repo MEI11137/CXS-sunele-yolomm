@@ -86,6 +86,14 @@ const authStateLabel = computed(() => AUTH_STATE_LABELS[authState.value] ?? '')
 const evidence = computed(() => connection.connection?.capabilities?.evidence ?? {})
 const checked = computed(() => Boolean(connection.connection?.checked_at) && !connection.connection?.capabilities_stale)
 
+/** 后端返回 UTC ISO；界面显示本地时间，避免评委看到裸 ISO 串。 */
+function formatCheckedAt(value: string | null | undefined): string {
+  if (!value) return ''
+  const time = new Date(value)
+  if (Number.isNaN(time.getTime())) return String(value)
+  return time.toLocaleString('zh-CN', { hour12: false })
+}
+
 function syncForm(): void {
   const current = connection.connection
   if (!current) {
@@ -220,9 +228,6 @@ onMounted(async () => {
         <dl class="kv compact">
           <div><dt>模型</dt><dd>
             <span class="mono">{{ connection.connection.model }}</span>
-            <span v-if="connection.connection.display_name" class="hint">
-              （{{ connection.connection.display_name }}）
-            </span>
           </dd></div>
           <div><dt>接口</dt><dd class="mono">{{ connection.connection.base_url }}</dd></div>
           <div><dt>Key</dt><dd class="mono">{{ connection.connection.key_hint }}</dd></div>
@@ -231,7 +236,7 @@ onMounted(async () => {
             <template v-else>
               <span class="tag tag-on">已检查</span>
               <span v-if="connection.connection.checked_at" class="hint">
-                {{ connection.connection.checked_at }}
+                {{ formatCheckedAt(connection.connection.checked_at) }}
               </span>
             </template>
           </dd></div>

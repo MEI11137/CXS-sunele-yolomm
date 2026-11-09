@@ -180,15 +180,26 @@ export function toolStateLabel(state: string): string {
 /**
  * 折叠起来的工具过程标题：默认不铺开，但状态要一眼能看到。
  *
- * 只放"几次调用 + 最近一次的状态和标题"，不放工具的返回摘要——
- * 摘要是给排查用的，展开才看，不能当成回答上屏。
+ * 不能只看最后一张卡：前面失败、最后成功时也必须汇总出失败数，否则会把
+ * “某工具失败”伪装成全部完成。这里只描述**工具调用**的状态，不凭工具名或
+ * transport 返回猜业务/后台作业是否完成；业务状态交给已有的 job 事件、
+ * 业务卡和最终回答。
  */
-export function toolFoldSummary(cards: { title: string; state: string }[]): string {
+export function toolFoldSummary(cards: { title: string; state: string; tool?: string }[]): string {
   if (!cards.length) return '本轮工具调用'
-  const last = cards[cards.length - 1]
   const head = cards.length === 1 ? '1 次工具调用' : `${cards.length} 次工具调用`
-  const tail = [toolStateLabel(last.state), last.title].filter(Boolean).join(' · ')
-  return tail ? `${head} · 最近：${tail}` : head
+  const count = (state: string) => cards.filter((card) => card.state === state).length
+  const failed = count('error')
+  if (failed) return `${head} · ${failed} 项失败`
+  const waiting = count('pending_confirmation')
+  if (waiting) return `${head} · ${waiting} 项等待确认`
+  const active = cards.filter((card) => card.state === 'pending' || card.state === 'running').length
+  if (active) return `${head} · ${active} 项执行中`
+  const unknown = cards.filter(
+    (card) => !['completed', 'error', 'pending', 'running', 'pending_confirmation'].includes(card.state),
+  ).length
+  if (unknown) return `${head} · ${unknown} 项状态未知`
+  return `${head} · 工具调用已结束`
 }
 
 const TURN_STATUS_LABELS: Record<string, string> = {

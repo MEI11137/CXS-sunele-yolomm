@@ -18,6 +18,7 @@ import hashlib
 import io
 import json
 import mimetypes
+import os
 import sqlite3
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -94,6 +95,63 @@ def _limit_for(kind: str) -> int:
         "weight": MAX_WEIGHT_BYTES,
         "document": MAX_DOCUMENT_BYTES,
     }[kind]
+
+
+def _classify_zip_names(names: list[str]) -> dict:
+    """ZIP 里面的 ``data.pkl`` 才是权重，否则按数据集压缩包处理（与 ``sniff`` 同口径）。"""
+    if any(name.endswith("/data.pkl") or name == "data.pkl" for name in names):
+        return {"kind": "weight", "mime": "application/octet-stream", "meta": {}}
+    return {"kind": "archive", "mime": "application/zip", "meta": {}}
+
+
+def sniff_path(path: Path, filename: str) -> dict:
+    """按文件内容判断类型，**不为大文件整读进内存**。
+
+    * ZIP / 权重：只读文件头，再用 ``ZipFile(path)`` 读中央目录（不展开条目）；
+    * 图片：不超过 24MB 时读入内存做真实解码校验，超过就明确拒绝，
+      而不是先吃掉几百 MB 再报错。
+    分类口径与 :func:`sniff` 保持一致（同一个 ``data.pkl`` 判定）。
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        raise ApiError(404, "FILE_MISSING", "待登记的文件已不存在") from None
+    if size <= 0:
+        raise ApiError(400, "EMPTY_FILE", "文件是空的")
+    with open(path, "rb") as handle:
+        head = handle.read(4)
+    if head == b"PK\x03\x04":
+        try:
+            with zipfile.ZipFile(path) as archive:
+                names = archive.namelist()
+        except zipfile.BadZipFile:
+            # 头是 ZIP 但中央目录坏了：仍按数据集压缩包登记，让导入阶段报真实原因。
+            return {"kind": "archive", "mime": "application/zip", "meta": {}}
+        return _classify_zip_names(names)
+    if size > MAX_IMAGE_BYTES:
+        raise ApiError(
+            415,
+            "UNSUPPORTED_CONTENT",
+            f"这个文件（{filename or '未命名'}）不是 ZIP/权重，且超过图片上限 24MB，无法按内容识别",
+        )
+    image = _probe_image(path.read_bytes())
+    if image is not None:
+        return {"kind": "image", "mime": image["mime"], "meta": image}
+    raise ApiError(
+        415,
+        "UNSUPPORTED_CONTENT",
+        "只支持 JPEG/PNG/BMP/WEBP/TIFF 图片、ZIP 数据集和 .pt 权重；"
+        f"这个文件（{filename or '未命名'}）的真实内容不在支持范围内",
+    )
+
+
+def sha256_file(path: Path) -> str:
+    """流式计算 SHA256（分块读，不整文件进内存）。"""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 # --------------------------------------------------------------------------- 读写
@@ -219,6 +277,78 @@ def add_bytes(
         height=detected["meta"].get("height"),
         source_path=source_path,
         parent_id=parent_id,
+        meta=json.dumps(payload_meta, ensure_ascii=False),
+        created_at=security.now_iso(),
+    )
+    return public(row)
+
+
+def add_file(
+    conn,
+    user_id: int,
+    project_id: str,
+    *,
+    source: Path,
+    filename: str,
+    role: str | None = None,
+    session_id: str | None = None,
+    origin: str = "upload",
+    meta: dict | None = None,
+    asset_id: str | None = None,
+) -> dict:
+    """把项目内**已存在的文件**收编为资产（流式，不整文件进内存）。
+
+    与 :func:`add_bytes` 共用同一套内容识别、归属校验与落盘规则；区别只是字节
+    已经在磁盘上。``source`` 会被移动进资产目录（同卷 rename，失败才退回复制），
+    调用方不要再引用它。用于分块上传合并后的文件。
+
+    ``asset_id`` 允许调用方**预分配**身份（分块上传在 init 时就把 id 定下来）。
+    目标路径因此是确定的：崩溃后重试会落到同一个 ``assets/<kind>/<id>/<name>``，
+    不会因为 ``unique_path`` 多出一份没人认识的黑文件；是否已有同 id 资产由调用方先查。
+    """
+    root = storage.project_root(conn, user_id, project_id)
+    source = storage.guard(root, Path(source))
+    size = source.stat().st_size
+    detected = sniff_path(source, filename)
+    kind = detected["kind"]
+    if size > _limit_for(kind):
+        raise ApiError(413, "FILE_TOO_LARGE", f"文件超过上限（{_limit_for(kind) // (1024 * 1024)}MB）")
+    safe = storage.safe_name(filename, fallback=kind)
+    stable_id = str(asset_id or security.new_id("ast"))
+    directory = _store_dir(root, kind, stable_id)
+    # 每个资产独占一个目录，目录里只有这一个文件：用固定名字，重试覆盖同一路径。
+    target = storage.guard(root, directory / safe)
+    try:
+        os.replace(source, target)
+    except OSError:
+        # 跨卷或文件被占用：退回“流式复制 + 删除源文件”，仍然受 guard 约束。
+        storage.copy_into(root, source, target)
+        try:
+            source.unlink()
+        except OSError:
+            pass
+    digest = sha256_file(target)
+    rel = storage.relative(root, target)
+    payload_meta = dict(detected["meta"])
+    payload_meta.update(meta or {})
+    row = _insert(
+        conn,
+        id=stable_id,
+        project_id=str(project_id),
+        owner_id=int(user_id),
+        session_id=session_id,
+        kind=kind,
+        role=role or ROLE_FOR_KIND[kind],
+        origin=origin,
+        filename=target.name,
+        rel_path=rel,
+        mime=detected["mime"],
+        size=size,
+        sha256=digest,
+        width=detected["meta"].get("width"),
+        height=detected["meta"].get("height"),
+        source_path=None,
+        parent_id=None,
         meta=json.dumps(payload_meta, ensure_ascii=False),
         created_at=security.now_iso(),
     )

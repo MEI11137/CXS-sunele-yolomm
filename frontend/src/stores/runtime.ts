@@ -19,8 +19,8 @@ export const useRuntimeStore = defineStore('runtime', () => {
     error.value = ''
     try {
       const [healthData, metaData] = await Promise.all([
-        http.get<HealthData>('/health'),
-        http.get<MetaData>('/meta'),
+        http.get<HealthData>('/health', { timeoutMs: 8000 }),
+        http.get<MetaData>('/meta', { timeoutMs: 8000 }),
       ])
       health.value = healthData
       meta.value = metaData

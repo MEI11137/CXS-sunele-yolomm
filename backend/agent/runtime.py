@@ -17,6 +17,8 @@ class AgentRuntime:
     def __init__(self, settings, *, spawner=None) -> None:
         self.settings = settings
         self.gateway = ToolGateway(settings)
+        # 工具里的“目录绑定变更后终止旧轮次”与页面路由共用同一个运行时。
+        self.gateway.runtime = self
         self.manager = engine.EngineManager(settings, spawner=spawner, tokens=self.gateway)
         self.runner = runner.TurnRunner(settings, self.manager, self.gateway)
         self._started_at = time.time()

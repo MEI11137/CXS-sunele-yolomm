@@ -11,6 +11,7 @@ from flask import Blueprint, current_app, request
 from backend import auth, db, security
 from backend.errors import ApiError, ok
 from backend.services import followups as followup_service
+from backend.services import projects as project_service
 from backend.services import review as review_service
 
 bp = Blueprint("reviews", __name__)
@@ -53,12 +54,23 @@ def _key(payload: dict, prefix: str) -> str:
     return raw[:120] if raw else f"{prefix}:{security.new_token(12)}"
 
 
+def _limit(default: int = 50, maximum: int = 200) -> int:
+    """limit 参数显式校验：非法值返回 400，不再 500；0/负数与超上限都夹到合法区间。"""
+    raw = request.args.get("limit")
+    try:
+        value = int(raw if raw not in (None, "") else default)
+    except (TypeError, ValueError):
+        raise ApiError(400, "BAD_LIMIT", "limit 必须是整数") from None
+    return max(1, min(maximum, value))
+
+
 @bp.get("/projects/<project_id>/reviews")
 @auth.login_required
 def list_queue(project_id: str):
     raw = (request.args.get("record_ids") or "").strip()
     ids = [item.strip() for item in raw.split(",") if item.strip()] if raw else None
     conn = db.get_db()
+    project_service.get_owned(conn, project_id, int(_user()["id"]))
     return ok(
         review_service.queue(
             conn,
@@ -66,7 +78,8 @@ def list_queue(project_id: str):
             project_id,
             view=(request.args.get("view") or "pending").strip(),
             record_ids=ids,
-            limit=int(request.args.get("limit") or 50),
+            flow_id=(request.args.get("flow") or "").strip() or None,
+            limit=_limit(),
         )
     )
 
@@ -109,6 +122,7 @@ def review_events(project_id: str):
     except ValueError:
         raise ApiError(400, "BAD_LIMIT", "limit 必须是整数")
     conn = db.get_db()
+    project_service.get_owned(conn, project_id, int(_user()["id"]))
     if latest:
         if not record_id:
             raise ApiError(400, "BAD_REQUEST", "latest=1 需要同时带 record_id")

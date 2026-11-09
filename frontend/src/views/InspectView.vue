@@ -31,6 +31,14 @@ const model = computed<ModelSummary | null>(
 const multimodal = computed(() => model.value?.model_mode === 'multimodal')
 const secondary = computed(() => String(model.value?.secondary_modality ?? 'ir'))
 const secondaryLabel = computed(() => inspectSecondaryLabel(secondary.value))
+
+// 双模态模型必须拿到配图（edge 可用 RGB 派生顶替）。只让按钮“看起来能点”，
+// 再等服务端 409 VISION_X_REQUIRED，是之前审计里“门控与文案矛盾”的根因。
+const missingSecondary = computed(() => {
+  if (!multimodal.value) return false
+  if (secondary.value === 'edge') return !deriveEdge.value && !xId.value
+  return !xId.value
+})
 /** 模型绑定数据集的主模态：单 IR 模型的原图就是红外图，不是缺了 RGB。 */
 const primaryModality = computed<'rgb' | 'ir'>(() =>
   model.value?.dataset_primary_modality === 'ir' ? 'ir' : 'rgb',
@@ -40,6 +48,18 @@ const primaryLabel = computed(() =>
 )
 
 const images = ref<AssetSummary[]>([])
+
+// 同一张图常被重复上传（审计里 000232.jpg 有 4 份、 image.png 有 3 份），
+// 下拉只保留内容相同的一份，避免用户以为每份分辨率/来源不同。
+function uniqueBySha(items: AssetSummary[]): AssetSummary[] {
+  const seen = new Set<string>()
+  return items.filter((item) => {
+    const key = item.sha256 || item.id
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
 const rgbId = ref('')
 const xId = ref('')
 const deriveEdge = ref(true)
@@ -60,14 +80,20 @@ const hint = computed(() => {
 
 // 单 IR 模型：主图选择不再把 role=ir 的资产藏起来（它就是唯一的输入）。
 const rgbOptions = computed(() =>
-  images.value.filter((item) =>
-    primaryModality.value === 'ir'
-      ? item.role !== 'edge'
-      : item.role !== 'ir' && item.role !== 'edge',
+  uniqueBySha(
+    images.value.filter((item) =>
+      primaryModality.value === 'ir'
+        ? item.role !== 'edge'
+        : item.role !== 'ir' && item.role !== 'edge',
+    ),
   ),
 )
 const xOptions = computed(() =>
-  images.value.filter((item) => item.role === secondary.value || item.role === 'x' || item.role === 'image'),
+  uniqueBySha(
+    images.value.filter(
+      (item) => item.role === secondary.value || item.role === 'x' || item.role === 'image',
+    ),
+  ),
 )
 
 onMounted(async () => {
@@ -123,6 +149,13 @@ async function onUpload(event: Event, target: 'rgb' | 'x'): Promise<void> {
 async function submit(): Promise<void> {
   if (!model.value || !rgbId.value) {
     localError.value = `需要选择一个已发布模型和一张${primaryLabel.value}`
+    return
+  }
+  if (missingSecondary.value) {
+    localError.value =
+      secondary.value === 'edge'
+        ? '这个模型需要 edge 配图：请选择配图，或勾选由 RGB 派生边缘图'
+        : `这个模型需要 ${secondaryLabel.value} 配图，不能只用 RGB 检测`
     return
   }
   localError.value = ''
@@ -238,12 +271,17 @@ function openRecords(): void {
         <span v-if="images.length" class="hint">项目内已有 {{ images.length }} 张图片</span>
       </div>
       <p class="hint">{{ hint }}</p>
+      <p v-if="missingSecondary" class="form-error" role="status">
+        {{ secondary === 'edge'
+          ? '未选配图：请上传/选择 edge 图，或勾选由 RGB 派生边缘图。'
+          : `未选${secondaryLabel}配图：双模态模型必须提供该配图。` }}
+      </p>
 
       <div class="form-actions">
         <button
           class="primary small"
           type="button"
-          :disabled="!model || !rgbId || business.busy === 'detect'"
+          :disabled="!model || !rgbId || missingSecondary || business.busy === 'detect'"
           @click="submit"
         >
           {{ business.busy === 'detect' ? '检测中…' : '开始检测' }}

@@ -1,5 +1,5 @@
-import { ApiError, apiUrl, http } from '@/api/http'
-import type {
+import { ApiError, apiUrl, captureAuthScope, http, notifyUnauthorized } from '@/api/http'
+import type { DatasetPreview, 
   AssetSummary,
   BusinessJob,
   DatasetReport,
@@ -30,6 +30,7 @@ import type {
   TrainingDeviceCapabilities,
   TrainingPlan,
   TrainingRun,
+  WeightInspection,
 } from '@/types'
 
 /**
@@ -75,15 +76,102 @@ export async function registerAsset(
   })
 }
 
+/** 超过这个大小就走分块：WorkBuddy 前置网关对**单个请求体**有硬限制，加大会被 413。 */
+const CHUNK_THRESHOLD = 8 * 1024 * 1024
+const CHUNK_SIZE = 4 * 1024 * 1024
+
+export interface UploadProgress {
+  /** upload=正在传分块；merge=服务端正在合并 */
+  phase: 'upload' | 'merge'
+  loaded: number
+  total: number
+}
+
+export interface UploadSession {
+  id: string
+  status: string
+  filename: string
+  size: number
+  chunk_size: number
+  chunk_count: number
+  received_bytes: number
+  asset_id: string | null
+  expires_at: number
+}
+
+export interface UploadOptions {
+  role?: string
+  sessionId?: string
+  /** 可选进度回调：界面据此显示“已传 x%”与“合并中”。 */
+  onProgress?: (progress: UploadProgress) => void
+}
+
+function csrfHeader(): Record<string, string> {
+  const token = readCsrf()
+  return token ? { 'X-CSRF-Token': token } : {}
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
 /**
- * 上传：必须走 multipart，且**只**这个端点允许 multipart（后端有白名单）。
- * 这里不用 http 封装，因为它固定按 JSON 设置 Content-Type 与 CSRF 头。
+ * 统一解析后端信封；错误保留 HTTP 状态与机器码，界面能区分 409/413/429。
+ *
+ * scope 是发起请求时的账号代次：分块上传可能跨登录切换，旧账号迟到的 401
+ * 不能用来踢掉刚登录的新账号。
+ */
+async function readEnvelope<T>(
+  response: Response,
+  fallback: string,
+  scope = captureAuthScope(),
+): Promise<T> {
+  let payload: { code?: number; msg?: string; error?: string; data?: T } | null = null
+  try {
+    payload = await response.json()
+  } catch {
+    payload = null
+  }
+  // 旧账号的慢响应（无论 200 还是 401）都不能交给新账号的调用方继续使用。
+  if (scope !== captureAuthScope()) {
+    throw new ApiError(0, '登录账号已切换，已忽略旧请求结果', 'STALE_AUTH')
+  }
+  if (!response.ok || !payload || payload.code !== 0 || payload.data === undefined) {
+    // 上传/分块/文档这些直接 fetch 的入口也统一处理 401，不能只修 http.get/post。
+    if (scope === captureAuthScope()) notifyUnauthorized(response.status)
+    throw new ApiError(
+      response.status,
+      payload?.msg || `${fallback}（HTTP ${response.status}）`,
+      payload?.error ?? '',
+    )
+  }
+  return payload.data
+}
+
+async function sha256Hex(data: ArrayBuffer): Promise<string> {
+  if (!globalThis.crypto?.subtle) {
+    throw new ApiError(
+      0,
+      '当前环境不支持浏览器加密摘要（需要 HTTPS 或 localhost），无法做分块校验',
+      'NO_SUBTLE',
+    )
+  }
+  const digest = await crypto.subtle.digest('SHA-256', data)
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+/**
+ * 上传资产：小文件仍走原来的 multipart（兼容旧接口），大文件自动切成 4MiB 分块。
+ *
+ * 分块不是“前端提示换本机”，而是真正把每个请求体压到网关限制以下：
+ * 每个块带自己的 SHA256，服务端逐块校验、合并后按整文件 SHA256 登记资产。
  */
 export async function uploadAsset(
   projectId: string,
   file: File,
-  options: { role?: string; sessionId?: string } = {},
+  options: UploadOptions = {},
 ): Promise<AssetSummary> {
+  if (file.size > CHUNK_THRESHOLD) return uploadInChunks(projectId, file, options)
+
+  const scope = captureAuthScope()
   const form = new FormData()
   form.append('file', file, file.name)
   if (options.role) form.append('role', options.role)
@@ -95,16 +183,205 @@ export async function uploadAsset(
     credentials: 'same-origin',
     headers: token ? { 'X-CSRF-Token': token, Accept: 'application/json' } : { Accept: 'application/json' },
   })
-  let payload: { code?: number; msg?: string; error?: string; data?: { asset: AssetSummary } } | null = null
+  const data = await readEnvelope<{ asset: AssetSummary }>(response, '上传失败', scope)
+  return data.asset
+}
+
+async function uploadInChunks(
+  projectId: string,
+  file: File,
+  options: UploadOptions,
+): Promise<AssetSummary> {
+  const scope = captureAuthScope()
+  const created = await readEnvelope<{ upload: UploadSession }>(
+    await fetch(apiUrl(`${project(projectId)}/uploads`), {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json', ...csrfHeader() },
+      body: JSON.stringify({
+        filename: file.name,
+        size: file.size,
+        chunk_size: CHUNK_SIZE,
+        session_id: options.sessionId ?? null,
+        role: options.role ?? null,
+      }),
+    }),
+    '创建上传会话失败',
+    scope,
+  )
+  const upload = created.upload
+  let sent = 0
   try {
-    payload = await response.json()
+    for (let index = 0; index < upload.chunk_count; index += 1) {
+      const start = index * upload.chunk_size
+      const blob = file.slice(start, Math.min(start + upload.chunk_size, file.size))
+      const digest = await sha256Hex(await blob.arrayBuffer())
+      await putChunkWithRetry(projectId, upload.id, index, blob, digest, scope)
+      sent += blob.size
+      options.onProgress?.({ phase: 'upload', loaded: sent, total: file.size })
+    }
+    options.onProgress?.({ phase: 'merge', loaded: file.size, total: file.size })
+    return await finishWithRetry(projectId, upload.id, scope)
+  } catch (error) {
+    // 只有“确定服务端没有产生资产”才取消这次会话；结果未知（UPLOAD_UNKNOWN）时
+    // 不能 abort —— 那可能把已经合并好的资产对应的会话记录删掉，用户看到假失败。
+    const unknown = error instanceof ApiError && error.code === 'UPLOAD_UNKNOWN'
+    const stale = error instanceof ApiError && error.code === 'STALE_AUTH'
+    // 账号已切换时，旧上传既不能继续，也不能用新账号去 abort 旧会话（那会改新账号状态）。
+    if (!unknown && !stale) await abortUpload(projectId, upload.id)
+    throw error
+  }
+}
+
+/** 服务端已明确表态、不可能“稍后自愈”的错误：不要再拿状态查询去掩盖它们。 */
+const FINISH_FATAL = new Set([
+  'CHUNKS_MISSING',
+  'CHUNK_CORRUPTED',
+  'UPLOAD_SIZE_MISMATCH',
+  'UPLOAD_SHA_MISMATCH',
+  'CHUNK_CONFLICT',
+  'UPLOAD_STATE',
+  'UPLOAD_EXPIRED',
+  'UPLOAD_NOT_FOUND',
+  'UPLOAD_ABORTED',
+  'UPLOAD_ROOT_CHANGED',
+  'FILE_TOO_LARGE',
+  'NO_SUBTLE',
+  'STALE_AUTH',
+])
+
+/** 合并最多等这么久（大文件在巡检机上合并 + 扫毒/识别都要时间）。 */
+const FINISH_DEADLINE_MS = 120_000
+
+async function readUploadState(projectId: string, uploadId: string): Promise<UploadSession | null> {
+  try {
+    const data = await http.get<{ upload: UploadSession }>(
+      `${project(projectId)}/uploads/${uploadId}`,
+    )
+    return data.upload
   } catch {
-    payload = null
+    // 查不到就当“未知”，由调用方继续短重试；不要据此下结论。
+    return null
   }
-  if (!response.ok || !payload || payload.code !== 0 || !payload.data) {
-    throw new ApiError(response.status, payload?.msg || `上传失败（HTTP ${response.status}）`, payload?.error ?? '')
+}
+
+async function fetchAsset(projectId: string, assetId: string): Promise<AssetSummary> {
+  const data = await http.get<{ asset: AssetSummary }>(
+    `${project(projectId)}/assets/${encodeURIComponent(assetId)}`,
+  )
+  return data.asset
+}
+
+/**
+ * 合并：同 ID 重复调用是幂等的，所以网络失败/5xx/响应丢失时可以安心重问。
+ *
+ * 关键点：**首个 finish 可能已经在服务端成功，只是响应没回来**。这种情况下
+ * 直接抛“失败”会让用户重传，产生第二份资产。所以每次失败都先查一次会话状态：
+ * 已经是 completed 就把那个资产取回来。
+ */
+async function finishWithRetry(
+  projectId: string,
+  uploadId: string,
+  scope: number,
+): Promise<AssetSummary> {
+  const deadline = Date.now() + FINISH_DEADLINE_MS
+  let attempt = 0
+  const stale = () =>
+    new ApiError(0, '登录账号已切换，已忽略旧请求结果', 'STALE_AUTH')
+  while (Date.now() < deadline) {
+    if (scope !== captureAuthScope()) throw stale()
+    attempt += 1
+    try {
+      const data = await readEnvelope<{ asset: AssetSummary }>(
+        await fetch(apiUrl(`${project(projectId)}/uploads/${uploadId}/finish`), {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { Accept: 'application/json', 'Content-Type': 'application/json', ...csrfHeader() },
+          body: '{}',
+        }),
+        '合并上传文件失败',
+        scope,
+      )
+      return data.asset
+    } catch (error) {
+      const api = error instanceof ApiError ? error : null
+      if (api && FINISH_FATAL.has(api.code)) throw error
+      // UPLOAD_BUSY / 5xx / 断网 / 响应丢失：先问服务端到底成了没有。
+      if (scope !== captureAuthScope()) throw stale()
+      const state = await readUploadState(projectId, uploadId)
+      if (scope !== captureAuthScope()) throw stale()
+      if (state?.status === 'completed' && state.asset_id) {
+        return await fetchAsset(projectId, state.asset_id)
+      }
+      if (state?.status === 'aborted') {
+        throw new ApiError(409, '这次上传已取消', 'UPLOAD_ABORTED')
+      }
+      await sleep(Math.min(300 * attempt, 3000))
+    }
   }
-  return payload.data.asset
+  throw new ApiError(
+    0,
+    '合并结果还没有确认：文件可能已经保存成功，请不要重复上传，稍后刷新资产列表确认',
+    'UPLOAD_UNKNOWN',
+  )
+}
+
+async function putChunkWithRetry(
+  projectId: string,
+  uploadId: string,
+  index: number,
+  blob: Blob,
+  digest: string,
+  scope: number,
+): Promise<void> {
+  let lastError: unknown = null
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await readEnvelope(
+        await fetch(apiUrl(`${project(projectId)}/uploads/${uploadId}/chunks/${index}`), {
+          method: 'PUT',
+          credentials: 'same-origin',
+          body: blob,
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/octet-stream',
+            'X-Chunk-Sha256': digest,
+            ...csrfHeader(),
+          },
+        }),
+        `第 ${index + 1} 块上传失败`,
+        scope,
+      )
+      return
+    } catch (error) {
+      lastError = error
+      // 网络中断/5xx 重试；UPLOAD_BUSY 表示服务端正在合并，也值得等一等。
+      // STALE_AUTH 表示账号已切换，继续重试只会用新账号重复旧上传，必须立刻终止。
+      const retryable =
+        error instanceof ApiError && error.code === 'STALE_AUTH'
+          ? false
+          : !(error instanceof ApiError) ||
+            error.status >= 500 ||
+            error.status === 0 ||
+            error.code === 'UPLOAD_BUSY'
+      if (!retryable) throw error
+      await sleep(300 * (attempt + 1))
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('分块上传失败')
+}
+
+async function abortUpload(projectId: string, uploadId: string): Promise<void> {
+  try {
+    await fetch(apiUrl(`${project(projectId)}/uploads/${uploadId}/abort`), {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json', ...csrfHeader() },
+      body: '{}',
+    })
+  } catch {
+    // 尽力而为：残留由服务端过期清理兜底，不覆盖真正的上传错误。
+  }
 }
 
 function readCsrf(): string {
@@ -156,6 +433,13 @@ export async function listModels(
 ): Promise<{ models: ModelSummary[] }> {
   const suffix = includeDeleted ? '?include_deleted=1' : ''
   return http.get(`${project(projectId)}/models${suffix}`)
+}
+
+export async function inspectModel(
+  projectId: string,
+  payload: { asset_id?: string; rel_path?: string },
+): Promise<WeightInspection> {
+  return http.post(`${project(projectId)}/models/inspect`, payload)
 }
 
 export async function importModel(
@@ -349,7 +633,7 @@ export interface ReviewBoxPayload {
 
 export async function listReviewQueue(
   projectId: string,
-  params: { view?: string; record_ids?: string[]; limit?: number } = {},
+  params: { view?: string; record_ids?: string[]; flow?: string; limit?: number } = {},
 ): Promise<{
   view: string
   items: DetectionRecord[]
@@ -359,6 +643,7 @@ export async function listReviewQueue(
   const query = new URLSearchParams()
   if (params.view) query.set('view', params.view)
   if (params.record_ids?.length) query.set('record_ids', params.record_ids.join(','))
+  if (params.flow) query.set('flow', params.flow)
   if (params.limit) query.set('limit', String(params.limit))
   return http.get(`${project(projectId)}/reviews?${query.toString()}`)
 }
@@ -502,6 +787,13 @@ export async function matchRecords(
   })
 }
 
+export async function previewDataset(
+  projectId: string,
+  payload: { asset_id?: string; rel_path?: string },
+): Promise<DatasetPreview> {
+  return http.post(`${project(projectId)}/datasets/preview`, payload)
+}
+
 export async function reflowPreview(
   projectId: string,
   payload: {
@@ -642,6 +934,7 @@ export async function uploadDocument(
   file: File,
   name?: string,
 ): Promise<ProjectDocument> {
+  const scope = captureAuthScope()
   const form = new FormData()
   form.append('file', file, file.name)
   if (name) form.append('name', name)
@@ -658,7 +951,11 @@ export async function uploadDocument(
   } catch {
     payload = null
   }
+  if (scope !== captureAuthScope()) {
+    throw new ApiError(0, '登录账号已切换，已忽略旧请求结果', 'STALE_AUTH')
+  }
   if (!response.ok || !payload || payload.code !== 0 || !payload.data) {
+    if (scope === captureAuthScope()) notifyUnauthorized(response.status)
     throw new ApiError(response.status, payload?.msg || `上传失败（HTTP ${response.status}）`, payload?.error ?? '')
   }
   return payload.data.document

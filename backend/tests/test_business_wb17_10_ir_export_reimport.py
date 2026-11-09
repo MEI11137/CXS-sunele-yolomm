@@ -123,6 +123,56 @@ class IRReferenceReimportTest(BusinessBase):
         self.assertEqual(config["val"], "images/val")
         self.assertEqual(config["path"], "raw")
 
+    def test_auto_infers_modalities_from_data_yaml(self):
+        # 省略 modalities 时，导入端必须按 data.yaml 的 modalities 自己识别，
+        # 不能把真实 RGB+IR 数据集默默当单 RGB 导入。
+        rel = self._source("auto")
+        conn = self.conn()
+        try:
+            dataset = dataset_service.import_dataset(
+                conn,
+                self.alice["id"],
+                self.project["id"],
+                name="IR 自动识别",
+                modalities=None,
+                secondary_modality=None,
+                reference_modality=None,
+                classes=NAMES,
+                rel_path=rel,
+            )
+        finally:
+            conn.close()
+        self.assertEqual(dataset["reference_modality"], "ir")
+        self.assertEqual(dataset["primary_modality"], "ir")
+        self.assertEqual(dataset["secondary_modality"], "rgb")
+        self.assertEqual(dataset["modalities"], ["ir", "rgb"])
+
+    def test_auto_inference_falls_back_to_rgb_without_modalities(self):
+        rel = f"uploads/rgb-auto-{secrets.token_hex(4)}"
+        base = storage.project_dir(self.root, *rel.split("/"))
+        for split in ("train", "val"):
+            storage.write_bytes(self.root, base / "images" / split / "a.png", png_bytes(120, 90, (30, 60, 90)))
+            storage.write_bytes(self.root, base / "labels" / split / "a.txt", _label().encode())
+        config = {"path": ".", "nc": 1, "names": NAMES, "train": "images/train", "val": "images/val"}
+        storage.write_bytes(
+            self.root, base / "data.yaml", yaml.safe_dump(config, allow_unicode=True).encode("utf-8")
+        )
+        conn = self.conn()
+        try:
+            dataset = dataset_service.import_dataset(
+                conn,
+                self.alice["id"],
+                self.project["id"],
+                name="RGB 自动回退",
+                modalities=None,
+                classes=NAMES,
+                rel_path=rel,
+            )
+        finally:
+            conn.close()
+        self.assertEqual(dataset["reference_modality"], "rgb")
+        self.assertEqual(dataset["modalities"], ["rgb"])
+
     def test_changed_auxiliary_label_is_not_deduplicated(self):
         rel = self._source("aux-label")
         first = self._import(rel, "IR 集")

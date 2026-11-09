@@ -25,6 +25,15 @@ def _assert_project(conn, project_id: str, user_id: int) -> None:
     project_service.get_owned(conn, project_id, user_id)
 
 
+def _limit(default: int = 50, maximum: int = 200) -> int:
+    raw = request.args.get("limit")
+    try:
+        value = int(raw if raw not in (None, "") else default)
+    except (TypeError, ValueError):
+        raise ApiError(400, "BAD_LIMIT", "limit 必须是整数") from None
+    return max(1, min(maximum, value))
+
+
 @bp.get("/projects/<project_id>/datasets")
 @auth.login_required
 def list_datasets(project_id: str):
@@ -35,8 +44,26 @@ def list_datasets(project_id: str):
             conn,
             int(_user()["id"]),
             project_id,
-            limit=int(request.args.get("limit") or 50),
+            limit=_limit(50),
             deleted=(request.args.get("deleted") or "exclude").strip(),
+        )
+    )
+
+
+@bp.post("/projects/<project_id>/datasets/preview")
+@auth.login_required
+def preview_dataset(project_id: str):
+    """只读识别 ZIP/目录的建议名称、类别、模态与划分；不创建任何数据集。"""
+    payload = request.get_json(silent=True) or {}
+    conn = db.get_db()
+    _assert_project(conn, project_id, int(_user()["id"]))
+    return ok(
+        dataset_service.preview_source(
+            conn,
+            int(_user()["id"]),
+            project_id,
+            asset_id=payload.get("asset_id") or None,
+            rel_path=payload.get("rel_path") or None,
         )
     )
 
@@ -45,9 +72,14 @@ def list_datasets(project_id: str):
 @auth.login_required
 def import_dataset(project_id: str):
     payload = request.get_json(silent=True) or {}
-    modalities = payload.get("modalities") or ["rgb"]
-    if not isinstance(modalities, list):
+    modalities_payload = payload.get("modalities")
+    if modalities_payload is None:
+        # 省略 modalities = 按压缩包内 data.yaml 自动识别主/辅模态。
+        modalities = None
+    elif not isinstance(modalities_payload, list):
         raise ApiError(400, "VALIDATION", "modalities 必须是数组")
+    else:
+        modalities = [str(item) for item in modalities_payload]
     classes = payload.get("classes")
     if classes is not None and not isinstance(classes, list):
         raise ApiError(400, "VALIDATION", "classes 必须是数组")
@@ -57,7 +89,7 @@ def import_dataset(project_id: str):
         int(_user()["id"]),
         project_id,
         name=str(payload.get("name") or ""),
-        modalities=[str(item) for item in modalities],
+        modalities=modalities,
         secondary_modality=payload.get("secondary_modality"),
         reference_modality=payload.get("reference_modality"),
         classes=[str(item) for item in classes] if classes else None,
@@ -86,7 +118,7 @@ def list_samples(project_id: str, dataset_id: str):
             project_id,
             dataset_id,
             split=(request.args.get("split") or "").strip() or None,
-            limit=int(request.args.get("limit") or 200),
+            limit=_limit(200),
         )
     )
 
@@ -186,6 +218,7 @@ def download_export(project_id: str, dataset_id: str):
 @auth.login_required
 def list_reflow_drafts(project_id: str):
     conn = db.get_db()
+    _assert_project(conn, project_id, int(_user()["id"]))
     return ok(
         reflow_service.list_drafts(
             conn,

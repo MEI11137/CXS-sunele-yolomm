@@ -69,7 +69,7 @@ export const useAgentStore = defineStore('agent', () => {
    */
   const pendingRequest = new Map<
     string,
-    { requestId: string; content: string; assetIds: string[] }
+    { requestId: string; content: string; assetIds: string[]; contextKey: string }
   >()
 
   const modes = computed(() => preferences.value?.modes ?? capabilities.value?.modes ?? [])
@@ -101,20 +101,28 @@ export const useAgentStore = defineStore('agent', () => {
   // ------------------------------------------------------------------ 读取
 
   async function loadCapabilities(): Promise<void> {
+    const token = generation
     loading.value = true
     try {
-      capabilities.value = await http.get<AgentCapabilities>('/agent/capabilities')
+      const data = await http.get<AgentCapabilities>('/agent/capabilities')
+      if (token !== generation) return
+      capabilities.value = data
     } catch (failure) {
+      if (token !== generation) return
       error.value = errorMessage(failure)
     } finally {
-      loading.value = false
+      if (token === generation) loading.value = false
     }
   }
 
   async function loadPreferences(): Promise<void> {
+    const token = generation
     try {
-      preferences.value = await http.get<AgentPreferences>('/me/preferences')
+      const data = await http.get<AgentPreferences>('/me/preferences')
+      if (token !== generation) return
+      preferences.value = data
     } catch (failure) {
+      if (token !== generation) return
       error.value = errorMessage(failure)
     }
   }
@@ -187,10 +195,19 @@ export const useAgentStore = defineStore('agent', () => {
     sessionId: string,
     content: string,
     assetIds: string[] = [],
+    selection: { page: string; recordIds: string[] } | null = null,
   ): Promise<boolean> {
     const text = content.trim()
     if (!text || sending.value) return false
     const assets = [...assetIds]
+    // 冻结本次发送的界面选择快照：后端会逐条校验归属，模型据此知道
+    // “这条/这些/所选记录”具体指哪些 record_id，而不是只看到聊天正文。
+    const contextIds = selection ? [...new Set(selection.recordIds)] : []
+    const uiContext =
+      contextIds.length > 0
+        ? { page: selection!.page.slice(0, 80), record_ids: contextIds }
+        : null
+    const contextKey = uiContext ? JSON.stringify(uiContext) : ''
     sending.value = true
     error.value = ''
     notice.value = ''
@@ -201,9 +218,15 @@ export const useAgentStore = defineStore('agent', () => {
       pending &&
       pending.content === text &&
       pending.assetIds.length === assets.length &&
-      pending.assetIds.every((item, index) => item === assets[index])
+      pending.assetIds.every((item, index) => item === assets[index]) &&
+      pending.contextKey === contextKey
     const requestId = sameAsPending ? pending!.requestId : newRequestId()
-    pendingRequest.set(sessionId, { requestId, content: text, assetIds: assets })
+    pendingRequest.set(sessionId, {
+      requestId,
+      content: text,
+      assetIds: assets,
+      contextKey,
+    })
     try {
       const data = await http.post<{
         turn: Turn
@@ -215,6 +238,7 @@ export const useAgentStore = defineStore('agent', () => {
         content: text,
         request_id: requestId,
         asset_ids: assets,
+        ...(uiContext ? { ui_context: uiContext } : {}),
       })
       pendingRequest.delete(sessionId)
       adopt(data.turn, data.events ?? [], data.actions ?? [])
@@ -367,6 +391,11 @@ export const useAgentStore = defineStore('agent', () => {
       const merged = new Map((actions[turn.id] ?? []).map((item) => [item.id, item]))
       for (const action of turnActions) merged.set(action.id, action)
       actions[turn.id] = [...merged.values()]
+      // 轮次进行中就把新提出的待确认动作同步进会话级缓存：
+      // 底部确认卡只读 pending(sessionId)，不能等到终态才出现。
+      const pending = new Map((sessionActions[turn.session_id] ?? []).map((item) => [item.id, item]))
+      for (const action of turnActions) pending.set(action.id, action)
+      sessionActions[turn.session_id] = [...pending.values()]
     }
     refreshBusiness(scopes)
     if (isTerminalStatus(turn.status)) {
@@ -475,6 +504,12 @@ export const useAgentStore = defineStore('agent', () => {
     stopping.value = false
     deciding.value = ''
   }
+
+  /**
+   * 说明：页面勾选不再由这里“新建会话 + 跳页”交接。
+   * 选择由 useSelectionStore 自动注册，普通发送时冻结快照走 ui_context；
+   * 这样用户可以直接在右侧既有对话说“我选中的这些”，上下文不割裂。
+   */
 
   return {
     capabilities,

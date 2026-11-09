@@ -22,6 +22,10 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   const projects = ref<Project[]>([])
   const deletedProjects = ref<Project[]>([])
   const deletedSessions = ref<ChatSession[]>([])
+  const trashLoading = ref(false)
+  // 项目列表的专属错误：通用 run() 的 error 会被其它成功请求清掉，
+  // 但侧栏必须一直显示“加载失败 + 重试”，不能被后续会话/回收站请求抹掉。
+  const projectsError = ref('')
   const sessionsByProject = reactive<Record<string, ChatSession[]>>({})
   const messagesBySession = reactive<Record<string, ChatMessage[]>>({})
   const pagingBySession = reactive<Record<string, { hasMore: boolean; nextBefore: number | null }>>({})
@@ -34,6 +38,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   const currentProjectId = ref(localStorage.getItem(PROJECT_KEY) ?? '')
   /** sessionId -> 最近一次读取的代次；只有代次相同的返回才允许落盘。 */
   const loadGeneration = new Map<string, number>()
+  /** 账号代次：登出/失效/换号时 +1，旧账号迟到的读取与错误都不得回填。 */
+  let generation = 0
   const loading = ref(false)
   /** 第一次成功读到项目列表。删当前项目后的路由收尾要等它，避免首屏空列表误跳。 */
   const projectsReady = ref(false)
@@ -48,15 +54,17 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   )
 
   async function run<T>(task: () => Promise<T>): Promise<T | null> {
+    const token = generation
     loading.value = true
     error.value = ''
     try {
       return await task()
     } catch (failure) {
-      error.value = errorMessage(failure)
+      // 旧账号的慢失败不能把错误写到新账号界面上。
+      if (token === generation) error.value = errorMessage(failure)
       return null
     } finally {
-      loading.value = false
+      if (token === generation) loading.value = false
     }
   }
 
@@ -83,28 +91,45 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   }
 
   async function loadProjects(): Promise<void> {
+    const token = generation
+    projectsError.value = ''
     await run(async () => {
       const data = await http.get<{ projects: Project[] }>('/projects')
+      if (token !== generation) return
       projects.value = data.projects
       projectsReady.value = true
     })
+    if (token === generation && !projectsReady.value) {
+      projectsError.value = error.value || '项目列表加载失败，请检查网络后重试。'
+    }
   }
 
   async function loadTrash(): Promise<void> {
-    await run(async () => {
-      const [deleted, active] = await Promise.all([
-        http.get<{ projects: Project[] }>('/projects?trash=1'),
-        http.get<{ projects: Project[] }>('/projects'),
-      ])
-      deletedProjects.value = deleted.projects
-      deletedSessions.value = []
-      for (const project of active.projects) {
-        const data = await http.get<{ sessions: ChatSession[] }>(
-          `/projects/${project.id}/sessions?trash=1`,
+    const token = generation
+    trashLoading.value = true
+    try {
+      await run(async () => {
+        const [deleted, active] = await Promise.all([
+          http.get<{ projects: Project[] }>('/projects?trash=1'),
+          http.get<{ projects: Project[] }>('/projects'),
+        ])
+        if (token !== generation) return
+        deletedProjects.value = deleted.projects
+        // 并行拉取各项目的已删除会话：串行时 10 个项目要 10s+，期间页面会显示假空态。
+        const batches = await Promise.all(
+          active.projects.map(async (project) => {
+            const data = await http.get<{ sessions: ChatSession[] }>(
+              `/projects/${project.id}/sessions?trash=1`,
+            )
+            return token === generation ? data.sessions : []
+          }),
         )
-        deletedSessions.value.push(...data.sessions)
-      }
-    })
+        if (token !== generation) return
+        deletedSessions.value = batches.flat()
+      })
+    } finally {
+      if (token === generation) trashLoading.value = false
+    }
   }
 
   async function createProject(name: string, description = ''): Promise<Project | null> {
@@ -176,8 +201,10 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   }
 
   async function loadSessions(projectId: string): Promise<void> {
+    const token = generation
     await run(async () => {
       const data = await http.get<{ sessions: ChatSession[] }>(`/projects/${projectId}/sessions`)
+      if (token !== generation) return
       sessionsByProject[projectId] = data.sessions
     })
   }
@@ -249,12 +276,14 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   ): Promise<void> {
     const before = options.before
     if (!before && !force && (messagesBySession[sessionId] ?? []).length) return
-    const generation = (loadGeneration.get(sessionId) ?? 0) + 1
-    loadGeneration.set(sessionId, generation)
+    const token = generation
+    const generationForSession = (loadGeneration.get(sessionId) ?? 0) + 1
+    loadGeneration.set(sessionId, generationForSession)
     const query = before ? `?before=${before}` : ''
     try {
       const data = await http.get<MessagePage>(`/sessions/${sessionId}/messages${query}`)
-      if (loadGeneration.get(sessionId) !== generation) return
+      if (token !== generation) return
+      if (loadGeneration.get(sessionId) !== generationForSession) return
       if (before) {
         const existing = messagesBySession[sessionId] ?? []
         const known = new Set(existing.map((item) => item.id))
@@ -268,7 +297,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       pagingBySession[sessionId] = { hasMore: data.has_more, nextBefore: data.next_before }
       error.value = ''
     } catch (failure) {
-      if (loadGeneration.get(sessionId) !== generation) return
+      if (token !== generation) return
+      if (loadGeneration.get(sessionId) !== generationForSession) return
       error.value = errorMessage(failure)
     }
   }
@@ -295,9 +325,12 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   }
 
   function reset(): void {
+    generation += 1
     projects.value = []
     deletedProjects.value = []
     deletedSessions.value = []
+    trashLoading.value = false
+    projectsError.value = ''
     currentSessionId.value = ''
     projectsReady.value = false
     error.value = ''
@@ -314,6 +347,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     projects,
     deletedProjects,
     deletedSessions,
+    trashLoading,
+    projectsError,
     sessionsByProject,
     messages,
     messagesBySession,

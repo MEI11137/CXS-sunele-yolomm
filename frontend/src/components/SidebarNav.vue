@@ -4,9 +4,9 @@ import { RouterLink, useRoute, useRouter } from 'vue-router'
 import DialogShell from '@/components/DialogShell.vue'
 import NewProjectDialog from '@/components/NewProjectDialog.vue'
 import SidebarIcon from '@/components/SidebarIcon.vue'
+import { errorMessage } from '@/api/http'
 import { useAuthStore } from '@/stores/auth'
-import { useAgentStore } from '@/stores/agent'
-import { useConnectionStore } from '@/stores/connection'
+import { resetUserScopedStores } from '@/stores/sessionReset'
 import { useRuntimeStore } from '@/stores/runtime'
 import { useWorkspaceStore } from '@/stores/workspace'
 import type { ChatSession, Project } from '@/types'
@@ -26,18 +26,38 @@ import type { ChatSession, Project } from '@/types'
 const auth = useAuthStore()
 const runtime = useRuntimeStore()
 const workspace = useWorkspaceStore()
-const connection = useConnectionStore()
-const agent = useAgentStore()
 const router = useRouter()
 const route = useRoute()
 
+/** 侧栏偏好：排序方式与展开的项目。只存本地显示偏好，不进账号资料。 */
+const SORT_KEY = 'hx17-sb-sort'
+const EXPANDED_KEY = 'hx17-sb-expanded'
+
+function readSortMode(): 'recent' | 'name' {
+  try {
+    return window.localStorage.getItem(SORT_KEY) === 'name' ? 'name' : 'recent'
+  } catch {
+    return 'recent'
+  }
+}
+
+function readExpandedIds(): string[] {
+  try {
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(EXPANDED_KEY) ?? '[]')
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : []
+  } catch {
+    return []
+  }
+}
+
 /** 每个工作区的展开状态；当前路由所在的工作区由 watch 自动展开。 */
 const expanded = reactive<Record<string, boolean>>({})
+for (const id of readExpandedIds()) expanded[id] = true
 const search = ref('')
 const searchOpen = ref(false)
 const searchInput = ref<HTMLInputElement | null>(null)
 const createOpen = ref(false)
-const sortMode = ref<'recent' | 'name'>('recent')
+const sortMode = ref<'recent' | 'name'>(readSortMode())
 const creating = ref('')
 /** 相对时间的基准：每分钟推一次，避免页面挂着不刷新导致“刚刚”永远不变。 */
 const now = ref(Date.now())
@@ -351,6 +371,25 @@ watch(
   { immediate: true },
 )
 
+watch(sortMode, (mode) => {
+  try {
+    window.localStorage.setItem(SORT_KEY, mode)
+  } catch {
+    /* 本地存储不可用只影响偏好记忆，不影响本次会话内的排序。 */
+  }
+})
+
+watch(
+  () => Object.keys(expanded).filter((id) => expanded[id]).sort().join(','),
+  (ids) => {
+    try {
+      window.localStorage.setItem(EXPANDED_KEY, JSON.stringify(ids ? ids.split(',') : []))
+    } catch {
+      /* 同上：存不下就只保留本次会话内的展开状态。 */
+    }
+  },
+)
+
 onMounted(() => {
   clock = window.setInterval(() => {
     now.value = Date.now()
@@ -363,12 +402,23 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydown)
 })
 
+const loggingOut = ref(false)
+const logoutError = ref('')
+
 async function logout(): Promise<void> {
-  await auth.logout()
-  agent.reset()
-  workspace.reset()
-  connection.reset()
-  await router.replace({ name: 'login' })
+  if (loggingOut.value) return
+  loggingOut.value = true
+  logoutError.value = ''
+  try {
+    await auth.logout()
+    resetUserScopedStores()
+    await router.replace({ name: 'login' })
+  } catch (exc) {
+    // 后端 503/断网时服务端会话没有确认吊销，保持登录态原样，不假装已经安全退出。
+    logoutError.value = `退出未完成：${errorMessage(exc)}。请检查网络后重试。`
+  } finally {
+    loggingOut.value = false
+  }
 }
 </script>
 
@@ -396,12 +446,12 @@ async function logout(): Promise<void> {
     </div>
 
     <div class="sb-section" :class="{ 'sb-searching': searchOpen }">
-      <span v-show="!searchOpen" class="sb-section-label">工作区</span>
+      <span v-show="!searchOpen" class="sb-section-label">项目</span>
       <div class="sb-search">
         <button
           class="sb-icon"
           type="button"
-          :aria-label="searchOpen ? '收起搜索' : '搜索工作区或会话'"
+          :aria-label="searchOpen ? '收起搜索' : '搜索项目或会话'"
           :aria-expanded="searchOpen"
           @click="toggleSearch"
         >
@@ -413,8 +463,8 @@ async function logout(): Promise<void> {
             v-model="search"
             class="sb-search-input"
             type="search"
-            placeholder="搜索工作区或会话"
-            aria-label="搜索工作区或会话"
+            placeholder="搜索项目或会话"
+            aria-label="搜索项目或会话"
             @keydown.esc="closeSearch"
           />
           <button
@@ -438,13 +488,13 @@ async function logout(): Promise<void> {
         >
           <SidebarIcon name="sort" :size="15" />
         </button>
-        <button class="sb-icon" type="button" aria-label="新建工作区" @click="createOpen = true">
+        <button class="sb-icon" type="button" aria-label="新建项目" @click="createOpen = true">
           <SidebarIcon name="folder-plus" :size="16" />
         </button>
       </div>
     </div>
 
-    <div class="sb-tree" role="tree" aria-label="工作区与会话">
+    <div class="sb-tree" role="tree" aria-label="项目与会话">
       <template v-for="group in groups" :key="group.project.id">
         <div
           class="sb-workspace"
@@ -463,7 +513,7 @@ async function logout(): Promise<void> {
             class="sb-chevron"
             :class="{ 'sb-chevron-open': isOpen(group.project.id) }"
             type="button"
-            :aria-label="`${isOpen(group.project.id) ? '折叠' : '展开'}工作区 ${group.project.name}`"
+            :aria-label="`${isOpen(group.project.id) ? '折叠' : '展开'}项目 ${group.project.name}`"
             @click.stop="toggle(group.project.id)"
           >
             <SidebarIcon name="chevron" :size="10" />
@@ -526,8 +576,12 @@ async function logout(): Promise<void> {
         </div>
       </template>
 
-      <p v-if="!groups.length" class="sb-empty sb-empty-root">
-        {{ query ? '没有匹配的工作区或会话' : '还没有工作区。点右上角文件夹图标新建。' }}
+      <div v-if="!groups.length && workspace.projectsError && !workspace.projects.length" class="sb-empty sb-empty-root">
+        <p>项目加载失败：{{ workspace.projectsError }}</p>
+        <button class="ghost small" type="button" @click="workspace.loadProjects()">重试</button>
+      </div>
+      <p v-else-if="!groups.length" class="sb-empty sb-empty-root">
+        {{ query ? '没有匹配的项目或会话' : '还没有项目。点右上角文件夹图标新建。' }}
       </p>
     </div>
 
@@ -551,11 +605,19 @@ async function logout(): Promise<void> {
           <span>本机管理</span>
         </RouterLink>
       </nav>
+      <p v-if="logoutError" class="sb-logout-error" role="alert">{{ logoutError }}</p>
       <div class="sb-user">
         <span class="sb-avatar" aria-hidden="true">{{ initial }}</span>
         <span class="sb-user-name" :title="auth.user?.username">{{ auth.user?.display_name || auth.user?.username }}</span>
         <span class="sb-role">{{ auth.isAdmin ? '管理员' : '普通用户' }}</span>
-        <button class="sb-icon" type="button" aria-label="退出登录" title="退出登录" @click="logout">
+        <button
+          class="sb-icon"
+          type="button"
+          aria-label="退出登录"
+          title="退出登录"
+          :disabled="loggingOut"
+          @click="logout"
+        >
           <SidebarIcon name="logout" :size="15" />
         </button>
       </div>
@@ -567,7 +629,7 @@ async function logout(): Promise<void> {
       <div v-if="menu" class="sb-menu-scrim" @click="menu = null" @contextmenu.prevent="menu = null"></div>
       <div v-if="menu" class="sb-pop" :style="menuStyle" role="menu">
         <template v-if="menu.kind === 'new'">
-          <p class="sb-pop-title">选择工作区开始新会话</p>
+          <p class="sb-pop-title">选择项目开始新会话</p>
           <button
             v-for="group in groups"
             :key="group.project.id"
@@ -582,7 +644,7 @@ async function logout(): Promise<void> {
           <div class="sb-pop-sep"></div>
           <button class="sb-pop-item" type="button" role="menuitem" @click="menu = null; createOpen = true">
             <SidebarIcon name="folder-plus" :size="15" />
-            <span class="sb-pop-item-text">新建工作区</span>
+            <span class="sb-pop-item-text">新建项目</span>
           </button>
         </template>
 
@@ -599,9 +661,9 @@ async function logout(): Promise<void> {
         </template>
 
         <template v-else-if="menu.kind === 'project'">
-          <button class="sb-pop-item" type="button" role="menuitem" @click="startProjectRename">重命名工作区</button>
+          <button class="sb-pop-item" type="button" role="menuitem" @click="startProjectRename">重命名项目</button>
           <div class="sb-pop-sep"></div>
-          <button class="sb-pop-item sb-danger" type="button" role="menuitem" @click="removeProject">删除工作区</button>
+          <button class="sb-pop-item sb-danger" type="button" role="menuitem" @click="removeProject">删除项目</button>
         </template>
 
         <template v-else>
@@ -614,7 +676,7 @@ async function logout(): Promise<void> {
 
     <DialogShell
       :open="renaming !== null"
-      :title="renaming?.kind === 'project' ? '重命名工作区' : '重命名会话'"
+      :title="renaming?.kind === 'project' ? '重命名项目' : '重命名会话'"
       @close="renaming = null"
     >
       <label class="field">
@@ -1056,6 +1118,22 @@ async function logout(): Promise<void> {
   height: 34px;
   padding: 0 4px 0 6px;
   margin-top: 2px;
+}
+
+.sb-logout-error {
+  margin: 2px 6px 0;
+  padding: 6px 8px;
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  color: var(--danger);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.sb-user .sb-icon:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .sb-avatar {

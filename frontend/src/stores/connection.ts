@@ -12,6 +12,8 @@ export const useConnectionStore = defineStore('connection', () => {
   const error = ref('')
   const notice = ref('')
   const loaded = ref(false)
+  /** 账号代次：登出/换号后旧账号迟到的连接信息与 401 都不得影响新账号。 */
+  let generation = 0
 
   const hasConnection = computed(() => connection.value !== null)
   const capabilitiesValid = computed(
@@ -20,25 +22,31 @@ export const useConnectionStore = defineStore('connection', () => {
 
   async function loadProviders(): Promise<void> {
     if (providers.value.length) return
+    const token = generation
     try {
       const data = await http.get<{ providers: ProviderPreset[] }>('/connections/providers')
+      if (token !== generation) return
       providers.value = data.providers
     } catch (failure) {
+      if (token !== generation) return
       error.value = errorMessage(failure)
     }
   }
 
   async function load(): Promise<void> {
+    const token = generation
     loading.value = true
     error.value = ''
     try {
       const data = await http.get<{ connection: ModelConnection | null }>('/connections/me')
+      if (token !== generation) return
       connection.value = data.connection
       loaded.value = true
     } catch (failure) {
+      if (token !== generation) return
       error.value = errorMessage(failure)
     } finally {
-      loading.value = false
+      if (token === generation) loading.value = false
     }
   }
 
@@ -66,19 +74,22 @@ export const useConnectionStore = defineStore('connection', () => {
   }
 
   async function check(): Promise<boolean> {
+    const token = generation
     checking.value = true
     error.value = ''
     notice.value = ''
     try {
       const data = await http.post<{ connection: ModelConnection }>('/connections/me/check', {})
+      if (token !== generation) return false
       connection.value = data.connection
       notice.value = data.connection.summary ?? '检查完成'
       return true
     } catch (failure) {
+      if (token !== generation) return false
       error.value = errorMessage(failure)
       return false
     } finally {
-      checking.value = false
+      if (token === generation) checking.value = false
     }
   }
 
@@ -99,6 +110,7 @@ export const useConnectionStore = defineStore('connection', () => {
   }
 
   function reset(): void {
+    generation += 1
     connection.value = null
     loaded.value = false
     error.value = ''

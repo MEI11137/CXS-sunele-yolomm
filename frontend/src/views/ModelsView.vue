@@ -2,12 +2,13 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import * as api from '@/api/business'
+import type { UploadProgress } from '@/api/business'
 import { errorCode, errorMessage } from '@/api/http'
 import { formatBytes } from '@/lib/business'
 import { useBusinessStore } from '@/stores/business'
 import { useSyncStore } from '@/stores/sync'
 import TrainingPanel from '@/components/TrainingPanel.vue'
-import type { ModelSummary } from '@/types'
+import type { ModelSummary, WeightInspection } from '@/types'
 
 /**
  * 模型页：导入 PT、显式确认类别映射、发布到**本项目**。
@@ -33,23 +34,42 @@ const showImport = ref(false)
 const showTraining = ref(false)
 const presetDatasetId = ref('')
 
-const form = ref({
-  name: '',
-  family: 'yolomm' as 'yolo' | 'yolomm',
-  secondary: 'ir' as '' | 'ir' | 'edge' | 'depth',
-  datasetId: '',
-  relPath: 'weights/best.pt',
-  assetId: '',
-})
-const weights = ref<{ id: string; filename: string; size: number }[]>([])
+function defaultImportForm() {
+  return {
+    name: '',
+    family: 'yolomm' as 'yolo' | 'yolomm',
+    secondary: 'ir' as '' | 'ir' | 'edge' | 'depth',
+    datasetId: '',
+    // 不再预填 weights/best.pt：默认值会让人只写名称就能提交，误把旧权重登记成新模型。
+    relPath: '',
+    assetId: '',
+  }
+}
+const form = ref(defaultImportForm())
+const weights = ref<{ id: string; filename: string; size: number; createdAt: string }[]>([])
+const weightsLoading = ref(false)
+const weightsError = ref('')
 const mapping = ref<{
   native: { index: number; name: string }[]
   target: string[]
   values: Record<string, string>
 } | null>(null)
 const localError = ref('')
+const inspection = ref<WeightInspection | null>(null)
+const inspecting = ref(false)
+const inspectError = ref('')
 const uploading = ref(false)
+const weightProgress = ref<UploadProgress | null>(null)
+const weightLabel = computed(() => {
+  if (!uploading.value) return '上传 .pt'
+  const current = weightProgress.value
+  if (!current) return '上传中…'
+  if (current.phase === 'merge') return '合并中…'
+  const percent = current.total ? Math.floor((current.loaded / current.total) * 100) : 0
+  return `上传中 ${percent}%`
+})
 const deletedModels = ref<ModelSummary[]>([])
+const trashLoaded = ref(false)
 const showTrash = ref(false)
 const trainingLock = ref<{ held: boolean; run_id: string }>({ held: false, run_id: '' })
 const notesDraft = ref<Record<string, string>>({})
@@ -88,6 +108,9 @@ async function loadDeleted(): Promise<void> {
     deletedModels.value = data.models.filter((model) => Boolean(model.deleted_at))
   } catch {
     deletedModels.value = []
+  } finally {
+    // 未加载完时页面不显示“0”，避免把加载中误读成回收站为空。
+    trashLoaded.value = true
   }
 }
 
@@ -110,13 +133,16 @@ async function runModel(action: 'unpublish' | 'delete' | 'restore', model: Model
 }
 
 async function saveNotes(model: ModelSummary): Promise<void> {
-  const notes = notesDraft.value[model.id]
-  if (notes === undefined) return
+  // 草稿未编辑时以真实当前备注为初值：编辑框显示实际值，而不是 placeholder 伪装。
+  const notes = notesDraft.value[model.id] ?? model.notes ?? ''
   localError.value = ''
   business.error = ''
   try {
     await api.patchModel(projectId.value, model.id, { notes })
-    delete notesDraft.value[model.id]
+    // 请求期间用户可能继续输入；只有草稿仍等于这次发送的快照时才清，
+    // 否则保留更新的草稿，不能被慢响应的 delete 抹掉。
+    const current = notesDraft.value[model.id]
+    if (current === undefined || current === notes) delete notesDraft.value[model.id]
     await business.loadModels(projectId.value)
   } catch (failure) {
     // 备注保存失败同样走页级横幅（可能发生在任何折叠状态下）。
@@ -161,16 +187,39 @@ function statusText(model: ModelSummary): string {
 }
 
 async function loadWeights(): Promise<void> {
+  weightsLoading.value = true
+  weightsError.value = ''
   try {
     const data = await api.listAssets(projectId.value, { kind: 'weight', limit: 50 })
-    weights.value = data.assets.map((asset) => ({
-      id: asset.id,
-      filename: asset.filename,
-      size: asset.size,
-    }))
+    // 同一内容可能被重复上传（审计里 best.pt 有 10 份、real-mm.pt 5 份），
+    // 选择框按 sha256 只留一份，避免用户对着同名同大小的条目猜哪个是新的。
+    const seen = new Set<string>()
+    weights.value = data.assets
+      .filter((asset) => {
+        const key = asset.sha256 || asset.id
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+      .map((asset) => ({
+        id: asset.id,
+        filename: asset.filename,
+        size: asset.size,
+        createdAt: asset.created_at,
+      }))
   } catch {
     weights.value = []
+    weightsError.value = '权重列表加载失败，请点「刷新」重试。'
+  } finally {
+    weightsLoading.value = false
   }
+}
+
+// 同名同大小的权重靠上传时间区分；下拉框里给出短日期，避免只看到两个 yolo11n.pt。
+function shortAssetTime(value: string): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  return `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
 }
 
 async function onWeight(event: Event): Promise<void> {
@@ -178,32 +227,112 @@ async function onWeight(event: Event): Promise<void> {
   const file = input.files?.[0]
   if (!file) return
   uploading.value = true
+  weightProgress.value = null
   localError.value = ''
   try {
-    const asset = await api.uploadAsset(projectId.value, file)
+    const asset = await api.uploadAsset(projectId.value, file, {
+      onProgress: (progress) => {
+        weightProgress.value = progress
+      },
+    })
     if (asset.kind !== 'weight') {
       localError.value = `这个文件按内容被识别为 ${asset.kind}，不是模型权重`
     } else {
       form.value.assetId = asset.id
       await loadWeights()
+      await inspectSource({ asset_id: asset.id })
     }
   } catch (failure) {
     localError.value = errorMessage(failure)
   } finally {
     uploading.value = false
+    weightProgress.value = null
     input.value = ''
   }
 }
 
+function resetImportForm(): void {
+  form.value = defaultImportForm()
+  mapping.value = null
+  inspection.value = null
+  inspectError.value = ''
+  localError.value = ''
+  uploading.value = false
+}
+
 function closeImport(): void {
   showImport.value = false
-  mapping.value = null
-  localError.value = ''
+  resetImportForm()
+}
+
+// 展开时从干净表单开始；收起后再展开不会带回上一次的名称/已选权重。
+function toggleImport(): void {
+  if (showImport.value) {
+    closeImport()
+    return
+  }
+  resetImportForm()
+  showImport.value = true
+}
+
+/**
+ * 只读预检：按权重真实结构给 family/第二模态“对号入座”。
+ *
+ * 预检结果只影响 family 与第二模态这两个“结构声明”，不动名称、数据集绑定和
+ * 用户已选的类别映射。用户在预检后仍可手动改回，但提交前会再次拦一次不一致。
+ */
+async function inspectSource(source: { asset_id?: string; rel_path?: string }): Promise<void> {
+  inspecting.value = true
+  inspectError.value = ''
+  try {
+    const data = await api.inspectModel(projectId.value, source)
+    inspection.value = data
+    if (data.suggested_family !== form.value.family) {
+      form.value.family = data.suggested_family
+    }
+    if (data.suggested_family === 'yolomm') {
+      const detected = data.secondary_modality
+      if (detected === 'ir' || detected === 'edge' || detected === 'depth') {
+        form.value.secondary = detected
+      } else if (!form.value.secondary) {
+        form.value.secondary = 'ir'
+      }
+    }
+  } catch (failure) {
+    inspection.value = null
+    inspectError.value = errorMessage(failure)
+  } finally {
+    inspecting.value = false
+  }
+}
+
+async function onAssetPicked(): Promise<void> {
+  if (!form.value.assetId) {
+    inspection.value = null
+    inspectError.value = ''
+    return
+  }
+  await inspectSource({ asset_id: form.value.assetId })
+}
+
+async function inspectPath(): Promise<void> {
+  const relPath = form.value.relPath.trim()
+  if (!relPath) {
+    inspectError.value = '先填写项目内的权重路径，再预检'
+    return
+  }
+  await inspectSource({ rel_path: relPath })
 }
 
 async function submit(): Promise<void> {
   localError.value = ''
   mapping.value = null
+  if (inspection.value && inspection.value.suggested_family !== form.value.family) {
+    localError.value =
+      `预检显示这是 ${inspection.value.suggested_family} 结构，请按预检结果选择家族，` +
+      '不要按文件名或旧习惯选。'
+    return
+  }
   const payload = {
     name: form.value.name.trim(),
     family: form.value.family,
@@ -305,13 +434,13 @@ function useForInspect(): void {
           :aria-expanded="showTraining"
           @click="showTraining = !showTraining"
         >
-          开始训练
+          {{ showTraining ? '收起训练配置' : '训练配置' }}
         </button>
         <button
           class="primary small"
           type="button"
           :aria-expanded="showImport"
-          @click="showImport = !showImport"
+          @click="toggleImport"
         >
           导入权重
         </button>
@@ -358,23 +487,50 @@ function useForInspect(): void {
         </label>
         <label class="field">
           <span>权重路径（项目内相对路径）</span>
-          <input v-model="form.relPath" placeholder="weights/best.pt" :disabled="Boolean(form.assetId)" />
+          <div class="inline-form">
+            <input v-model="form.relPath" placeholder="weights/best.pt" :disabled="Boolean(form.assetId)" />
+            <button
+              class="ghost small"
+              type="button"
+              :disabled="Boolean(form.assetId) || inspecting"
+              @click="inspectPath"
+            >
+              预检
+            </button>
+          </div>
         </label>
         <label class="field">
           <span>或使用已上传的权重</span>
-          <select v-model="form.assetId">
-            <option value="">不使用</option>
+          <select v-model="form.assetId" :disabled="weightsLoading" @change="onAssetPicked">
+            <option value="">{{ weightsLoading ? '正在加载权重…' : '不使用' }}</option>
             <option v-for="asset in weights" :key="asset.id" :value="asset.id">
-              {{ asset.filename }}（{{ formatBytes(asset.size) }}）
+              {{ asset.filename }}（{{ formatBytes(asset.size) }} · {{ shortAssetTime(asset.createdAt) }}）
             </option>
           </select>
+          <span v-if="weightsError" class="form-error">{{ weightsError }}</span>
         </label>
       </div>
       <div class="inline-form">
         <label class="button ghost small">
-          {{ uploading ? '上传中…' : '上传 .pt' }}
+          {{ weightLabel }}
           <input type="file" accept=".pt" hidden :disabled="uploading" @change="onWeight" />
         </label>
+        <span v-if="inspecting" class="hint">正在预检权重结构…</span>
+      </div>
+      <p v-if="inspectError" class="form-error">{{ inspectError }}</p>
+      <div v-if="inspection" class="weight-inspection" role="status">
+        <p class="card-head">权重预检（只读，不登记）</p>
+        <p class="hint">
+          真实结构：<strong>{{ inspection.suggested_family === 'yolomm' ? 'YOLOMM 双模态' : 'YOLO 单模态' }}</strong>
+          · 类别 {{ inspection.class_count }} 个
+          <template v-if="inspection.classes.length">（{{ inspection.classes.join(' / ') }}）</template>
+        </p>
+        <p class="hint">
+          模态路由：主 {{ inspection.primary_modality || '未知' }}<template v-if="inspection.secondary_modality">
+            · 辅 {{ inspection.secondary_modality }}</template>
+          · 家族与第二模态已按预检结果填好。
+        </p>
+        <p class="hint">SHA256 {{ inspection.sha256.slice(0, 16) }}… · {{ formatBytes(inspection.size) }}</p>
       </div>
       <p v-if="localError" class="form-error">{{ localError }}</p>
 
@@ -435,7 +591,6 @@ function useForInspect(): void {
           </span>
           <span v-if="model.source === 'trained'" class="tag tag-off">训练产出</span>
           <span class="hint">{{ model.model_mode === 'multimodal' ? `RGB + ${model.secondary_modality ?? '?'}` : '仅 RGB' }}</span>
-          <span class="hint">{{ model.source === 'trained' ? '本机训练' : '导入权重' }}</span>
           <span class="hint metrics">{{ metricText(model) }}</span>
           <span class="spacer"></span>
           <button
@@ -490,9 +645,10 @@ function useForInspect(): void {
           <p v-else class="hint">还没有验证集指标；训练完成后会在这里显示真实数值。</p>
           <div class="inline-form">
             <input
-              v-model="notesDraft[model.id]"
-              :placeholder="model.notes || '备注（仅本项目可见）'"
+              :value="notesDraft[model.id] ?? model.notes ?? ''"
+              placeholder="备注（仅本项目可见）"
               maxlength="200"
+              @input="notesDraft[model.id] = ($event.target as HTMLInputElement).value"
             />
             <button class="ghost small" type="button" @click="saveNotes(model)">保存备注</button>
           </div>
@@ -505,7 +661,7 @@ function useForInspect(): void {
 
     <div class="card">
       <p class="card-head">
-        回收站中的模型（{{ deletedModels.length }}）
+        回收站中的模型（{{ trashLoaded ? deletedModels.length : '…' }}）
         <button class="ghost small" type="button" @click="showTrash = !showTrash">
           {{ showTrash ? '收起' : '展开' }}
         </button>
@@ -518,7 +674,8 @@ function useForInspect(): void {
           <button class="ghost small" type="button" @click="runModel('restore', model)">恢复</button>
         </li>
       </ul>
-      <p v-if="showTrash && !deletedModels.length" class="empty-hint">回收站是空的。</p>
+      <p v-if="showTrash && !trashLoaded" class="empty-hint">正在加载回收站模型…</p>
+      <p v-else-if="showTrash && !deletedModels.length" class="empty-hint">回收站是空的。</p>
     </div>
   </section>
 </template>

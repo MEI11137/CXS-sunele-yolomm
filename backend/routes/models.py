@@ -57,6 +57,22 @@ def import_model(project_id: str):
     return ok({"model": model})
 
 
+@bp.post("/projects/<project_id>/models/inspect")
+@auth.login_required
+def inspect_model(project_id: str):
+    """只读预检：先看清权重真实结构和类别，再决定 family，避免导入后才失败。"""
+    payload = request.get_json(silent=True) or {}
+    conn = db.get_db()
+    data = model_service.inspect_weight_source(
+        conn,
+        int(_user()["id"]),
+        project_id,
+        rel_path=payload.get("rel_path"),
+        asset_id=payload.get("asset_id"),
+    )
+    return ok(data)
+
+
 @bp.get("/projects/<project_id>/models/<model_id>")
 @auth.login_required
 def get_model(project_id: str, model_id: str):

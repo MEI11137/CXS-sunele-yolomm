@@ -312,12 +312,12 @@ def run_batch(conn, job) -> dict:
     items: list[dict] = []
     done = 0
     failed = 0
+    job_service.update(
+        conn,
+        str(job["id"]),
+        progress=json.dumps({"done": 0, "failed": 0, "total": len(ids)}, ensure_ascii=False),
+    )
     for index, record_id in enumerate(ids, 1):
-        job_service.update(
-            conn,
-            str(job["id"]),
-            progress=json.dumps({"done": done, "failed": failed, "total": len(ids)}, ensure_ascii=False),
-        )
         try:
             review = _review_one(
                 conn,
@@ -343,6 +343,12 @@ def run_batch(conn, job) -> dict:
                     "error": {"code": exc.code, "message": exc.msg},
                 }
             )
+        # 先落累计进度再发事件：终态必须包含最后一条，不能停在 N-1。
+        job_service.update(
+            conn,
+            str(job["id"]),
+            progress=json.dumps({"done": done, "failed": failed, "total": len(ids)}, ensure_ascii=False),
+        )
         job_service.emit(
             conn,
             job,

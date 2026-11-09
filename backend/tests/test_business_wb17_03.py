@@ -39,7 +39,7 @@ from backend.services import datasets as dataset_service
 from backend.services import jobs as job_service
 from backend.tests.weights import write_real_weight
 from backend.vision import runtime as vision_runtime
-from backend.tests.support import Harness, body, csrf_headers, login
+from backend.tests.support import Harness, body, csrf_headers, login, make_temp_dir
 
 import requests
 
@@ -1001,7 +1001,7 @@ class MigrationIntegrityTest(unittest.TestCase):
 
         from backend import db
 
-        workdir = Path(tempfile.mkdtemp(prefix="hx17-mig-"))
+        workdir = make_temp_dir("hx17-mig-")
         path = workdir / "old.db"
         raw = sqlite3.connect(path)
         try:

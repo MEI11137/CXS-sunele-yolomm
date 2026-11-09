@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import atexit
 import dataclasses
+import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -18,6 +20,32 @@ from backend.tests.fake_engine import FakeEngine, fake_spawner
 
 PASSWORD = "correct-horse-9"
 
+# 进程内创建的测试临时目录。故意不在 Harness.close() 立即删除（Windows 上
+# sqlite/子进程句柄释放有延迟，删除会让后续用例偶发文件锁），但必须在测试进程
+# 退出时收尾；否则全量套件会在仓库根留下上千个 hx17-test-* 目录。
+_TEMP_DIRS: list[Path] = []
+
+
+def _cleanup_temp_dirs() -> None:
+    while _TEMP_DIRS:
+        target = _TEMP_DIRS.pop()
+        for attempt in range(3):
+            try:
+                shutil.rmtree(target, ignore_errors=False)
+                break
+            except OSError:
+                time.sleep(0.2)
+
+
+def make_temp_dir(prefix: str) -> Path:
+    """创建会被测试进程统一清理的临时目录（不要在用例里裸调 mkdtemp）。"""
+    path = Path(tempfile.mkdtemp(prefix=prefix))
+    _TEMP_DIRS.append(path)
+    return path
+
+
+atexit.register(_cleanup_temp_dirs)
+
 
 class Harness:
     def __init__(self, *, fake_engine: bool = False) -> None:
@@ -27,6 +55,7 @@ class Harness:
         # 业务工作区必须与数据目录分开：数据目录是服务端私有区（数据库/密钥/引擎），
         # 测试也不该为了让文件工具跑通而放宽这条生产边界。
         self.workspace_dir = Path(tempfile.mkdtemp(prefix="hx17-ws-"))
+        _TEMP_DIRS.extend([self.data_dir, self.workspace_dir])
         self.fake: FakeEngine | None = None
         settings = config.load_settings(data_dir=self.data_dir, serve_dist=False, port=5099)
         spawner = None

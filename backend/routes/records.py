@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 from flask import Blueprint, request, send_file
 
 from backend import auth, db, security
@@ -33,6 +35,26 @@ def _assert_project(conn, project_id: str) -> None:
     project_service.get_owned(conn, project_id, int(_user()["id"]))
 
 
+def _limit(default: int = 20, maximum: int = 200) -> int:
+    raw = request.args.get("limit")
+    try:
+        value = int(raw if raw not in (None, "") else default)
+    except (TypeError, ValueError):
+        raise ApiError(400, "BAD_LIMIT", "limit 必须是整数") from None
+    return max(1, min(maximum, value))
+
+
+def _date_arg(name: str) -> str | None:
+    raw = (request.args.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        date.fromisoformat(raw[:10])
+    except ValueError:
+        raise ApiError(400, "BAD_DATE", f"{name} 必须是 YYYY-MM-DD 日期") from None
+    return raw
+
+
 def _key(payload: dict, prefix: str) -> str:
     """请求键：调用方给了就复用（重试幂等），没给就本次新建一条。"""
     raw = str(payload.get("request_key") or "").strip()
@@ -55,9 +77,9 @@ def list_records(project_id: str):
         model_id=(request.args.get("model_id") or "").strip() or None,
         session_id=(request.args.get("session_id") or "").strip() or None,
         has_hits=(None if has_hits is None else has_hits.lower() in {"1", "true", "yes"}),
-        date_from=(request.args.get("date_from") or "").strip() or None,
-        date_to=(request.args.get("date_to") or "").strip() or None,
-        limit=int(request.args.get("limit") or 20),
+        date_from=_date_arg("date_from"),
+        date_to=_date_arg("date_to"),
+        limit=_limit(20),
         before=(request.args.get("before") or "").strip() or None,
         deleted=(request.args.get("deleted") or "exclude").strip(),
         q=(request.args.get("q") or "").strip() or None,
@@ -183,13 +205,14 @@ def review_records(project_id: str):
 @auth.login_required
 def list_jobs(project_id: str):
     conn = db.get_db()
+    _assert_project(conn, project_id)
     return ok(
         job_service.list_for_project(
             conn,
             int(_user()["id"]),
             project_id,
             session_id=(request.args.get("session_id") or "").strip() or None,
-            limit=int(request.args.get("limit") or 20),
+            limit=_limit(20),
         )
     )
 
@@ -210,6 +233,7 @@ def get_job(project_id: str, job_id: str):
 def job_events(project_id: str):
     """会话级事件恢复：轮次结束后仍能拿到业务进度与结果。"""
     conn = db.get_db()
+    _assert_project(conn, project_id)
     return ok(
         job_service.events_after(
             conn,
@@ -274,7 +298,7 @@ def list_feedback(project_id: str):
             int(_user()["id"]),
             project_id,
             status=(request.args.get("status") or "pending").strip(),
-            limit=int(request.args.get("limit") or 50),
+            limit=_limit(50),
         )
     )
 
@@ -286,6 +310,7 @@ def export_records(project_id: str):
     from flask import send_file
 
     conn = db.get_db()
+    _assert_project(conn, project_id)
     scope = (request.args.get("scope") or "").strip()
     ids = [item for item in (request.args.get("ids") or "").split(",") if item.strip()]
     has_hits = request.args.get("has_hits")
@@ -295,7 +320,7 @@ def export_records(project_id: str):
         project_id,
         scope=scope,
         ids=ids,
-        limit=int(request.args.get("limit") or 20),
+        limit=_limit(20),
         filters={
             "status": (request.args.get("status") or "").strip(),
             "model_id": (request.args.get("model_id") or "").strip(),

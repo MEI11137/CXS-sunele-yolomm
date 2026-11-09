@@ -365,6 +365,7 @@ class ToolGateway:
                     conn, actor.turn_id, actor.session_id, type_, payload
                 ),
                 jobs={},
+                runtime=getattr(self, "runtime", None),
             )
             risk = spec.effective_risk(ctx)
             decision = policy.decide(actor.mode, risk)
@@ -511,6 +512,7 @@ class ToolGateway:
                 conn, actor.turn_id, actor.session_id, type_, payload
             ),
             jobs={},
+            runtime=getattr(self, "runtime", None),
         )
         if spec.requires_root:
             fsops.require_root(actor.root_path)

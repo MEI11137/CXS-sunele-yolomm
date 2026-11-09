@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import * as api from '@/api/business'
 import { errorMessage } from '@/api/http'
 import { useBusinessStore } from '@/stores/business'
+import { useSelectionStore } from '@/stores/selection'
 import { useWorkspaceStore } from '@/stores/workspace'
 import {
   humanStatusLabel,
@@ -27,6 +28,7 @@ import type { DetectionBox, DetectionRecord, RecordFiltersState } from '@/types'
 const route = useRoute()
 const router = useRouter()
 const business = useBusinessStore()
+const selection = useSelectionStore()
 const workspace = useWorkspaceStore()
 
 const projectId = computed(() => String(route.params.projectId ?? ''))
@@ -35,12 +37,14 @@ const records = computed<DetectionRecord[]>(() => page.value?.records ?? [])
 const filters = computed<RecordFiltersState>(() => business.filtersFor(projectId.value))
 const models = computed(() => business.models[projectId.value] ?? [])
 const selected = ref<string[]>([])
+const recordsLoading = ref(false)
 const openRecordId = ref('')
 // 深链定位用的"脱离列表"记录：目标可能不在当前筛选/前 50 条里，按 ID 授权
 // 直读（与列表同一人工状态/结论版本口径）。出现在列表里时优先用列表版本（更新鲜）。
 const detachedRecord = ref<DetectionRecord | null>(null)
-const showDeleted = ref(Boolean(route.query.deleted))
+const showDeleted = ref(route.query.deleted === '1')
 const showAdvanced = ref(false)
+const filterError = ref('')
 const openRecord = computed(
   () => records.value.find((item) => item.id === openRecordId.value) ?? detachedRecord.value,
 )
@@ -86,10 +90,28 @@ function feedbackStatusLabel(record: DetectionRecord): string {
 }
 
 onMounted(async () => {
+  window.addEventListener('keydown', onWindowKeydown)
   if (!business.models[projectId.value]) await business.loadModels(projectId.value)
   hydrateFiltersFromUrl()
-  await business.loadRecords(projectId.value, { ...filters.value, deleted: deletedParam() })
+  filterError.value = dateFilterError()
+  if (filterError.value) return
+  recordsLoading.value = true
+  try {
+    await business.loadRecords(projectId.value, { ...filters.value, deleted: deletedParam() })
+  } finally {
+    recordsLoading.value = false
+  }
 })
+
+function onWindowKeydown(event: KeyboardEvent): void {
+  if (event.key !== 'Escape') return
+  if (openRecordId.value) {
+    event.preventDefault()
+    openRecordId.value = ''
+    return
+  }
+  if (menuFor.value) hideMenu()
+}
 
 function hydrateFiltersFromUrl(): void {
   const query = route.query
@@ -153,10 +175,25 @@ watch(openRecordId, (value) => {
   if (!value) detachedRecord.value = null
 })
 
+/** 日期范围倒置时明确报错；不能悄悄丢掉条件或查出一个看似“没有记录”的空列表。 */
+function dateFilterError(): string {
+  const from = filters.value.date_from
+  const to = filters.value.date_to
+  if (from && to && from > to) return '开始日期不能晚于结束日期，请调整日期范围。'
+  return ''
+}
+
 async function reload(): Promise<void> {
+  filterError.value = dateFilterError()
+  if (filterError.value) return
   selected.value = []
   syncFiltersToUrl()
-  await business.loadRecords(projectId.value, { ...filters.value, deleted: deletedParam() })
+  recordsLoading.value = true
+  try {
+    await business.loadRecords(projectId.value, { ...filters.value, deleted: deletedParam() })
+  } finally {
+    recordsLoading.value = false
+  }
 }
 
 async function loadMore(): Promise<void> {
@@ -192,6 +229,68 @@ function toggleAll(): void {
 function clearSelection(): void {
   selected.value = []
 }
+
+/** 把当前筛选的简短文字带进选择上下文，帮助模型理解“这些记录”的范围。 */
+const selectionFilterLabel = computed(() => {
+  const parts: string[] = []
+  if (filters.value.status) parts.push(`状态 ${filters.value.status}`)
+  if (filters.value.q) parts.push(`搜索 ${filters.value.q}`)
+  if (showDeleted.value) parts.push('含已删除记录')
+  return parts.join(' / ')
+})
+
+/**
+ * 勾选自动注册到共享 UI 上下文：下一条普通消息发送时冻结 record_ids 快照交给后端，
+ * 用户无需点按钮建会话或把 ID 打出来；后端仍逐条校验归属。
+ */
+function syncSelection(): void {
+  selection.setSelection(
+    selected.value.length
+      ? {
+          projectId: projectId.value,
+          page: '识别记录',
+          recordIds: [...selected.value],
+          filters: selectionFilterLabel.value,
+        }
+      : null,
+  )
+}
+
+function focusAssistant(): void {
+  window.dispatchEvent(new CustomEvent('hx17:focus-composer'))
+}
+
+watch(selected, syncSelection)
+// 输入框“清除选择”等外部清空：页面复选框与批量计数必须一起复位，
+// 不能出现“页面显示已选、发送却无 ui_context”的两套状态。
+watch(
+  () => selection.context,
+  (current) => {
+    if (!current && selected.value.length) selected.value = []
+  },
+)
+watch(
+  () => [
+    filters.value.status,
+    filters.value.model_id,
+    filters.value.q,
+    filters.value.has_hits,
+    filters.value.date_from,
+    filters.value.date_to,
+    showDeleted.value,
+  ],
+  () => {
+    // 筛选变化后旧勾选已不可见，必须清掉，避免把隐藏记录继续带进对话。
+    if (selected.value.length) {
+      selected.value = []
+      syncSelection()
+    }
+  },
+)
+onUnmounted(() => {
+  window.removeEventListener('keydown', onWindowKeydown)
+  if (selection.context?.page === '识别记录') selection.clear(projectId.value)
+})
 
 async function reviewOne(record: DetectionRecord): Promise<void> {
   hideMenu()
@@ -352,17 +451,22 @@ watch(records, (list) => {
       <div>
         <h1>识别记录</h1>
         <p class="subtitle">
-          本页 {{ records.length }} 条 · 命中 {{ hitsOnPage }} 条
-          <span v-if="page" class="hint">· 筛选范围内共 {{ page.total_in_range }} 条</span>
-          <span v-if="showDeleted" class="hint">· 正在查看回收站</span>
+          <template v-if="recordsLoading">正在加载记录…</template>
+          <template v-else-if="records.length">本页 {{ records.length }} 条</template>
+          <template v-else>暂无记录</template>
+          <span v-if="records.length && hitsOnPage" class="hint">· 命中 {{ hitsOnPage }} 条</span>
+          <span v-if="page && page.total_in_range > records.length" class="hint">
+            · 筛选范围内共 {{ page.total_in_range }} 条
+          </span>
+          <span v-if="showDeleted" class="hint">· 正在查看记录回收站</span>
         </p>
       </div>
       <div class="header-actions">
-        <button class="ghost small" type="button" :disabled="business.loading" @click="reload">
+        <button class="ghost small" type="button" :disabled="business.loading || recordsLoading" @click="reload">
           刷新
         </button>
         <button class="ghost small" type="button" @click="toggleDeleted">
-          {{ showDeleted ? '返回在用记录' : '回收站' }}
+          {{ showDeleted ? '返回在用记录' : '记录回收站' }}
         </button>
         <button
           class="ghost small"
@@ -412,6 +516,14 @@ watch(records, (list) => {
           加入反馈（{{ feedbackEligible.length }}）
         </button>
         <button class="ghost small" type="button" @click="exportSelected">导出所选</button>
+        <button
+          class="ghost small"
+          type="button"
+          :title="`聚焦右侧输入框；已勾选的 ${selected.length} 条记录会随下一条普通消息自动附带`"
+          @click="focusAssistant"
+        >
+          向助手提问（{{ selected.length }}）
+        </button>
         <button class="ghost small danger" type="button" @click="deleteChecked">移入回收站</button>
       </template>
       <button class="link" type="button" @click="clearSelection">清空选择</button>
@@ -476,6 +588,7 @@ watch(records, (list) => {
           <span class="hint">结束日期</span>
           <input v-model="filters.date_to" type="date" @change="reload" />
         </label>
+        <p v-if="filterError" class="form-error" role="alert">{{ filterError }}</p>
         <p class="hint bounds-hint">
           日期按本地日期解释（UTC{{ appliedBounds.offset >= 0 ? '+' : '' }}{{ appliedBounds.offset / 60 }}），
           实际查询区间 <span class="mono">{{ appliedBounds.from || '不限' }}</span> →
@@ -483,7 +596,8 @@ watch(records, (list) => {
         </p>
       </div>
 
-      <table v-if="records.length" class="table rec-table">
+      <div v-if="records.length" class="table-scroll">
+      <table class="table rec-table">
         <thead>
           <tr>
             <th style="width: 34px">
@@ -578,6 +692,7 @@ watch(records, (list) => {
           </tr>
         </tbody>
       </table>
+      </div>
       <p v-else-if="!business.loading" class="empty-hint">
         {{
           showDeleted
@@ -751,6 +866,8 @@ watch(records, (list) => {
 
 .rec-table {
   font-size: 13px;
+  /* 保证操作列在窄业务区可横向滚动，而不是被 app-main 的 overflow-x:hidden 裁掉。 */
+  min-width: 900px;
 }
 
 .rec-table th,
@@ -789,7 +906,7 @@ watch(records, (list) => {
   color: var(--text-secondary);
 }
 
-.row-actions {
+.row-actions:not(td) {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;

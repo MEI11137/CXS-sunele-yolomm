@@ -29,6 +29,7 @@ import io
 import os
 import re
 import shutil
+import time
 import unicodedata
 from pathlib import Path
 
@@ -115,6 +116,11 @@ def project_dir(root: Path, *parts: str) -> Path:
     先查后建：如果某一级是通往项目外的联接，``guard`` 在 ``mkdir`` 之前就会拒绝，
     不会出现“报错了但目录已经建在项目外”的情况。创建后再查一次，覆盖
     “父目录在检查与创建之间被替换”的窄窗口。
+
+    并发下要注意一件事：目标目录**还不存在**时，Windows 的 ``realpath`` 解析
+    结果并不稳定（多线程同时创建同一层级时实测会偶发判成“越界”）。所以先校验
+    最近一个**已存在**的祖先（联接若存在，一定在这一段里，能验出来），建完再校验
+    完整路径；只有这时才做一次极短重试，仍不通过就照旧拒绝。
     """
     target = root
     for part in parts:
@@ -122,9 +128,21 @@ def project_dir(root: Path, *parts: str) -> Path:
         if not text or text in {".", ".."} or "/" in text or "\\" in text:
             raise ApiError(400, "PATH_INVALID", "目录名不合法")
         target = target / text
-    guard(root, target)
-    target.mkdir(parents=True, exist_ok=True)
-    return guard(root, target)
+    # 每一轮都仍然做真实的 guard：重试只是为了绕开“目录正在被并发创建”时
+    # realpath 的瞬时抖动，不是因为放宽判定。真越界（联接/符号链接）每轮都会失败。
+    for attempt in range(3):
+        try:
+            existing = target
+            while not existing.exists() and existing != root and root in existing.parents:
+                existing = existing.parent
+            guard(root, existing)
+            target.mkdir(parents=True, exist_ok=True)
+            return guard(root, target)
+        except ApiError as exc:
+            if exc.code != "PATH_OUTSIDE_PROJECT" or attempt == 2:
+                raise
+        time.sleep(0.02 * (attempt + 1))
+    raise ApiError(403, "PATH_OUTSIDE_PROJECT", "目标真实路径已离开项目绑定目录")  # pragma: no cover
 
 
 def unique_path(directory: Path, filename: str) -> Path:

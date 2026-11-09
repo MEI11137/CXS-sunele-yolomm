@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import DialogShell from '@/components/DialogShell.vue'
 import DirectoryBrowser from '@/components/DirectoryBrowser.vue'
+import { hasOpenDialogs } from '@/components/dialogStack'
 import { useWorkspaceStore } from '@/stores/workspace'
 
 /**
@@ -23,6 +24,12 @@ const project = computed(() => (projectId.value ? workspace.projectById(projectI
 const sessions = computed(() =>
   projectId.value ? (workspace.sessionsByProject[projectId.value] ?? []) : [],
 )
+
+async function openSession(sessionId: string): Promise<void> {
+  // 先关闭抽屉，再显式导航：避免 RouterLink 内部 push 与 close 触发的 query 变更互相取消。
+  emit('close')
+  await router.push({ name: 'session', params: { projectId: projectId.value, sessionId } })
+}
 
 const pathInput = ref('')
 const browseOpen = ref(false)
@@ -61,6 +68,16 @@ watch(
 watch(projectId, (id) => {
   if (id) void workspace.loadSessions(id)
 })
+
+function onKeydown(event: KeyboardEvent): void {
+  // 抽屉里可能叠着目录选择/重命名等弹窗；Esc 先关最上层的弹窗，不连关抽屉。
+  if (event.key !== 'Escape' || !props.open || hasOpenDialogs()) return
+  event.preventDefault()
+  emit('close')
+}
+
+onMounted(() => window.addEventListener('keydown', onKeydown))
+onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 
 async function bind(path: string): Promise<void> {
   bindError.value = ''
@@ -271,7 +288,14 @@ async function confirmDeleteSession(): Promise<void> {
                   <button class="ghost small" type="button" @click="editingSessionId = ''">取消</button>
                 </template>
                 <template v-else>
-                  <span class="session-title">{{ item.title }}</span>
+                  <button
+                    class="session-title"
+                    type="button"
+                    :aria-label="`打开会话：${item.title}`"
+                    @click="openSession(item.id)"
+                  >
+                    {{ item.title }}
+                  </button>
                   <span class="session-meta">{{ item.updated_at }}</span>
                   <button class="ghost small" type="button" @click="startRenameSession(item.id, item.title)">
                     改名

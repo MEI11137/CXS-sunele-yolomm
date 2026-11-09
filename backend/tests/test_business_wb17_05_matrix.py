@@ -24,7 +24,7 @@ import yaml
 from backend.services import identity as identity_service
 from backend.services import storage
 
-from backend.tests.support import body, csrf_headers
+from backend.tests.support import body, csrf_headers, make_temp_dir
 from backend.tests.test_business_wb17_03 import png_bytes
 from backend.tests.test_business_wb17_04 import ReviewBase
 
@@ -36,7 +36,8 @@ MATRIX: dict[int, tuple[str, str, str, tuple[str, ...]]] = {
     3: ("项目列表/创建/删除/恢复", "tool", "侧栏 + 项目页",
         ("hx_list_projects", "hx_create_project", "hx_rename_project", "hx_project_overview",
          "hx_project_admin", "hx_project_update")),
-    4: ("项目绑定本机目录", "human", "项目详情 + 管理员授权", ()),
+    4: ("项目绑定本机目录", "tool", "项目详情 + 管理员授权",
+        ("hx_project_bind",)),
     5: ("会话列表/新建/删除", "tool", "侧栏",
         ("hx_list_sessions", "hx_create_session", "hx_rename_session",
          "hx_session_admin", "hx_session_history", "hx_search_sessions")),
@@ -75,8 +76,17 @@ MATRIX: dict[int, tuple[str, str, str, tuple[str, ...]]] = {
 }
 
 
+class _RecordingRuntime:
+    def __init__(self):
+        self.calls = []
+
+    def invalidate_project(self, user_id, project_id, *, reason):
+        self.calls.append((int(user_id), str(project_id), reason))
+        return 1
+
+
 class MatrixBase(ReviewBase):
-    def _ctx(self, conn, args: dict):
+    def _ctx(self, conn, args: dict, *, runtime=None):
         from backend.agent import identity as agent_identity
         from backend.agent.context import Actor
         from backend.agent.tools import ToolContext
@@ -95,7 +105,14 @@ class MatrixBase(ReviewBase):
             provider=str(connection["provider"]),
             model=agent_identity.effective_model(conn, self.alice["id"], connection),
         )
-        return ToolContext(conn=conn, actor=actor, args=args, emit=lambda *_args: None, jobs={})
+        return ToolContext(
+            conn=conn,
+            actor=actor,
+            args=args,
+            emit=lambda *_args: None,
+            jobs={},
+            runtime=runtime,
+        )
 
     def dataset(self, *, samples: int = 2) -> dict:
         dataset_id = f"dst_{secrets.token_hex(8)}"
@@ -180,7 +197,7 @@ class MatrixCoverageTest(MatrixBase):
         forbidden = {
             "提交复核结论": "review submit",
             "保存连接凭据": "connection save",
-            "绑定/授权目录": "directory bind",
+            "新增/扩大目录授权": "directory grant",
             "建号注册": "user register",
             "停止任务": "turn stop",
         }
@@ -378,7 +395,94 @@ class DatasetModelMatrixTest(MatrixBase):
         self.assertTrue(result["binding"]["exists"])
         self.assertTrue(result["binding"]["writable"])
         self.assertTrue(any(item["path"] == str(self.root) for item in result["granted_roots"]))
-        self.assertIn("不能改", result["note"])
+        self.assertIn("hx_project_bind", result["note"])
+        self.assertIn("管理员", result["note"])
+
+    def test_project_bind_lifecycle_and_guards(self):
+        import tempfile
+        from pathlib import Path
+
+        from backend.agent import tools as agent_tools
+        from backend.services import projects as project_service
+
+        target = Path(self.root) / "bind-target"
+        target.mkdir(parents=True, exist_ok=True)
+        target2 = Path(self.root) / "bind-target-2"
+        target2.mkdir(parents=True, exist_ok=True)
+        outside = make_temp_dir("hx17-outside-")
+        runtime = _RecordingRuntime()
+        conn = self.conn()
+        try:
+            # 当前对话项目：拒绝，避免终止本轮回复。
+            with self.assertRaises(Exception) as current:
+                agent_tools.TOOLS["hx_project_bind"].handler(
+                    self._ctx(
+                        conn,
+                        {"project_id": self.project["id"], "path": str(target), "replace": True},
+                        runtime=runtime,
+                    )
+                )
+            self.assertEqual(getattr(current.exception, "code", ""), "CURRENT_PROJECT_REBIND")
+
+            # 另一个 owned、未绑定项目：真实绑定并通知运行时停旧轮次。
+            other = project_service.create(
+                conn, int(self.alice["id"]), name="绑定验收项目"
+            )
+            bound = agent_tools.TOOLS["hx_project_bind"].handler(
+                self._ctx(
+                    conn,
+                    {"project_id": other["id"], "path": str(target), "replace": False},
+                    runtime=runtime,
+                )
+            )
+            self.assertEqual(bound["status"], "bound")
+            self.assertTrue(bound["changed"])
+            self.assertEqual(Path(bound["root_path"]), target.resolve())
+            self.assertTrue(bound["lifecycle_notified"])
+            self.assertEqual(bound["interrupted_turns"], 1)
+            self.assertEqual(len(runtime.calls), 1)
+            self.assertEqual(runtime.calls[0][1], other["id"])
+            self.assertIn("不会搬迁或重新关联", bound["note"])
+            self.assertNotIn("同一路径重新关联", bound["note"])
+
+            # 同目录幂等：不改变 root，不重复通知运行时/不重复终止。
+            again = agent_tools.TOOLS["hx_project_bind"].handler(
+                self._ctx(
+                    conn,
+                    {"project_id": other["id"], "path": str(target), "replace": False},
+                    runtime=runtime,
+                )
+            )
+            self.assertEqual(again["status"], "unchanged")
+            self.assertFalse(again["changed"])
+            self.assertFalse(again["lifecycle_notified"])
+            self.assertEqual(again["interrupted_turns"], 0)
+            self.assertEqual(len(runtime.calls), 1)
+
+            # 已绑定其它目录且未 replace：保留原服务冲突码。
+            with self.assertRaises(Exception) as conflict:
+                agent_tools.TOOLS["hx_project_bind"].handler(
+                    self._ctx(
+                        conn,
+                        {"project_id": other["id"], "path": str(target2), "replace": False},
+                        runtime=runtime,
+                    )
+                )
+            self.assertEqual(getattr(conflict.exception, "code", ""), "ROOT_ALREADY_BOUND")
+
+            # 授权根之外：拒绝，且在写库前失败。
+            with self.assertRaises(Exception) as denied:
+                agent_tools.TOOLS["hx_project_bind"].handler(
+                    self._ctx(
+                        conn,
+                        {"project_id": other["id"], "path": str(outside), "replace": True},
+                        runtime=runtime,
+                    )
+                )
+            self.assertEqual(getattr(denied.exception, "code", ""), "OUTSIDE_ALLOWED_ROOTS")
+            self.assertEqual(len(runtime.calls), 1)
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -472,7 +472,7 @@ function metricText(values?: Record<string, number | null>): string {
   white-space: pre-wrap;
   word-break: break-all;
 }
-.row-actions {
+.row-actions:not(td) {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;

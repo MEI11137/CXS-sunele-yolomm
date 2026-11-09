@@ -12,7 +12,7 @@ import unittest
 import uuid
 
 from backend import db
-from backend.agent import identity, store
+from backend.agent import continuation, identity, store
 from backend.tests.support import Harness, api, body, login, wait_turn
 
 
@@ -113,6 +113,28 @@ class TurnTest(unittest.TestCase):
         final = wait_turn(self.client, turn["id"], timeout=25)
         self.assertEqual(final["turn"]["status"], "completed")
         self.assertEqual(self.assistant_texts(), ["空闲之后才出现的回答"])
+
+    def test_tool_round_final_text_after_long_idle_gap(self):
+        # 真实引擎在工具轮之后会短暂 idle，最终文本可能晚于普通 6 秒宽限才出现；
+        # 这不能被误判成 NO_FINAL_TEXT（线上 turn trn_8d3f299d9574535a 的回归）。
+        self.fake.queue(
+            {
+                "tool_calls": [
+                    {
+                        "tool": "hx17_hx_list_files",
+                        "args": {"path": "."},
+                        "output": '{"entries": []}',
+                        "title": "列出目录",
+                    }
+                ],
+                "tool_final_gap": 8.0,
+                "text": "工具之后才生成的最终回答。",
+            }
+        )
+        turn = body(self.send())["data"]["turn"]
+        final = wait_turn(self.client, turn["id"], timeout=35)
+        self.assertEqual(final["turn"]["status"], "completed")
+        self.assertEqual(self.assistant_texts(), ["工具之后才生成的最终回答。"])
 
     def test_no_final_text_fails_honestly(self):
         self.fake.queue({"no_text": True})
@@ -215,6 +237,19 @@ class TurnTest(unittest.TestCase):
         good = api(self.client, "PUT", "/api/me/preferences", {"mode": "assist"})
         self.assertEqual(good.status_code, 200)
         self.assertEqual(body(good)["data"]["mode"], "assist")
+
+    def test_model_only_preferences_save_with_default_mode(self):
+        # 首次设置（还没有 user_prefs 行）只切模型：不能因 mode=None 撞 NOT NULL 变成 500。
+        response = api(
+            self.client, "PUT", "/api/me/preferences", {"model": "probe-model"}
+        )
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        data = body(response)["data"]
+        self.assertEqual(data["model"], "probe-model")
+        self.assertEqual(data["mode"], "request")
+        saved = store.prefs(self.harness.conn(), self.alice["id"])
+        self.assertEqual(saved["mode"], "request")
+        self.assertEqual(saved["model"], "probe-model")
 
     def test_other_user_cannot_read_turn(self):
         self.fake.queue({"hang": True})
@@ -454,6 +489,195 @@ class ActionContinuationTest(unittest.TestCase):
         self.assertIn("报告已写入，继续下一步。", texts)
         self.assertIn("continuation", kinds)
 
+
+    def test_continuation_prompt_reads_its_own_action_not_latest(self):
+        """A 的续跑必须读 A 的结果；同会话后来完成的 B 不能被冒充。"""
+        conn = self.harness.conn()
+        try:
+            parent = self._create_turn(conn)
+            first = store.create_action(
+                conn,
+                turn_id=parent,
+                session_id=self.session["id"],
+                project_id=self.project["id"],
+                owner_id=self.alice["id"],
+                tool="hx_write_file",
+                risk="write",
+                title="动作A-写A",
+                args={"path": "a.txt"},
+                preview="写入 a.txt",
+            )
+            store.settle_action(conn, first["id"], status="done", result={"value": "A-RESULT"})
+            second = store.create_action(
+                conn,
+                turn_id=parent,
+                session_id=self.session["id"],
+                project_id=self.project["id"],
+                owner_id=self.alice["id"],
+                tool="hx_write_file",
+                risk="write",
+                title="动作B-写B",
+                args={"path": "b.txt"},
+                preview="写入 b.txt",
+            )
+            store.settle_action(
+                conn, second["id"], status="done", result={"value": "B-RESULT-LATEST"}
+            )
+            connection = identity.connection_for(conn, self.alice["id"])
+            turn, _ = store.create(
+                conn,
+                session_id=self.session["id"],
+                project_id=self.project["id"],
+                owner_id=self.alice["id"],
+                request_id=continuation.resume_request_id(first["id"]),
+                mode="request",
+                provider=str(connection["provider"]),
+                model=str(connection["model"]),
+                fingerprint=identity.connection_fingerprint(connection),
+                kind="continuation",
+            )
+            runner = self.harness.app.config["HX17_AGENT"].runner
+            prompt = runner._prompt_text(conn, turn)
+            self.assertIn("动作A-写A", prompt)
+            self.assertIn("A-RESULT", prompt)
+            self.assertNotIn("动作B-写B", prompt)
+            self.assertNotIn("B-RESULT-LATEST", prompt)
+            store.finish(conn, turn["id"], "completed")
+
+            missing, _ = store.create(
+                conn,
+                session_id=self.session["id"],
+                project_id=self.project["id"],
+                owner_id=self.alice["id"],
+                request_id="resume_act_does_not_exist",
+                mode="request",
+                provider=str(connection["provider"]),
+                model=str(connection["model"]),
+                fingerprint=identity.connection_fingerprint(connection),
+                kind="continuation",
+            )
+            invalid = runner._prompt_text(conn, missing)
+            self.assertIn("已取消、不存在或结果缺失", invalid)
+            self.assertNotIn("B-RESULT-LATEST", invalid)
+        finally:
+            conn.close()
+
+    def test_settle_starts_continuation_after_approve_race(self):
+        """approve 早于原轮次结束时先返回 None；原轮次收尾扫描补上同一幂等轮次。"""
+        conn = self.harness.conn()
+        try:
+            connection = identity.connection_for(conn, self.alice["id"])
+            parent_row, _ = store.create(
+                conn,
+                session_id=self.session["id"],
+                project_id=self.project["id"],
+                owner_id=self.alice["id"],
+                request_id="parent-still-running",
+                mode="request",
+                provider=str(connection["provider"]),
+                model=str(connection["model"]),
+                fingerprint=identity.connection_fingerprint(connection),
+            )
+            parent = parent_row["id"]
+            self.assertTrue(store.mark_running(conn, parent))
+            action = store.create_action(
+                conn,
+                turn_id=parent,
+                session_id=self.session["id"],
+                project_id=self.project["id"],
+                owner_id=self.alice["id"],
+                tool="hx_write_file",
+                risk="write",
+                title="竞态动作",
+                args={"path": "race.txt"},
+                preview="写入 race.txt",
+            )
+            store.settle_action(conn, action["id"], status="done", result={"ok": True})
+            started: list[str] = []
+            # approve 路由拿到的是执行前旧 row；helper 必须按 ID 重读 done 权威行。
+            # 此时 parent 仍 running，快速批准返回 None 而不是插队。
+            done_action = store.get_action(conn, action["id"])
+            self.assertEqual(str(done_action["status"]), "done")
+            self.assertIsNone(
+                continuation.start_action_continuation(conn, done_action, started.append)
+            )
+            self.assertEqual(started, [])
+            store.finish(conn, parent, "completed")
+            parent_row = store.get(conn, parent)
+            created = continuation.settle_action_continuations(
+                conn, parent_row, started.append
+            )
+            self.assertEqual(created, 1)
+            self.assertEqual(len(started), 1)
+            resume = store.by_request(
+                conn, self.session["id"], continuation.resume_request_id(action["id"])
+            )
+            self.assertIsNotNone(resume)
+            self.assertEqual(str(resume["kind"]), "continuation")
+            # 再收尾一次不会重复建轮次/重复启动。
+            again = continuation.settle_action_continuations(conn, parent_row, started.append)
+            self.assertEqual(again, 0)
+            self.assertEqual(len(started), 1)
+        finally:
+            conn.close()
+
+    def test_continuation_guards_connection_and_new_goal(self):
+        """换连接/新用户目标/停止中的原轮次都不能续旧动作。"""
+        conn = self.harness.conn()
+        try:
+            parent = self._create_turn(conn)
+            action = store.create_action(
+                conn,
+                turn_id=parent,
+                session_id=self.session["id"],
+                project_id=self.project["id"],
+                owner_id=self.alice["id"],
+                tool="hx_write_file",
+                risk="write",
+                title="旧授权动作",
+                args={"path": "guard.txt"},
+                preview="写入 guard.txt",
+            )
+            store.settle_action(conn, action["id"], status="done", result={"ok": True})
+            started: list[str] = []
+            conn.execute(
+                "UPDATE turns SET connection_fingerprint = 'changed-after-approve' WHERE id = ?",
+                (parent,),
+            )
+            conn.commit()
+            self.assertIsNone(
+                continuation.start_action_continuation(conn, action, started.append)
+            )
+            conn.execute(
+                "UPDATE turns SET connection_fingerprint = ? WHERE id = ?",
+                (
+                    identity.connection_fingerprint(
+                        identity.connection_for(conn, self.alice["id"])
+                    ),
+                    parent,
+                ),
+            )
+            conn.commit()
+            # 原轮次之后用户已经开了新目标：旧动作续跑必须让位。
+            connection = identity.connection_for(conn, self.alice["id"])
+            newer, _ = store.create(
+                conn,
+                session_id=self.session["id"],
+                project_id=self.project["id"],
+                owner_id=self.alice["id"],
+                request_id="new-user-goal-after-parent",
+                mode="request",
+                provider=str(connection["provider"]),
+                model=str(connection["model"]),
+                fingerprint=identity.connection_fingerprint(connection),
+            )
+            store.finish(conn, newer["id"], "completed")
+            self.assertIsNone(
+                continuation.start_action_continuation(conn, action, started.append)
+            )
+            self.assertEqual(started, [])
+        finally:
+            conn.close()
 
     def _create_turn(self, conn) -> str:
         connection = identity.connection_for(conn, self.alice["id"])

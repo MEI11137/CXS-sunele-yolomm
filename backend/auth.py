@@ -26,6 +26,10 @@ SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 # 用 endpoint（蓝图.视图）而不是路径前缀，避免以后新增路由被顺带放宽。
 MULTIPART_ENDPOINTS = {"assets.upload_asset", "documents.upload_document"}
 
+# 分块上传的**单个块**是原始字节（不包 multipart，省掉每块的表单解析开销）。
+# 只对这一个精确端点放行 octet-stream；其它写接口仍然只收 JSON。
+OCTET_ENDPOINTS = {"assets.put_upload_chunk"}
+
 
 def _settings():
     return current_app.config["HX17"]
@@ -185,7 +189,12 @@ def _guard_state_changing() -> None:
     # 只收 JSON：简单的跨站表单无法伪造 Content-Type，天然挡掉一类 CSRF。
     # 文件上传是唯一例外，且仍然要过后面的 CSRF 双提交与 Origin 校验。
     if request.content_length and not request.is_json:
-        allowed = request.mimetype == "multipart/form-data" and request.endpoint in MULTIPART_ENDPOINTS
+        allowed = (
+            request.mimetype == "multipart/form-data" and request.endpoint in MULTIPART_ENDPOINTS
+        ) or (
+            request.mimetype == "application/octet-stream"
+            and request.endpoint in OCTET_ENDPOINTS
+        )
         if not allowed:
             raise ApiError(415, "UNSUPPORTED_MEDIA_TYPE", "请求体必须是 application/json")
 

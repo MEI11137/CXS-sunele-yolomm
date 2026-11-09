@@ -127,6 +127,8 @@ async function main() {
   const spaced = path.join(work, '海巡 智检 v1.7 测试')
   const token = crypto.randomBytes(24).toString('hex')
   let gateway = null
+  let connector = null
+  let fakeUpstream = null
 
   try {
     // ---------------------------------------------------------------- 语法
@@ -447,7 +449,71 @@ async function main() {
       const res = await request(port, '/__hx17/health')
       assert(res.status === 403, `状态码 ${res.status}`)
     })
+
+    // 最后一项要起一个**回环**连接器：证明分块上传的块哈希头与原始字节
+    // 通过真实 connector.js 也能原样抵达上游（不是只在 Flask 直连时能用）。
+    await check('网关经真实连接器转发 x-chunk-sha256 与原始字节（回环假上游）', async () => {
+      const seen = []
+      fakeUpstream = http.createServer((req, res) => {
+        const chunks = []
+        req.on('data', (chunk) => chunks.push(chunk))
+        req.on('end', () => {
+          const body = Buffer.concat(chunks)
+          seen.push({
+            headers: req.headers,
+            sha: crypto.createHash('sha256').update(body).digest('hex'),
+            bytes: body.length,
+          })
+          const payload = Buffer.from(JSON.stringify({ code: 0, msg: '', data: { ok: true } }), 'utf8')
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': String(payload.length) })
+          res.end(payload)
+        })
+      })
+      const upPort = await new Promise((resolve) => {
+        fakeUpstream.listen(0, '127.0.0.1', () => resolve(fakeUpstream.address().port))
+      })
+
+      connector = spawn(
+        process.execPath,
+        ['connector.js', '--public', `http://127.0.0.1:${port}`, '--upstream', `http://127.0.0.1:${upPort}`, '--lanes', '2'],
+        { cwd: GW, env: { ...process.env, HX17_TUNNEL_TOKEN: token }, stdio: 'ignore' },
+      )
+      let online = false
+      for (let i = 0; i < 100; i += 1) {
+        const probe = await request(port, '/api/health').catch(() => null)
+        if (probe && probe.status !== 503) { online = true; break }
+        await new Promise((resolve) => setTimeout(resolve, 150))
+      }
+      assert(online, '连接器在 15s 内没有上线')
+
+      const chunk = crypto.randomBytes(64 * 1024)
+      const digest = crypto.createHash('sha256').update(chunk).digest('hex')
+      const res = await request(port, '/api/projects/prj_x/uploads/upl_x/chunks/0', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(chunk.length),
+          'X-Chunk-Sha256': digest,
+          'X-Hx17-Extra': 'should-not-pass',
+          Origin: 'https://example.test',
+        },
+        body: chunk,
+      })
+      assert(res.status === 200, `网关返回 ${res.status}：${res.text.slice(0, 200)}`)
+      const chunksSeen = seen.filter((item) => item.headers['x-chunk-sha256'])
+      assert(chunksSeen.length === 1, `带块哈希的请求数 ${chunksSeen.length}（期望 1）`)
+      const got = chunksSeen[0]
+      assert(
+        got.headers['x-chunk-sha256'] === digest,
+        `上游没收到 x-chunk-sha256（实际 ${got.headers['x-chunk-sha256']}）`,
+      )
+      assert(got.bytes === chunk.length && got.sha === digest, `上游收到的字节不一致（${got.bytes} 字节）`)
+      assert(!got.headers['x-hx17-extra'], '非白名单头被透传了（请求头白名单被放宽）')
+      return `${chunk.length} 字节、x-chunk-sha256 与字节都原样抵达；非白名单头未透传`
+    })
   } finally {
+    if (connector) connector.kill()
+    if (fakeUpstream) fakeUpstream.close()
     if (gateway) gateway.kill()
     await fs.rm(work, { recursive: true, force: true }).catch(() => {})
   }

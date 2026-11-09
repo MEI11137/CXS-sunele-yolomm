@@ -336,9 +336,15 @@ def check_font(font="Arial.ttf"):
 
     # Download to USER_CONFIG_DIR if missing
     url = f"https://github.com/ultralytics/assets/releases/download/v0.0.0/{name}"
-    if downloads.is_url(url, check=True):
-        downloads.safe_download(url=url, file=file)
-        return file
+    try:
+        if downloads.is_url(url, check=True):
+            downloads.safe_download(url=url, file=file)
+            return file
+    except Exception:
+        # 字体是可选的绘图资源，不是数据/权重校验的前置条件。离线或代理不可达时
+        # 不能因为一次 GitHub HEAD/download 失败而把合法的训练配置判为无效。
+        pass
+    return None
 
 
 def check_python(minimum: str = "3.8.0", hard: bool = True, verbose: bool = False) -> bool:

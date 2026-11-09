@@ -79,6 +79,7 @@ const upstreamAgent = new http.Agent({ keepAlive: true, maxSockets: 12, keepAliv
 
 let mode = 'stream' // stream = 长挂起上行；fast = 短轮询
 let stopping = false
+let authFailures = 0
 const stats = { requests: 0, replied: 0, errors: 0, startedAt: Date.now() }
 
 function log(...items) {
@@ -345,15 +346,20 @@ async function lane(index) {
       // 只有硬超时才能把这一条通道救回来。
       const res = await tunnelRequest(`/__hx17/uplink?mode=${mode}&wait=${wait}&lane=${index}`, 'GET', undefined, wait + 12000)
       if (res.statusCode === 403) {
-        log('[fatal] tunnel token rejected; check .tunnel-token matches the cloud side')
-        stopping = true
-        return
+        // 平台重发布/换实例时云端签名会短暂变化，本机 connector 必须耐心重试，
+        // 不能把一次 403 当成永久失败退出——否则公网会一直 503 直到人工重启。
+        authFailures += 1
+        const delay = Math.min(30000, 2000 * Math.min(authFailures, 10))
+        log(`[warn] tunnel token rejected (attempt ${authFailures}); retry in ${delay}ms`)
+        await sleep(delay)
+        continue
       }
       if (res.statusCode !== 200) {
         await readAll(res, 4096).catch(() => {})
         await sleep(1000)
         continue
       }
+      authFailures = 0
       let job = null
       await readFrames(res, (frame, ttfb) => {
         if (frame.type === 'open') {

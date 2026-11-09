@@ -43,7 +43,14 @@ deploy/workbuddy/web/
 deploy/workbuddy/.web-prepare-*/
 deploy/workbuddy/.web-old-*/
 
-# 测试工作区：只跟踪目录结构与说明，真实数据/权重/产物按目录忽略
+# 测试工作区：默认整棵树忽略。
+# 平台/后端会在这个根下生成英文 uploads/、datasets/、artifacts/、.cache/（JPEG/TXT/part 全在内），
+# 这些是业务产物，绝不能进 Git；只显式放行说明与本层骨架占位文件。
+测试工作区/*
+!测试工作区/README.md
+!测试工作区/数据集/
+!测试工作区/权重/
+!测试工作区/输出/
 测试工作区/数据集/*
 !测试工作区/数据集/.gitkeep
 !测试工作区/数据集/README.md
@@ -53,6 +60,10 @@ deploy/workbuddy/.web-old-*/
 测试工作区/输出/*
 !测试工作区/输出/.gitkeep
 !测试工作区/输出/README.md
+
+# Agent/发布过程中的本机临时脚本与中间产物：不属于源码
+.dsh-tmp/
+torchinductor_*/
 
 # 编辑器与系统
 .vscode/

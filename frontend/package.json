@@ -8,7 +8,8 @@
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "vue-tsc --noEmit",
-    "test:logic": "node --experimental-strip-types --test tests/timeline.test.ts tests/business.test.ts tests/geometry.test.ts tests/review.test.ts tests/interaction.test.ts tests/reflow.test.ts tests/layout.test.ts tests/sync.test.ts"
+    "test:logic": "node --experimental-strip-types --test tests/timeline.test.ts tests/business.test.ts tests/geometry.test.ts tests/review.test.ts tests/interaction.test.ts tests/reflow.test.ts tests/layout.test.ts tests/sync.test.ts",
+    "test:upload": "node --experimental-strip-types --experimental-loader ./tests/alias-loader.mjs --test tests/upload.test.ts"
   },
   "dependencies": {
     "dompurify": "^3.4.17",

@@ -122,6 +122,33 @@ pre {
   color: var(--text-secondary);
 }
 
+/* 后端暂时不可用：保留当前路由、提供重试，不把登录态当成失效。 */
+.boot-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 24px;
+  text-align: center;
+}
+
+.boot-error h1 {
+  margin: 0;
+  font-size: 18px;
+  color: var(--text);
+}
+
+.boot-error p {
+  margin: 0;
+  max-width: 520px;
+  line-height: 1.6;
+}
+
+.boot-error .form-actions {
+  margin-top: 6px;
+}
+
 /* ---------------- 布局 ---------------- */
 
 /* 结构同 v1.6：左侧导航 + 项目主体（顶部工具栏 + 内容行）。 */
@@ -296,11 +323,24 @@ pre {
 
 .header-actions,
 .card-actions,
-.row-actions {
+.row-actions:not(td) {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+/* 操作列必须保持 table-cell：把 flex 加在 td 上会让行高和横线脱离同表，
+   表现为操作列单元格比同行其他单元格矮一截、底部分隔线对不上。 */
+td.row-actions {
+  display: table-cell;
+  white-space: nowrap;
+}
+
+td.row-actions > button + button,
+td.row-actions > a + button,
+td.row-actions > button + a {
+  margin-left: 6px;
 }
 
 .cards {
@@ -482,6 +522,33 @@ pre {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 12px;
+}
+
+/* 权重预检结果：只读结果卡，和导入表单区分开，避免看起来像“已导入”。 */
+.weight-inspection {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent, #4f8cff);
+  border-radius: var(--radius-sm);
+  background: var(--panel-muted, rgba(127, 127, 127, 0.06));
+}
+
+.weight-inspection .card-head {
+  margin: 0 0 6px;
+}
+
+.weight-inspection .hint {
+  margin: 2px 0;
+  font-size: 12px;
+}
+
+/* 导入数据集默认自动识别模态；只有识别不出来时才展开手动指定。 */
+.auto-modality {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
 }
 
 .field {
@@ -719,6 +786,14 @@ button:focus-visible,
 
 /* ---------------- 表格 ---------------- */
 
+/* 窄屏（尤其右侧停靠助手时）业务区可能只剩 500px 左右；局部横向滚动
+   比裁掉操作列安全，且不影响 1440 桌面宽度。 */
+.table-scroll {
+  width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
 .table {
   width: 100%;
   border-collapse: collapse;
@@ -816,7 +891,16 @@ button:focus-visible,
   text-overflow: ellipsis;
 }
 
-.session-title:hover {
+/* 会话标题既可能是按钮（旧侧栏/项目详情抽屉）也可能是可访问链接；
+   按钮需要显式继承字体与颜色，否则浏览器默认按钮外观会破坏抽屉层级。 */
+.session-title {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.session-title:hover,
+.session-title:focus-visible {
   color: var(--accent);
 }
 
@@ -840,7 +924,8 @@ button:focus-visible,
   display: grid;
   place-items: center;
   padding: 20px;
-  z-index: 50;
+  /* 必须高于抽屉遮罩（60）与侧栏抽屉（75），否则从抽屉内打开的确认框会被遮罩层盖住、点击落到 backdrop。 */
+  z-index: 80;
 }
 
 .modal {
@@ -1432,6 +1517,24 @@ body.dock-dragging {
   gap: 6px;
 }
 
+.message-question {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--accent);
+  background: var(--panel);
+  border-radius: 0 8px 8px 0;
+  font-size: 12.5px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.message-question-text {
+  margin: 0;
+  flex-basis: 100%;
+}
+
 .tool-list {
   margin: 0;
   padding: 0;
@@ -1786,6 +1889,26 @@ body.dock-dragging {
 
 .composer-box:focus-within {
   border-color: var(--text-secondary);
+}
+
+/* 选择上下文提示：只展示“已附带多少条 + 来源页面”，精确 ID 走后端 ui_context。 */
+.selection-context {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 2px 6px;
+  padding: 5px 9px;
+  border-radius: 8px;
+  background: var(--panel-soft);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.selection-context strong {
+  color: var(--text-primary);
+  font-weight: 600;
 }
 
 .composer.dragging .composer-box {
@@ -2148,6 +2271,28 @@ body.dock-dragging {
   padding: 0;
   background: rgba(12, 18, 24, 0.34);
   cursor: pointer;
+}
+
+/* 抽屉打开后，☰ 会被 sidebar 盖住；在抽屉右缘固定一个始终可点的关闭按钮。 */
+.sidebar-close {
+  position: fixed;
+  top: 10px;
+  left: calc(min(86vw, 280px) - 38px);
+  z-index: 75;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border-control);
+  border-radius: 7px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.sidebar-close:hover {
+  background: var(--panel-secondary);
 }
 
 .sidebar-toggle {
@@ -2838,3 +2983,14 @@ body.dock-dragging {
     display: none;
   }
 }
+
+.dataset-preview {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--ok, #2f7d4f);
+  border-radius: 6px;
+  background: var(--panel-2, rgba(47, 125, 79, 0.06));
+  padding: 8px 10px;
+  margin: 4px 0 8px;
+  font-size: 13px;
+}
+.dataset-preview p { margin: 2px 0; }

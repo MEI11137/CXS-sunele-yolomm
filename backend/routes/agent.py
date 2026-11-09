@@ -18,7 +18,7 @@ import time
 from flask import Blueprint, Response, current_app, request, stream_with_context
 
 from backend import auth, db
-from backend.agent import identity, policy, store, tools
+from backend.agent import continuation, identity, policy, store, tools
 from backend.agent.context import ToolError
 from backend.errors import ApiError, conflict, not_found, ok
 from backend.services import audit, projects, sessions
@@ -165,7 +165,12 @@ def put_preferences():
             clear_model = True
     if clear_model:
         store.clear_model_pref(conn, user_id)
-    store.save_prefs(conn, user_id, mode=mode, model=model)
+    # model 单独更新时 mode 会是 None；首次写入用户没有 user_prefs 行，直接 INSERT 会撞
+    # user_prefs.mode 的 NOT NULL。补上现有值或默认模式，避免“只切模型”返回 500。
+    effective_mode = mode
+    if effective_mode is None:
+        effective_mode = store.prefs(conn, user_id)["mode"] or policy.DEFAULT_MODE
+    store.save_prefs(conn, user_id, mode=effective_mode, model=model)
     if mode is not None:
         audit.record(conn, user_id, "prefs.mode", mode)
     return ok(_prefs_payload(conn, user_id))
@@ -207,6 +212,47 @@ def create_turn(session_id: str):
             }
         )
 
+    # 界面选择上下文：只接受“用户在页面上显式勾选”的记录 ID。
+    # 校验必须放在幂等检查之后：同一 request_id 的成功轮次响应丢失后重试，
+    # 应直接返回原轮次；此时所选记录可能已被删除，不能因为当前上下文失效而变 400。
+    # 这里由后端逐个校验归属与可访问性，不能把前端文字当成事实；
+    # 校验通过后再写入消息 meta，由 runner 以只读上下文段落交给模型。
+    ui_context: dict[str, object] = {}
+    raw_context = payload.get("ui_context")
+    if raw_context not in (None, {}):
+        if not isinstance(raw_context, dict):
+            raise ApiError(400, "VALIDATION", "ui_context 必须是对象")
+        page = str(raw_context.get("page") or "").strip()[:80]
+        raw_ids = raw_context.get("record_ids") or []
+        if not isinstance(raw_ids, list):
+            raise ApiError(400, "VALIDATION", "ui_context.record_ids 必须是数组")
+        if len(raw_ids) > 100:
+            raise ApiError(400, "VALIDATION", "一次最多附带 100 条记录选择")
+        record_ids = [str(item).strip() for item in raw_ids if str(item).strip()]
+        if record_ids:
+            from backend.services import detection as detection_service
+
+            for record_id in record_ids:
+                try:
+                    record = detection_service.get_owned(
+                        conn, user_id, project["id"], record_id
+                    )
+                except (ApiError, KeyError):
+                    raise ApiError(
+                        400,
+                        "INVALID_UI_CONTEXT",
+                        "界面选择上下文里的记录不属于当前项目或已失效，请重新勾选后再发送",
+                    ) from None
+                # 已软删的记录对用户不可见，不能借旧 request_id 或手写 ID 继续带入；
+                # 幂等重试在上面的 existing 分支已提前返回，不受这里影响。
+                if record["deleted_at"]:
+                    raise ApiError(
+                        400,
+                        "INVALID_UI_CONTEXT",
+                        "界面选择上下文里的记录已被删除，请重新勾选后再发送",
+                    )
+            ui_context = {"page": page or "未标注页面", "record_ids": record_ids}
+
     active = store.active_for_session(conn, session["id"])
     if active is not None:
         raise conflict(
@@ -247,6 +293,7 @@ def create_turn(session_id: str):
             "source": "web",
             "request_id": request_id,
             "asset_ids": asset_ids,
+            **({"ui_context": ui_context} if ui_context else {}),
         },
     )
     try:
@@ -482,42 +529,15 @@ def approve_action(action_id: str):
 
 
 def _start_continuation(conn, action, user_id: int) -> dict | None:
-    """确认后让助手基于真实结果继续；已有活动轮次时不插队。"""
-    session = conn.execute(
-        "SELECT * FROM sessions WHERE id = ? AND owner_id = ?", (action["session_id"], user_id)
-    ).fetchone()
-    if session is None or session["status"] != "active":
+    """确认后让助手基于真实结果继续；已有活动轮次时不插队。
+
+    与轮次收尾共用 ``continuation.start_action_continuation``：approve 早于原轮次
+    结束时这里会因活动轮次返回 None，原轮次收尾时由 runner 的收尾扫描再接上；
+    两边都用 ``resume_<action_id>`` 幂等，不会重复续跑。
+    """
+    if int(action["owner_id"]) != int(user_id):
         return None
-    if store.active_for_session(conn, session["id"]) is not None:
-        return None
-    project = conn.execute(
-        "SELECT * FROM projects WHERE id = ? AND owner_id = ?", (action["project_id"], user_id)
-    ).fetchone()
-    if project is None or project["status"] != "active":
-        return None
-    connection = identity.connection_for(conn, user_id)
-    if connection is None:
-        return None
-    request_id = f"resume_{action['id']}"[:64]
-    try:
-        turn, created = store.create(
-            conn,
-            session_id=session["id"],
-            project_id=project["id"],
-            owner_id=user_id,
-            request_id=request_id,
-            mode=identity.effective_mode(conn, user_id),
-            provider=str(connection["provider"]),
-            model=identity.effective_model(conn, user_id, connection),
-            fingerprint=identity.connection_fingerprint(connection),
-            kind="continuation",
-        )
-    except Exception:
-        return None
-    if not created:
-        return store.turn_public(turn)
-    _runtime().runner.start(turn["id"])
-    return store.turn_public(turn)
+    return continuation.start_action_continuation(conn, action, _runtime().runner.start)
 
 
 @bp.post("/actions/<action_id>/reject")

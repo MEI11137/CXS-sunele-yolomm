@@ -402,7 +402,7 @@ async function loadAudit(server: McpServer): Promise<void> {
   gap: 8px;
   flex-wrap: wrap;
 }
-.row-actions {
+.row-actions:not(td) {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;

@@ -192,6 +192,28 @@ function assetIds(message: ChatMessage): string[] {
   return raw.map((item) => String(item)).filter(Boolean)
 }
 
+type PersistedQuestion = { question: string; options: string[] }
+
+/**
+ * 历史回答里落库的提问。
+ *
+ * 轮次跑完、最终回答落库后，实时区会收起；如果提问只存在于 turn_events，
+ * 用户就只看到“问题已发给你”却找不到问题。后端把最后一次提问写进消息 meta，
+ * 这里从 meta 再渲染一次，刷新后也还在。
+ */
+function messageQuestion(message: ChatMessage): PersistedQuestion | null {
+  if (message.role !== 'assistant') return null
+  const raw = message.meta?.question
+  if (!raw || typeof raw !== 'object') return null
+  const data = raw as { question?: unknown; options?: unknown }
+  const text = typeof data.question === 'string' ? data.question.trim() : ''
+  if (!text) return null
+  const options = Array.isArray(data.options)
+    ? data.options.map((item) => String(item)).filter(Boolean).slice(0, 5)
+    : []
+  return { question: text, options }
+}
+
 /**
  * 缩略图地址：走已鉴权的资产内容接口，**不信任**消息里的任何路径。
  * 跨账号/跨项目会 404，损坏的文件由后端 SHA 校验拒绝——两种都在界面上给占位。
@@ -439,6 +461,20 @@ defineExpose({ toLatest })
         ></div>
         <p v-else class="message-text">{{ message.content }}</p>
 
+        <!-- 落库后的提问：避免轮次结束后“问题已发给你”却看不到问题。 -->
+        <div v-if="messageQuestion(message)" class="message-question" role="status">
+          <p class="message-question-text">{{ messageQuestion(message)?.question }}</p>
+          <button
+            v-for="option in messageQuestion(message)?.options ?? []"
+            :key="option"
+            class="ghost small"
+            type="button"
+            @click="emit('pick', option)"
+          >
+            {{ option }}
+          </button>
+        </div>
+
         <!-- 用户发出的图片：从消息 meta 的资产引用读，刷新后仍然在。 -->
         <div v-if="assetIds(message).length" class="message-attachments">
           <template v-for="assetId in assetIds(message)" :key="assetId">
@@ -458,15 +494,16 @@ defineExpose({ toLatest })
           </template>
         </div>
 
-        <!-- 成功轮次的执行详情：默认收起，点开才按 meta.turn_id 拉这一轮的事件。 -->
+        <!-- 历史轮次的执行详情：默认收起；未拉事件前不判断成败，展开后才按 turn_id 读取。 -->
         <details
           v-if="message.role === 'assistant' && toolCountOf(message) > 0"
           class="turn-detail"
           @toggle="onToggleDetail($event, message)"
         >
           <summary class="turn-detail-head">
-            已完成 · {{ toolCountOf(message) }} 项操作
-            <span class="turn-detail-hint">查看执行详情</span>
+            <template v-if="detailLoaded(message)">{{ toolFoldSummary(detailCards(message)) }}</template>
+            <template v-else>工具调用 {{ toolCountOf(message) }} 次 · 执行记录</template>
+            <span class="turn-detail-hint">{{ detailLoaded(message) ? '查看执行详情' : '展开后读取' }}</span>
           </summary>
           <ul v-if="detailCards(message).length" class="tool-list">
             <li v-for="card in detailCards(message)" :key="card.callId" class="tool-card">

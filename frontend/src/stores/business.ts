@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, reactive, ref } from 'vue'
-import { errorMessage, errorStatus } from '@/api/http'
+import { ApiError, errorMessage, errorStatus } from '@/api/http'
 import * as api from '@/api/business'
 import { buildCards, lastJobSeq, mergeJobEvents, scopeEvents } from '@/lib/business'
 import type {
@@ -151,7 +151,11 @@ export const useBusinessStore = defineStore('business', () => {
     try {
       const { before: _cursor, limit: _limit, ...scope } = params
       recordScope[projectId] = scope
+      const scopeKey = JSON.stringify(scope)
       const data = await api.listRecords(projectId, { limit: 20, ...params })
+      // 会话页后台作业轮询可能带着旧 session 范围迟到；若页面已切到新的筛选范围，
+      // 旧响应必须丢弃，避免把刚加载好的记录表覆盖成空列表。
+      if (JSON.stringify(recordScope[projectId]) !== scopeKey) return
       records[projectId] = data
     } catch (failure) {
       error.value = errorMessage(failure)
@@ -211,7 +215,13 @@ export const useBusinessStore = defineStore('business', () => {
       await loadRecords(projectId, { ...recordScope[projectId] }, true)
       return true
     } catch (failure) {
-      error.value = errorMessage(failure)
+      if (failure instanceof ApiError && failure.code === 'VISION_UNVERIFIED') {
+        // 这次 409 是“当前对话模型没有看图证据”，不是网络抖动：
+        // 明确告诉用户当前模型和下一步，避免只剩一句抽象的前置条件错误。
+        error.value = `${errorMessage(failure)}。当前对话选择的模型不能看图；请到设置页「模型连接」切换回已通过图像验证的模型，重新点“检查连接”后再核查。`
+      } else {
+        error.value = errorMessage(failure)
+      }
       return false
     } finally {
       busy.value = ''

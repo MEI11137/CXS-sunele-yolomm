@@ -1784,7 +1784,11 @@ def finalize_draft(conn, user_id: int, project_id: str, draft_id: str) -> dict:
         (str(dataset["id"]), security.now_iso(), security.now_iso(), str(row["id"])),
     )
     conn.commit()
-    return {"dataset": dataset, "created": True, "note": "已定稿：数据集目录、清单与 ZIP 已生成。"}
+    note = (
+        f"已定稿：生成数据集「{dataset['name']}」，共 {dataset['sample_count']} 个样本；"
+        "数据集目录、清单与 ZIP 已生成。"
+    )
+    return {"dataset": dataset, "created": True, "note": note}
 
 
 def resplit(

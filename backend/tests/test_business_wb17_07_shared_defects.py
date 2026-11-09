@@ -25,7 +25,7 @@ from backend.errors import ApiError
 from backend.services import datasets as dataset_service
 from backend.services import detection as detection_service
 from backend.services import storage
-from backend.tests.support import body, csrf_headers
+from backend.tests.support import body, csrf_headers, make_temp_dir
 from backend.tests.test_business_wb17_03 import BusinessBase, png_bytes
 
 
@@ -354,7 +354,7 @@ class ShellAnalyzerEdgeTest(unittest.TestCase):
     def setUp(self):
         import tempfile
 
-        self.root = Path(tempfile.mkdtemp(prefix="hx17-shell-edge-"))
+        self.root = make_temp_dir("hx17-shell-edge-")
         (self.root / "notes.txt").write_text("热斑 阈值 70C\n", encoding="utf-8")
 
     def tearDown(self):

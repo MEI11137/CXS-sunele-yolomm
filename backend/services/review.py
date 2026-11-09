@@ -885,6 +885,38 @@ def reopen(
     return state(conn, user_id, project_id, record_id)
 
 
+_QUEUE_BUCKETS = ("pending", "draft", "rejected", "confirmed")
+
+
+def _queue_bucket_joins_sql() -> str:
+    """把某条记录最近一次已提交版本、当前草稿挂成别名，供分桶 CASE 使用。
+
+    与 ``_latest_submitted`` / ``_draft`` 的口径一致；只查各一条，靠
+    ``idx_review_detection(detection_id, version)`` 而不是 Python 逐条 N+1。
+    """
+    return (
+        "LEFT JOIN review_versions q_latest ON q_latest.id = ("
+        " SELECT rv.id FROM review_versions rv WHERE rv.detection_id = d.id"
+        " AND rv.owner_id = ? AND rv.status != 'draft'"
+        " ORDER BY rv.version DESC LIMIT 1)"
+        " LEFT JOIN review_versions q_draft ON q_draft.id = ("
+        " SELECT rv.id FROM review_versions rv WHERE rv.detection_id = d.id"
+        " AND rv.owner_id = ? AND rv.status = 'draft' LIMIT 1)"
+    )
+
+
+def _queue_bucket_case_sql() -> str:
+    """列表/计数共用的 SQL 分桶表达式，逐条对应 ``_bucket_for``。"""
+    return (
+        "CASE WHEN q_latest.id IS NULL THEN"
+        " CASE WHEN q_draft.id IS NULL THEN 'pending' ELSE 'draft' END"
+        " WHEN q_latest.status = 'rejected' AND q_draft.version IS NOT NULL"
+        " AND q_draft.version > q_latest.version THEN 'draft'"
+        " WHEN q_latest.status = 'rejected' THEN 'rejected'"
+        " ELSE 'confirmed' END"
+    )
+
+
 def queue(
     conn,
     user_id: int,
@@ -892,9 +924,17 @@ def queue(
     *,
     view: str = "pending",
     record_ids: list[str] | None = None,
+    flow_id: str | None = None,
     limit: int = 50,
 ) -> dict:
-    """待复核 / 已驳回 / 已确认 三个视图。驳回后默认不再出现在待复核里。"""
+    """待复核 / 已驳回 / 已确认 / 草稿四个视图。驳回后默认不再出现在待复核里。
+
+    ``counts`` 是全项目（或指定批次）的精确统计，不受列表上限影响；``items`` 只返回
+    当前视图的列表窗口（最多 500 行，再按 ``limit`` 截到 200）。两者范围不同是刻意
+    分开的：列表用于翻看，计数用于判断“还有多少要做”。
+
+    ``flow_id`` 只收窄本次列表与计数；批次下拉仍返回本项目全部批次，用户可随时切回。
+    """
     clauses = [
         "d.project_id = ?",
         "d.owner_id = ?",
@@ -906,12 +946,35 @@ def queue(
         placeholders = ", ".join("?" for _ in record_ids)
         clauses.append(f"d.id IN ({placeholders})")
         params.extend(str(item) for item in record_ids)
+    if flow_id:
+        clauses.append("d.flow_id = ?")
+        params.append(str(flow_id))
+    wanted = view if view in _QUEUE_BUCKETS else "pending"
+    bucket_case = _queue_bucket_case_sql()
+    # 列表只取当前视图的记录，避免“按全局最新 500 条再分桶”把少见视图饿死；
+    # counts 走下面的精确聚合，不受列表上限影响。
     rows = conn.execute(
-        f"SELECT d.* FROM detections d WHERE {' AND '.join(clauses)} "
+        "SELECT d.* FROM detections d "
+        f"{_queue_bucket_joins_sql()} "
+        f"WHERE {' AND '.join(clauses)} AND {bucket_case} = ? "
         "ORDER BY d.created_at DESC LIMIT 500",
-        tuple(params),
+        (int(user_id), int(user_id), *params, wanted),
     ).fetchall()
-    buckets = {"pending": [], "draft": [], "rejected": [], "confirmed": []}
+    count_rows = conn.execute(
+        f"SELECT {bucket_case} AS bucket, COUNT(*) AS n FROM detections d "
+        f"{_queue_bucket_joins_sql()} "
+        f"WHERE {' AND '.join(clauses)} GROUP BY bucket",
+        (int(user_id), int(user_id), *params),
+    ).fetchall()
+    flow_rows = conn.execute(
+        "SELECT DISTINCT d.flow_id FROM detections d WHERE d.project_id = ? AND d.owner_id = ? "
+        "AND d.status = 'done' AND d.deleted_at IS NULL AND d.flow_id IS NOT NULL AND d.flow_id != ''",
+        (str(project_id), int(user_id)),
+    ).fetchall()
+    counts = {name: 0 for name in _QUEUE_BUCKETS}
+    for row in count_rows:
+        counts[str(row["bucket"])] = int(row["n"])
+    items = []
     for row in rows:
         latest = _latest_submitted(conn, row["id"], user_id)
         draft = _draft(conn, row["id"], user_id)
@@ -921,14 +984,13 @@ def queue(
         item["review"] = public_version(latest) if latest else None
         item["draft"] = public_version(draft) if draft else None
         item["bucket"] = bucket
-        buckets[bucket].append(item)
-    wanted = view if view in buckets else "pending"
-    items = buckets[wanted][: max(1, min(int(limit or 50), 200))]
+        items.append(item)
+    items = items[: max(1, min(int(limit or 50), 200))]
     return {
         "view": wanted,
         "items": items,
-        "counts": {name: len(value) for name, value in buckets.items()},
-        "flow_ids": sorted({str(row["flow_id"]) for row in rows if row["flow_id"]}),
+        "counts": counts,
+        "flow_ids": sorted({str(row["flow_id"]) for row in flow_rows if row["flow_id"]}),
     }
 
 

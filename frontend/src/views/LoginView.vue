@@ -2,12 +2,9 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
-import { useConnectionStore } from '@/stores/connection'
-import { useWorkspaceStore } from '@/stores/workspace'
+import { resetUserScopedStores } from '@/stores/sessionReset'
 
 const auth = useAuthStore()
-const workspace = useWorkspaceStore()
-const connection = useConnectionStore()
 const router = useRouter()
 const route = useRoute()
 
@@ -28,8 +25,8 @@ async function submit(): Promise<void> {
   localError.value = ''
   try {
     await auth.login(username.value.trim(), password.value)
-    workspace.reset()
-    connection.reset()
+    // 换账号登录：旧账号的助手轮询/业务缓存/选择上下文都不能带进新会话。
+    resetUserScopedStores()
     const next = typeof route.query.next === 'string' ? route.query.next : '/projects'
     await router.replace(next)
   } catch {

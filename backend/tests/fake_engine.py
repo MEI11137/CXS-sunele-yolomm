@@ -309,6 +309,14 @@ class FakeEngine:
                     },
                     parts,
                 )
+                if script.get("tool_final_gap"):
+                    # 模拟真实引擎：工具轮已落库后、下一步还在排队，状态短暂 idle
+                    # 才追加最终文本；旧实现会在 idle 宽限期提前判 NO_FINAL_TEXT。
+                    with self._lock:
+                        session["state"] = "idle"
+                    time.sleep(float(script["tool_final_gap"]))
+                    with self._lock:
+                        session["state"] = "busy"
 
             if script.get("error"):
                 self._append(

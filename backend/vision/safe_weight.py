@@ -21,7 +21,12 @@
 
 vendor 版 ultralytics 内部仍然调用 ``torch.load(weights_only=False)``；``install_guard()``
 在进程内把这条路径重定向到本模块（不改 vendor 源码）。``safe_globals`` 是**进程级**
-状态，所以加载用一把模块级锁串行化，避免多线程互相增删许可项。
+状态：它内部维护一份全局许可集合，上下文退出时会把本线程加的项**从全局集合里删掉**。
+并发请求下两个上下文的进入/退出顺序不可控，会出现「A 退出时删掉了 B 正在用的
+DetectionModel」→ ``Unsupported global``（2026-11-08 现场：多线程同时导入权重时 5/6
+请求偶发失败）。因此这里不用可移除上下文，改为**只增不减地注册**审核过的符号
+（集合本来就等价于 ALLOWED_SYMBOLS，按表审核的语义不变），并用模块级锁串行化
+``torch.load`` 本身。
 """
 
 from __future__ import annotations
@@ -107,6 +112,9 @@ FORBIDDEN = frozenset(
 )
 
 _load_lock = threading.Lock()
+# 已注册进 torch 全局许可集合的对象；只增不减，避免并发下互相撤销。
+_register_lock = threading.Lock()
+_registered_allowed: set[Any] = set()
 
 
 class WeightRejected(RuntimeError):
@@ -116,6 +124,27 @@ class WeightRejected(RuntimeError):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+def _register_allowed(allowed: list[Any]) -> None:
+    """把本次审核通过的类型**累积**注册到 torch 的进程级许可集合。
+
+    不用 ``safe_globals`` 上下文：它退出时会从全局集合里移除本次添加的项，
+    多线程并发加载时可能把别的线程仍在用的类型删掉（真实复现：
+    多线程导入权重 5/6 出现 ``Unsupported global: DetectionModel``）。
+    注册集合只包含 ``ALLOWED_SYMBOLS`` 审核过的对象，累积不会放宽审核边界；
+    ``torch.load`` 仍由 ``_load_lock`` 串行化。
+    """
+    import torch
+
+    add_safe_globals = getattr(torch.serialization, "add_safe_globals", None)
+    if add_safe_globals is None:  # pragma: no cover - torch < 2.6 在 allowed_globals 已拒绝
+        return
+    with _register_lock:
+        pending = [obj for obj in allowed if obj not in _registered_allowed]
+        if pending:
+            add_safe_globals(pending)
+            _registered_allowed.update(pending)
 
 
 def _resolve_approved(ref: str) -> Any:
@@ -209,10 +238,10 @@ def load(path: str | Path, *, map_location: Any = "cpu") -> Any:
             f"权重声明了未审核的反序列化类型（{preview}{more}）；已拒绝加载。"
             "需要支持新架构时，请审核这些符号并加入 backend/vision/safe_weight.py 的 ALLOWED_SYMBOLS。",
         )
+    _register_allowed(allowed)
     with _load_lock:
         try:
-            with torch.serialization.safe_globals(allowed):
-                return torch.load(source, map_location=map_location, weights_only=True)
+            return torch.load(source, map_location=map_location, weights_only=True)
         except WeightRejected:
             raise
         except Exception as exc:

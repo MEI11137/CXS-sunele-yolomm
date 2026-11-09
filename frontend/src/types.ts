@@ -304,6 +304,28 @@ export interface AssetSummary {
   url: string
 }
 
+export interface WeightInspection {
+  /** 来源：asset_id 或项目内 rel_path（与请求一致） */
+  asset_id?: string
+  rel_path?: string
+  filename?: string
+  /** 项目内相对路径（服务端归一化后的值） */
+  path: string
+  size: number
+  sha256: string
+  classes: string[]
+  class_count: number
+  kind: string
+  task: string
+  multimodal: boolean
+  primary_modality: string | null
+  secondary_modality: string | null
+  evidence: Record<string, unknown>
+  /** 真实结构对应的 family；导入时应按这里选，而不是按文件名猜 */
+  suggested_family: 'yolo' | 'yolomm'
+  note: string
+}
+
 export interface DatasetSummary {
   /** 导入时命中已有内容：返回的是既有数据集，不是新建。 */
   reused?: boolean;
@@ -332,6 +354,20 @@ export interface DatasetSummary {
   manifest_rel: string | null
   export_rel: string | null
   export_url: string | null
+}
+
+export interface DatasetPreview {
+  source: 'zip' | 'local'
+  suggested_name: string
+  has_yaml: boolean
+  modalities: string[]
+  primary_modality: 'rgb' | 'ir'
+  secondary_modality: string | null
+  classes: string[]
+  class_count: number
+  split_counts: Partial<Record<'train' | 'val' | 'test', number>>
+  sample_count: number
+  warnings: string[]
 }
 
 export interface DatasetSample {

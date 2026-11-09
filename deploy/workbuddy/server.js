@@ -470,6 +470,8 @@ function pickRequestHeaders(raw) {
     'accept', 'accept-language', 'content-type', 'cookie', 'authorization',
     'x-csrf-token', 'user-agent', 'referer', 'range', 'if-none-match',
     'if-modified-since', 'origin', 'x-requested-with',
+    // 分块上传：每个块的 SHA256 由后端强制校验，缺了它整条大文件上传必然失败。
+    'x-chunk-sha256',
   ])
   for (const [key, value] of Object.entries(raw)) {
     const lower = key.toLowerCase()

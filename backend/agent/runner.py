@@ -30,6 +30,10 @@ DEFAULT_TIMEOUT = 900
 POLL_INTERVAL = 0.5
 IDLE_STABLE_SECONDS = 1.2
 IDLE_GRACE_SECONDS = 6.0
+# 引擎在“工具调用轮”也会短暂报 idle（工具结果落库、下一步还在排队），
+# 真实案例里最终回答比工具消息晚约 2~3 秒才出现，而 6 秒宽限从上一个 idle 起算，
+# 会把这轮误判成 NO_FINAL_TEXT。最后一轮是工具调用时，给最终文本更长的收尾窗口。
+TOOL_ROUND_GRACE_SECONDS = 20.0
 STOP_WAIT_SECONDS = 20.0
 MAX_ENGINE_ERRORS = 5
 TOOL_EVENT_LIMIT = 160
@@ -200,6 +204,11 @@ class TurnRunner:
         try:
             turn = store.get(conn, turn_id)
             session_id = str(turn["session_id"])
+            # 先接已完成动作的续跑，再接人工复核 ready：两者都依赖同一会话的
+            # active 限制；动作若先被 review 接力占用，它的回复就会永远丢。
+            from backend.agent import continuation
+
+            continuation.settle_action_continuations(conn, turn, self.start)
             followups.finish_turn(conn, turn_id)
             followups.drain(conn, session_id, start=self.start)
         except Exception:
@@ -241,6 +250,16 @@ class TurnRunner:
             if owner is None:
                 return
             project, session, connection, fingerprint, model = owner
+            # 续跑来源如果已取消/结果缺失，直接按失败终止，不能发一个“不要调用工具”
+            # 的软提示轮次——模型仍可能动手，业务上也不该有这一轮。
+            if not self._continuation_source_ok(conn, turn):
+                self._fail(
+                    conn,
+                    turn,
+                    "CONTINUATION_EXPIRED",
+                    "本轮续跑对应的确认动作已取消或结果缺失，未执行任何操作。",
+                )
+                return
 
             root = Path(str(project["root_path"]))
             spec = engine_module.EngineSpec(
@@ -261,6 +280,7 @@ class TurnRunner:
                 # 声明 image 输入会把图片发给不支持图像的模型。
                 vision=identity.verified_vision(conn, int(turn["owner_id"]), model),
             )
+            self._rebuild_after_stopped_turn(conn, turn)
             try:
                 instance = self._manager.get(spec)
             except engine_module.EngineUnavailable as exc:
@@ -329,6 +349,27 @@ class TurnRunner:
             return
         finally:
             conn.close()
+
+    def _rebuild_after_stopped_turn(self, conn, turn) -> None:
+        """上一轮被用户主动停止后，下一轮不要复用可能残留取消上下文的引擎。
+
+        停止时确认空闲的引擎按生命周期契约保留（见 test_confirmed_abort_keeps_engine）；
+        但实测 opencode 1.19.4 在停止后，同一引擎会让下一轮空回答（NO_FINAL_TEXT）。
+        因此只在**下一轮开始前**、且该会话最近一轮确为 STOPPED 时替换这台会话的
+        引擎进程；存储保留，本轮会从站内历史恢复上下文。其他会话完全不受影响。
+        """
+        previous = conn.execute(
+            "SELECT status, error_code FROM turns "
+            "WHERE session_id = ? AND id <> ? ORDER BY rowid DESC LIMIT 1",
+            (str(turn["session_id"]), str(turn["id"])),
+        ).fetchone()
+        if (
+            previous is None
+            or previous["status"] != "stopped"
+            or previous["error_code"] != "STOPPED"
+        ):
+            return
+        self._manager.quarantine_session(int(turn["owner_id"]), str(turn["session_id"]))
 
     def _message_ids(self, instance, engine_session: str) -> set[str]:
         """当前引擎会话里已经存在的消息 ID 集合（本轮的判定边界）。
@@ -520,6 +561,11 @@ class TurnRunner:
             newest = rows[-1]
             if str(newest["role"]) == "user" and str(newest["content"]) == str(prompt_text):
                 rows = rows[:-1]
+        # 没有助手回答的尾部用户消息不要带进恢复上下文：典型来源是被用户停止的
+        # 上一轮（请求已落库但从未执行完）。把它当历史喂给新引擎，模型会先回答
+        # 那条旧请求，而不是本轮真正要问的问题（实测停止后重发会被旧请求带偏）。
+        while rows and str(rows[-1]["role"]) == "user":
+            rows.pop()
         lines: list[str] = []
         for row in rows[-20:]:
             text = " ".join(str(row["content"] or "").split())
@@ -585,39 +631,110 @@ class TurnRunner:
             )
         return parts
 
+    def _continuation_source_ok(self, conn, turn) -> bool:
+        """续跑轮次必须仍能找到自己的来源；否则在请求模型前终止。"""
+        request_id = str(turn["request_id"] or "")
+        if request_id.startswith("review-followup:"):
+            from backend.services import followups
+
+            return followups.prompt_for(conn, request_id) is not None
+        if str(turn["kind"]) == "continuation" and request_id.startswith("resume_"):
+            from backend.agent import continuation
+
+            return continuation.action_for_resume(conn, turn) is not None
+        return True
+
+    def _invalid_continuation_text(self) -> str:
+        """续跑来源已取消/缺失时给模型的明确失效说明，避免猜结果。"""
+        return (
+            "【系统事件】本轮续跑对应的确认动作已取消、不存在或结果缺失，不能继续这个动作。\n"
+            "请只向用户简要说明：该续跑已失效，本轮没有执行任何操作；"
+            "不要猜测执行结果，也不要调用工具。"
+        )
+
     def _prompt_text(self, conn, turn) -> str:
         # 人工提交接力：turns.kind 仍用既有允许值 continuation，
         # 用幂等键前缀区分来源，避免为一个新来源再重建 turns 表。
-        if str(turn["request_id"]).startswith("review-followup:"):
+        request_id = str(turn["request_id"] or "")
+        if request_id.startswith("review-followup:"):
             from backend.services import followups
 
-            text = followups.prompt_for(conn, str(turn["request_id"]))
+            text = followups.prompt_for(conn, request_id)
             if text:
                 return text
-        if turn["kind"] == "continuation":
-            row = conn.execute(
-                "SELECT * FROM actions WHERE session_id = ? AND status = 'done' "
-                "ORDER BY decided_at DESC, created_at DESC LIMIT 1",
-                (turn["session_id"],),
-            ).fetchone()
-            if row is not None:
-                try:
-                    result = json.loads(row["result"] or "{}")
-                except ValueError:
-                    result = {}
-                return (
-                    "【系统事件】用户已确认你上一步请求的动作并已执行完成。\n"
-                    f"动作：{row['title']}\n"
-                    f"执行结果：{json.dumps(result, ensure_ascii=False)[:1500]}\n\n"
-                    "请基于这个真实结果继续：如果用户的原始目标已完成，给出简洁的最终答复；"
-                    "还需要别的操作就继续调用工具。不要重复已经成功的动作。"
-                )
+            # 接力内容已取消/缺失：明确失效，不能跌回“会话最后一个已完成动作”。
+            return self._invalid_continuation_text()
+        if turn["kind"] == "continuation" and request_id.startswith("resume_"):
+            from backend.agent import continuation
+
+            # 按 request_id 精确回读该动作，不能按“会话最新已完成动作”猜测归属。
+            row = continuation.action_for_resume(conn, turn)
+            if row is None:
+                return self._invalid_continuation_text()
+            try:
+                result = json.loads(row["result"] or "{}")
+            except ValueError:
+                result = {}
+            return (
+                "【系统事件】用户已确认你上一步请求的动作并已执行完成。\n"
+                f"动作：{row['title']}\n"
+                f"执行结果：{json.dumps(result, ensure_ascii=False)[:1500]}\n\n"
+                "请基于这个真实结果继续：如果用户的原始目标已完成，给出简洁的最终答复；"
+                "还需要别的操作就继续调用工具。不要重复已经成功的动作。"
+            )
         row = conn.execute(
-            "SELECT content FROM messages WHERE session_id = ? AND role = 'user' "
+            "SELECT content, meta FROM messages WHERE session_id = ? AND role = 'user' "
             "ORDER BY id DESC LIMIT 1",
             (turn["session_id"],),
         ).fetchone()
-        return str(row["content"]) if row is not None else "请继续。"
+        if row is None:
+            return "请继续。"
+        text = str(row["content"])
+        # 界面选择上下文：后端已在发消息时逐个校验过归属；
+        # 这里以只读段落注入，避免模型把“页面上的勾选”当成必须复述的正文，
+        # 也明确只有列出的 ID 才算用户所指的“这条/这些/所选记录”。
+        try:
+            meta = json.loads(row["meta"] or "{}")
+        except (TypeError, ValueError):
+            meta = {}
+        context = meta.get("ui_context") if isinstance(meta, dict) else None
+        if isinstance(context, dict) and context.get("record_ids"):
+            ids = [str(item) for item in context["record_ids"]]
+            page = str(context.get("page") or "当前页面")
+            text += (
+                "\n\n【界面选择上下文（后端已校验，只读）】\n"
+                f"用户在页面「{page}」显式勾选了 {len(ids)} 条记录：{'、'.join(ids)}。\n"
+                "用户说“这条/这些/所选记录”时只指上面列出的 record_id；"
+                "需要文件名、状态或内容时请调用工具按这些 ID 查询，不要猜测，"
+                "也不要扩大到未列出的记录。人工复核结论仍由用户确认，不要代提交。"
+            )
+        else:
+            # 清空勾选后必须给出“本轮没有选择”的明确语义，避免模型从历史
+            # ui_context 里沿用上一轮 ID；只在最近确有勾选历史时注入，减少噪音。
+            recent = conn.execute(
+                "SELECT meta FROM messages WHERE session_id = ? AND role = 'user' "
+                "ORDER BY id DESC LIMIT 10",
+                (turn["session_id"],),
+            ).fetchall()
+            had_context = False
+            for recent_row in recent:
+                try:
+                    recent_meta = json.loads(recent_row["meta"] or "{}")
+                except (TypeError, ValueError):
+                    recent_meta = {}
+                if isinstance(recent_meta, dict) and isinstance(
+                    recent_meta.get("ui_context"), dict
+                ):
+                    had_context = True
+                    break
+            if had_context:
+                text += (
+                    "\n\n【界面选择上下文（本轮）】\n"
+                    "本轮发送没有附带任何页面勾选选择；历史对话里出现过的勾选记录/ID 只属于过去，"
+                    "不能沿用。如果用户说“我选中的这些/刚才勾选的”而本轮没有选择，"
+                    "应先明确说明当前没有收到选择，请用户重新勾选或直接给出记录 ID，不得猜测。"
+                )
+        return text
 
     # ------------------------------------------------------------------ 实时增量
 
@@ -948,6 +1065,8 @@ class TurnRunner:
                     read_failed = True
                     messages = []
                 self._sync(conn, turn, self._new_messages(messages, baseline), live, seen_tool)
+                # 确认空闲时保留引擎（生命周期契约），停止污染由**下一轮开始时**
+                # 按上一轮是否 stopped 决定重建，见 _rebuild_after_stopped_turn()。
                 detail = "已停止本轮：后续步骤不再执行；已完成的工具调用结果保留。"
                 if read_failed:
                     detail += "（停止时无法读取引擎消息，本轮尚未保存的中间输出可能已丢失。）"
@@ -988,7 +1107,14 @@ class TurnRunner:
                 if final is not None and quiet >= IDLE_STABLE_SECONDS:
                     self._finish_success(conn, turn, final, new_messages)
                     return
-                if quiet >= IDLE_GRACE_SECONDS:
+                # 最后一轮是工具调用、还没有最终文本：引擎常常还在跑下一步，
+                # 不能用普通 idle 宽限提前判失败；超过工具收尾窗口仍无文本才失败。
+                grace = (
+                    TOOL_ROUND_GRACE_SECONDS
+                    if self._awaiting_tool_final(new_messages)
+                    else IDLE_GRACE_SECONDS
+                )
+                if quiet >= grace:
                     self._finish_without_text(conn, turn, new_messages)
                     return
             else:
@@ -1172,6 +1298,26 @@ class TurnRunner:
             }
         return None
 
+    def _awaiting_tool_final(self, messages: list[dict]) -> bool:
+        """最新一条 assistant 还是工具调用轮，且尚未出现最终文本。"""
+        for item in reversed(messages):
+            info = item.get("info") or {}
+            if info.get("role") == "assistant" and info.get("summary"):
+                continue
+            if info.get("role") != "assistant":
+                return False
+            if not (info.get("time") or {}).get("completed"):
+                return False
+            parts = item.get("parts") or []
+            reasons = [
+                str(part.get("reason"))
+                for part in parts
+                if part.get("type") == "step-finish" and part.get("reason")
+            ]
+            finish = str(info.get("finish") or (reasons[-1] if reasons else ""))
+            return finish == "tool-calls"
+        return False
+
     def _last_error(self, messages: list[dict]) -> dict | None:
         for item in reversed(messages):
             info = item.get("info") or {}
@@ -1191,19 +1337,39 @@ class TurnRunner:
             for part in item.get("parts") or []
             if part.get("type") == "tool"
         )
-        message = self._append_assistant(
-            conn,
-            turn,
-            text,
-            {
-                "turn_id": turn["id"],
-                "mode": turn["mode"],
-                "model": turn["model"],
-                "engine_message_id": final["message_id"],
-                "tool_calls": tool_calls,
-                "finish_reason": final["reason"],
-            },
-        )
+        # 提问事件只在“实时区”显示，轮次完成、实时区收起后就会消失，
+        # 用户只看到“问题已发给你”却找不到问题。这里把最后一次提问写进消息 meta，
+        # 刷新后仍能由消息渲染出来，并可点击选项继续。
+        question = None
+        try:
+            for event in store.events_after(conn, str(turn["id"])):
+                if event.get("type") != "question":
+                    continue
+                payload = event.get("payload") or {}
+                asked = str(payload.get("question") or "").strip()
+                if not asked:
+                    continue
+                options = [
+                    str(item)[:80]
+                    for item in (payload.get("options") or [])
+                    if str(item).strip()
+                ][:5]
+                question = {"question": asked[:500], "options": options}
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "读取提问事件失败 turn=%s", str(turn["id"])
+            )
+        meta = {
+            "turn_id": turn["id"],
+            "mode": turn["mode"],
+            "model": turn["model"],
+            "engine_message_id": final["message_id"],
+            "tool_calls": tool_calls,
+            "finish_reason": final["reason"],
+        }
+        if question:
+            meta["question"] = question
+        message = self._append_assistant(conn, turn, text, meta)
         if message is None:
             # 正文没落库就不能把轮次标成功：否则刷新后回答凭空消失、状态却显示完成。
             self._fail(

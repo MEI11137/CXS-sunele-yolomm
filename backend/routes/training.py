@@ -10,6 +10,7 @@ from flask import Blueprint, request
 
 from backend import auth, db, security
 from backend.errors import ApiError, ok
+from backend.services import projects as project_service
 from backend.services import training as training_service
 
 bp = Blueprint("training", __name__)
@@ -25,6 +26,7 @@ def _user() -> dict:
 @auth.login_required
 def list_runs(project_id: str):
     conn = db.get_db()
+    project_service.get_owned(conn, project_id, int(_user()["id"]))
     limit = request.args.get("limit", "30")
     try:
         size = int(limit)

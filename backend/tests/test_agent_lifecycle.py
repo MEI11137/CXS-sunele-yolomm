@@ -742,6 +742,15 @@ class StopQuarantinesEngineTest(LifecycleTestBase):
         self.assertIsNotNone(self.manager._instances.get(instance.spec.key()))
         self.assertIsNotNone(self.runtime.gateway.binding_for(instance.spec.tool_token))
 
+        # 但下一轮不能复用这台停止过的引擎：实测会让新轮次空回答（NO_FINAL_TEXT）。
+        # 运行器应在下一轮开始前只替换本会话的实例，存储保留、从站内历史恢复。
+        self.fleet.script({"text": "停止后再次回答。"})
+        second = self.run_turn("停止后再问一次")
+        self.assertEqual(second["turn"]["status"], "completed")
+        new_instance = self.manager._instances.get(instance.spec.key())
+        self.assertIsNotNone(new_instance)
+        self.assertNotEqual(new_instance.spec.tool_token, instance.spec.tool_token)
+
 
 class VisionEvidenceScopeTest(unittest.TestCase):
     """视觉能力是**针对某个模型**的结论，不能挪给另一个模型用。"""

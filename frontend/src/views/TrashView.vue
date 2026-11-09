@@ -27,13 +27,18 @@ function projectName(projectId: string): string {
       <div>
         <h1>回收站</h1>
         <p class="subtitle">软删除的项目与会话保留在这里，可随时恢复；本轮没有永久删除入口。</p>
+        <p class="hint">
+          本页只管理<strong>项目与会话</strong>。数据集与模型的软删除项目在各自页面内的“回收站”视图中，
+          可在<RouterLink :to="{ name: 'projects' }">项目页</RouterLink>进入对应项目后查看。
+        </p>
       </div>
       <button class="ghost" type="button" @click="workspace.loadTrash()">刷新</button>
     </header>
 
     <section class="card">
       <h2>已删除项目</h2>
-      <ul v-if="workspace.deletedProjects.length" class="trash-list">
+      <p v-if="workspace.trashLoading" class="empty-hint">正在加载回收站…</p>
+      <ul v-else-if="workspace.deletedProjects.length" class="trash-list">
         <li v-for="item in workspace.deletedProjects" :key="item.id" class="trash-row">
           <div>
             <strong>{{ item.name }}</strong>
@@ -47,7 +52,8 @@ function projectName(projectId: string): string {
 
     <section class="card">
       <h2>已删除会话</h2>
-      <ul v-if="workspace.deletedSessions.length" class="trash-list">
+      <p v-if="workspace.trashLoading" class="empty-hint">正在加载回收站…</p>
+      <ul v-else-if="workspace.deletedSessions.length" class="trash-list">
         <li v-for="item in workspace.deletedSessions" :key="item.id" class="trash-row">
           <div>
             <strong>{{ item.title }}</strong>

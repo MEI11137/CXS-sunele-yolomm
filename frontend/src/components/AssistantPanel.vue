@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import ChatTimeline from './ChatTimeline.vue'
 import { uploadAsset } from '@/api/business'
@@ -7,6 +7,7 @@ import { errorMessage } from '@/api/http'
 import { useAgentStore } from '@/stores/agent'
 import { useBusinessStore } from '@/stores/business'
 import { useConnectionStore } from '@/stores/connection'
+import { useSelectionStore } from '@/stores/selection'
 import { useUiStore } from '@/stores/ui'
 import { useWorkspaceStore } from '@/stores/workspace'
 import type { AssetSummary, PermissionMode } from '@/types'
@@ -35,6 +36,7 @@ const workspace = useWorkspaceStore()
 const connection = useConnectionStore()
 const agent = useAgentStore()
 const business = useBusinessStore()
+const selection = useSelectionStore()
 const ui = useUiStore()
 
 const input = ref('')
@@ -69,6 +71,13 @@ const sessionId = computed(() => {
   return list[0]?.id ?? ''
 })
 const project = computed(() => (projectId.value ? workspace.projectById(projectId.value) : null))
+/**
+ * 当前项目下由识别记录/复核队列“自动注册”的界面选择。
+ * 发送时冻结快照交给后端校验，用户无需把 ID 打进正文或点“交给助手”新建会话。
+ */
+const activeSelection = computed(() => selection.forProject(projectId.value))
+const selectedCount = computed(() => activeSelection.value?.recordIds.length ?? 0)
+const selectionLabel = computed(() => activeSelection.value?.page ?? '')
 const turn = computed(() => (sessionId.value ? agent.activeTurn(sessionId.value) : null))
 const events = computed(() => (turn.value ? agent.turnEvents(turn.value.id) : []))
 const pendingActions = computed(() => (sessionId.value ? agent.pending(sessionId.value) : []))
@@ -138,15 +147,30 @@ watch(
 const cards = computed(() => (sessionId.value ? business.cardsFor(sessionId.value) : []))
 
 // 附件属于当前项目：换项目就清空，绝不把 A 项目的图片带到 B 项目。
-watch(projectId, () => {
+watch(projectId, (id) => {
   attachments.value = []
   attachmentError.value = ''
+  // 选择上下文只在注册它的项目内有效；切项目必须清掉，避免把旧项目 ID 发给新项目。
+  if (selection.context && selection.context.projectId !== id) selection.clear()
 })
+
+/** 队列/记录页的“交给助手”只聚焦输入框并保留选择，不新建会话、不跳页。 */
+function focusComposer(): void {
+  void nextTick(() => {
+    textarea.value?.focus()
+    textarea.value?.scrollIntoView({ block: 'center' })
+  })
+}
 
 onMounted(() => {
   void connection.load()
   if (!agent.ready) void agent.loadCapabilities()
   void agent.loadPreferences()
+  window.addEventListener('hx17:focus-composer', focusComposer)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('hx17:focus-composer', focusComposer)
 })
 
 /** 输入框随内容长高，最多 200px，长草稿在框内滚动。 */
@@ -184,13 +208,22 @@ async function send(): Promise<void> {
   if (sendingDraft.value) return
   const text = input.value.trim()
   if ((!text && !attachments.value.length) || blockedReason.value) return
-  // 先把这次要发的附件记下来：等待期间用户改动附件不影响已发出的这一条。
+  // 先把这次要发的附件和选择快照记下来：等待期间用户改动不影响已发出的这一条。
   const assetIds = attachments.value.map((item) => item.id)
+  const snapshot = activeSelection.value
+  const selectionPayload = snapshot
+    ? { page: snapshot.page, recordIds: [...snapshot.recordIds] }
+    : null
+  // 正文只留一句可读提示；精确 ID 由 ui_context 结构化传给后端，模型不靠正文猜。
+  const body = text || '请查看我上传的图片。'
+  const content = snapshot
+    ? `${body}\n\n（已附带 ${snapshot.recordIds.length} 条选中记录上下文）`
+    : body
   sendingDraft.value = true
   try {
     const target = await ensureSession()
     if (!target) return
-    const ok = await agent.send(target, text || '请查看我上传的图片。', assetIds)
+    const ok = await agent.send(target, content, assetIds, selectionPayload)
     if (ok) {
       input.value = ''
       attachments.value = []
@@ -386,10 +419,11 @@ async function newSession(): Promise<void> {
 
     <!-- 确认区固定在输入框上方；长内容用 details 收起，不占满屏。 -->
     <section v-if="pendingActions.length" class="approval-dock" aria-label="待确认动作">
-      <details v-for="action in pendingActions" :key="action.id" class="approval-item">
+      <details v-for="action in pendingActions" :key="action.id" class="approval-item" open>
         <summary class="approval-head">
           <span class="tag tag-admin">{{ action.risk === 'destructive' ? '高风险' : '写入' }}</span>
           <span class="approval-title">{{ action.title }}</span>
+          <span class="hint">待确认</span>
         </summary>
         <pre v-if="action.preview" class="approval-preview mono">{{ action.preview }}</pre>
         <div class="approval-actions">
@@ -416,6 +450,15 @@ async function newSession(): Promise<void> {
     <!-- 一体式输入框：附件 / 权限 / 模型 / 发送都在同一个框内 -->
     <footer class="composer" :class="{ dragging }">
       <div class="composer-box">
+        <!-- 选择上下文来自识别记录/复核队列的自动注册；普通发送即冻结快照，无需另建会话。 -->
+        <div v-if="activeSelection" class="selection-context" role="status">
+          <span>
+            已附带 <strong>{{ selectedCount }}</strong> 条选中记录上下文（{{ selectionLabel }}）
+          </span>
+          <button class="link" type="button" title="清除选择并同步取消页面勾选" @click="selection.clear(projectId)">
+            清除选择
+          </button>
+        </div>
         <div v-if="attachments.length || uploading || attachmentError" class="attach-list">
           <span v-for="asset in attachments" :key="asset.id" class="attach-chip">
             <img :src="asset.url" :alt="asset.filename" />

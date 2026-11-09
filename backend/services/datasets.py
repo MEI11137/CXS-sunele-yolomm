@@ -485,31 +485,13 @@ def _find_duplicate(
     return None
 
 
-def import_dataset(
-    conn,
-    user_id: int,
-    project_id: str,
-    *,
-    name: str,
-    modalities: list[str],
-    secondary_modality: str | None = None,
-    reference_modality: str | None = None,
-    classes: list[str] | None = None,
-    asset_id: str | None = None,
-    rel_path: str | None = None,
-) -> dict:
-    label = str(name or "").strip()
-    if not label:
-        raise ApiError(400, "VALIDATION", "数据集名称不能为空")
-    declared_reference = str(reference_modality or "").strip().lower() or None
-    if declared_reference is not None and declared_reference not in PRIMARY_MODALITIES:
-        raise ApiError(
-            400,
-            "VALIDATION",
-            f"参考模态只能是 {'/'.join(sorted(PRIMARY_MODALITIES))}；当前是 {declared_reference}",
-        )
-    modes = [str(item).strip().lower() for item in (modalities or ["rgb"]) if str(item).strip()]
-    # 去重但保留顺序：第一个元素就是**主模态**（原图放在 images/）。
+def _resolve_modes(
+    modes: list[str],
+    declared_reference: str | None,
+    secondary_modality: str | None,
+) -> tuple[list[str], str, str | None]:
+    """校验并归一化主/辅模态；返回 (落库 modalities, primary, secondary)。"""
+    modes = [str(item).strip().lower() for item in (modes or []) if str(item).strip()]
     deduped: list[str] = []
     for item in modes:
         if item not in deduped:
@@ -545,7 +527,207 @@ def import_dataset(
     if secondary is not None and secondary not in modes:
         modes.append(secondary)
     # 落库的 modalities 只保留“主模态 + 辅助模态”两项，不额外扩未知多模态。
-    modes = [primary] + ([secondary] if secondary else [])
+    return [primary] + ([secondary] if secondary else []), primary, secondary
+
+
+def _infer_modalities(raw: Path) -> list[str]:
+    """未显式给 modalities 时，按压缩包内 data.yaml 的 modalities 声明推断顺序。
+
+    只读取声明键，不做像素级探测；data.yaml 缺失/无 modalities 时交给调用方回退 rgb。
+    """
+    yaml_path = _find_yaml(raw)
+    if yaml_path is None:
+        return []
+    try:
+        loaded = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return []
+    if not isinstance(loaded, dict):
+        return []
+    declared = loaded.get("modalities")
+    if not isinstance(declared, dict):
+        return []
+    known = set(PRIMARY_MODALITIES) | set(SUPPORTED_SECONDARY)
+    return [str(key).strip().lower() for key in declared if str(key).strip().lower() in known]
+
+
+def _preview_yaml(loaded: dict) -> tuple[list[str], list[str]]:
+    """从 data.yaml 里取类别与模态声明；不猜类别、不改写内容。"""
+    names = loaded.get("names")
+    classes: list[str] = []
+    if isinstance(names, dict):
+        classes = [str(names[key]).strip() for key in sorted(names, key=lambda item: int(item))]
+    elif isinstance(names, list):
+        classes = [str(item).strip() for item in names]
+    modalities = loaded.get("modalities")
+    declared = [str(key).strip().lower() for key in modalities] if isinstance(modalities, dict) else []
+    known = set(PRIMARY_MODALITIES) | set(SUPPORTED_SECONDARY)
+    return [item for item in classes if item], [item for item in declared if item in known]
+
+
+def _preview_split_paths(loaded: dict) -> dict[str, list[str]]:
+    """data.yaml 的 train/val/test 可能是字符串或字符串数组。"""
+    found: dict[str, list[str]] = {}
+    for split in SPLITS:
+        raw = loaded.get(split)
+        values: list[str] = []
+        if isinstance(raw, str) and raw.strip():
+            values = [raw.strip()]
+        elif isinstance(raw, list):
+            values = [str(item).strip() for item in raw if str(item).strip()]
+        found[split] = values
+    return found
+
+
+def _preview_count_zip(zf: zipfile.ZipFile, split_paths: dict[str, list[str]]) -> dict[str, int]:
+    names = [name.replace("\\", "/").lstrip("./") for name in zf.namelist()]
+    counts: dict[str, int] = {}
+    for split, paths in split_paths.items():
+        total = 0
+        for path in paths:
+            stem = path.strip("./").rstrip("/")
+            for name in names:
+                if not name.lower().endswith(tuple(IMAGE_SUFFIXES)):
+                    continue
+                # data.yaml 可能位于压缩包内一层子目录，按“路径片段”匹配更稳。
+                if name == stem or name.startswith(stem + "/") or ("/" + stem + "/") in ("/" + name):
+                    total += 1
+        counts[split] = total
+    return counts
+
+
+def _preview_count_dir(base: Path, split_paths: dict[str, list[str]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for split, paths in split_paths.items():
+        total = 0
+        for path in paths:
+            candidate = (base / path).resolve()
+            try:
+                candidate.relative_to(base.resolve())
+            except ValueError:
+                continue
+            if candidate.is_file() and candidate.suffix.lower() in IMAGE_SUFFIXES:
+                total += 1
+            elif candidate.is_dir():
+                total += sum(
+                    1 for item in candidate.rglob("*") if item.is_file() and item.suffix.lower() in IMAGE_SUFFIXES
+                )
+        counts[split] = total
+    return counts
+
+
+def preview_source(
+    conn,
+    user_id: int,
+    project_id: str,
+    *,
+    asset_id: str | None = None,
+    rel_path: str | None = None,
+) -> dict:
+    """只读预览 ZIP/目录：返回建议名称、类别、模态与各划分图片数；不创建数据集。"""
+    root = storage.project_root(conn, user_id, project_id)
+    source = "zip" if asset_id else "local"
+    if asset_id:
+        asset = asset_service.get_owned(conn, user_id, project_id, asset_id)
+        if str(asset["kind"]) != "archive":
+            raise ApiError(409, "NOT_AN_ARCHIVE", "只能预览 ZIP 压缩包")
+        path = asset_service.path_of(conn, user_id, project_id, asset_id)
+        suggested = str(asset["filename"] or Path(path).stem)
+        if suggested.lower().endswith(".zip"):
+            suggested = suggested[:-4]
+        with zipfile.ZipFile(path) as zf:
+            yaml_name = _find_yaml_in_zip(zf)
+            loaded = _load_zip_yaml(zf, yaml_name) if yaml_name else {}
+            classes, declared = _preview_yaml(loaded)
+            split_paths = _preview_split_paths(loaded)
+            split_counts = _preview_count_zip(zf, split_paths) if split_paths else {}
+    elif rel_path:
+        source_dir = storage.resolve_rel(root, rel_path)
+        if not source_dir.is_dir():
+            raise ApiError(409, "NOT_A_DIRECTORY", "目录预览需要一个真实存在的目录")
+        suggested = source_dir.name
+        yaml_path = _find_yaml(source_dir)
+        loaded = {}
+        if yaml_path is not None:
+            try:
+                value = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+                loaded = value if isinstance(value, dict) else {}
+            except (OSError, yaml.YAMLError):
+                loaded = {}
+        classes, declared = _preview_yaml(loaded)
+        split_paths = _preview_split_paths(loaded)
+        split_counts = _preview_count_dir(source_dir, split_paths) if split_paths else {}
+    else:
+        raise ApiError(400, "SOURCE_REQUIRED", "需要提供 ZIP 资产或项目内目录")
+
+    if not declared:
+        # data.yaml 没声明模态时按目录名给一个保守提示，不写库也不改用户文件。
+        if asset_id:
+            declared = ["rgb", "ir"] if any("images_ir/" in name for name in zipfile.ZipFile(path).namelist()) else ["rgb"]
+        else:
+            declared = ["rgb", "ir"] if (source_dir / "images_ir").is_dir() else ["rgb"]
+    try:
+        modes, primary, secondary = _resolve_modes(declared, None, None)
+    except ApiError:
+        modes, primary, secondary = ["rgb"], "rgb", None
+    has_yaml = bool(loaded) if isinstance(loaded, dict) else False
+    total = sum(split_counts.values()) if split_counts else 0
+    return {
+        "source": source,
+        "suggested_name": suggested[:80],
+        "has_yaml": has_yaml,
+        "modalities": modes,
+        "primary_modality": primary,
+        "secondary_modality": secondary,
+        "classes": classes,
+        "class_count": len(classes),
+        "split_counts": split_counts,
+        "sample_count": total,
+        "warnings": [] if has_yaml else ["没有识别到 data.yaml，类别/划分/模态需要人工补充"],
+    }
+
+
+def _find_yaml_in_zip(zf: zipfile.ZipFile) -> str | None:
+    for name in zf.namelist():
+        base = PurePosixPath(name).name.lower()
+        if base in {"data.yaml", "data.yml", "dataset.yaml", "dataset.yml"} and name.count("/") <= 1:
+            return name
+    return None
+
+
+def _load_zip_yaml(zf: zipfile.ZipFile, name: str) -> dict:
+    try:
+        value = yaml.safe_load(zf.read(name).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def import_dataset(
+    conn,
+    user_id: int,
+    project_id: str,
+    *,
+    name: str,
+    modalities: list[str] | None,
+    secondary_modality: str | None = None,
+    reference_modality: str | None = None,
+    classes: list[str] | None = None,
+    asset_id: str | None = None,
+    rel_path: str | None = None,
+) -> dict:
+    label = str(name or "").strip()
+    if not label:
+        raise ApiError(400, "VALIDATION", "数据集名称不能为空")
+    declared_reference = str(reference_modality or "").strip().lower() or None
+    if declared_reference is not None and declared_reference not in PRIMARY_MODALITIES:
+        raise ApiError(
+            400,
+            "VALIDATION",
+            f"参考模态只能是 {'/'.join(sorted(PRIMARY_MODALITIES))}；当前是 {declared_reference}",
+        )
+    requested_modes = [str(item) for item in (modalities or []) if str(item).strip()]
+    requested_secondary = str(secondary_modality or "").strip().lower() or None
 
     root = storage.project_root(conn, user_id, project_id)
     dataset_id = security.new_id("dst")
@@ -571,6 +753,13 @@ def import_dataset(
             source_asset_id = None
         else:
             raise ApiError(400, "SOURCE_REQUIRED", "需要提供 ZIP 资产或项目内目录")
+
+        if not requested_modes:
+            # 前端“自动识别”路径：按 data.yaml 声明推断主/辅模态，避免手填成正模态。
+            requested_modes = _infer_modalities(raw) or ["rgb"]
+        modes, primary, secondary = _resolve_modes(
+            requested_modes, declared_reference, requested_secondary
+        )
 
         scanned = _scan(raw, primary=primary, secondary=secondary, classes=classes, project_root=root)
         scanned["reference"] = primary

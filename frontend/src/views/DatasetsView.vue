@@ -2,13 +2,14 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import * as api from '@/api/business'
-import { errorMessage } from '@/api/http'
+import type { UploadProgress } from '@/api/business'
+import { errorCode, errorMessage } from '@/api/http'
 import { formatBytes } from '@/lib/business'
 import DirectoryBrowser from '@/components/DirectoryBrowser.vue'
 import { useBusinessStore } from '@/stores/business'
 import { useSyncStore } from '@/stores/sync'
 import { useWorkspaceStore } from '@/stores/workspace'
-import type { DatasetSample, DatasetSummary, ReflowDraft } from '@/types'
+import type { DatasetPreview, DatasetSample, DatasetSummary, ReflowDraft } from '@/types'
 
 /**
  * 数据集页：首屏先看清「有哪些数据集」，导入按需展开。
@@ -33,7 +34,7 @@ const datasets = computed(() => business.datasets[projectId.value] ?? [])
 
 // --------------------------------------------------------------------- 列表
 
-const showDeleted = ref(false)
+const showDeleted = ref(route.query.trash === '1')
 const drafts = ref<ReflowDraft[]>([])
 const showDraftTrash = ref(false)
 
@@ -42,6 +43,8 @@ const active = computed<DatasetSummary | null>(
   () => datasets.value.find((item) => item.id === activeId.value) ?? null,
 )
 const samples = ref<DatasetSample[]>([])
+const samplesError = ref('')
+const samplesLoading = ref(false)
 const sampleSplit = ref('')
 
 const draftReady = computed(
@@ -69,8 +72,26 @@ watch(
   () => void reloadDatasets(),
 )
 
+// 侧栏「数据集」会回到不带 ?trash=1 的地址，这里同步退出回收站视图；
+// 因为仍然复用同一个组件实例，只靠 onMounted 不会重建。
+watch(
+  () => route.query.trash,
+  async (value) => {
+    const inTrash = value === '1'
+    if (inTrash === showDeleted.value) return
+    showDeleted.value = inTrash
+    await reloadDatasets()
+  },
+)
+
 function onWindowKeydown(event: KeyboardEvent): void {
-  if (event.key === 'Escape' && menuMode.value) {
+  if (event.key !== 'Escape') return
+  if (activeId.value) {
+    event.preventDefault()
+    activeId.value = ''
+    return
+  }
+  if (menuMode.value) {
     event.stopPropagation()
     hideMenus()
   }
@@ -78,6 +99,12 @@ function onWindowKeydown(event: KeyboardEvent): void {
 
 async function toggleDeleted(): Promise<void> {
   showDeleted.value = !showDeleted.value
+  // 回收站是视图状态，写进 query 才能让 F5、前进/后退和侧栏返回保持一致；
+  // 之前只用 ref，刷新会静默跳回正式列表，看起来像“回收站丢了”。
+  const query = { ...route.query }
+  if (showDeleted.value) query.trash = '1'
+  else delete query.trash
+  await router.replace({ query })
   await reloadDatasets()
 }
 
@@ -282,13 +309,16 @@ const advancedOpen = ref(false)
 
 const form = ref({
   name: '',
-  source: 'dir' as Source,
+  source: 'zip' as Source,
   relPath: '',
   assetId: '',
   // 主模态：原图本身是 RGB 还是 IR。单 IR 数据集不需要第二张配图；
 // reflow 导出的“IR 参考 + RGB 辅助”布局则把 RGB 作为辅助图（images_ir/）。
   primary: 'rgb' as 'rgb' | 'ir',
   secondary: '' as '' | 'ir' | 'edge' | 'depth' | 'rgb',
+  // 常规流程默认自动识别：按 data.yaml 的 modalities 声明决定主/辅模态，
+  // 用户不必先理解 RGB/IR 配对；识别不出来时再展开手动指定。
+  autoModality: true,
   classes: '',
 })
 
@@ -304,7 +334,46 @@ watch(
 
 const archives = ref<{ id: string; filename: string; size: number }[]>([])
 const uploading = ref(false)
+const uploadProgress = ref<UploadProgress | null>(null)
+const uploadLabel = computed(() => {
+  if (!uploading.value) return '选择 ZIP 上传'
+  const current = uploadProgress.value
+  if (!current) return '上传中…'
+  if (current.phase === 'merge') return '合并中…'
+  const percent = current.total ? Math.floor((current.loaded / current.total) * 100) : 0
+  return `上传中 ${percent}%`
+})
+const preview = ref<DatasetPreview | null>(null)
+const previewing = ref(false)
+const previewError = ref('')
+
+async function loadPreview(assetId: string): Promise<void> {
+  if (!assetId) {
+    preview.value = null
+    return
+  }
+  previewing.value = true
+  previewError.value = ''
+  try {
+    const data = await api.previewDataset(projectId.value, { asset_id: assetId })
+    preview.value = data
+    if (!form.value.name.trim() && data.suggested_name) form.value.name = data.suggested_name
+  } catch (failure) {
+    preview.value = null
+    previewError.value = errorMessage(failure)
+  } finally {
+    previewing.value = false
+  }
+}
+
 const browseOpen = ref(false)
+watch(
+  () => form.value.assetId,
+  (assetId) => {
+    if (assetId && form.value.source === 'zip') void loadPreview(assetId)
+    if (!assetId) preview.value = null
+  },
+)
 
 const selectedArchive = computed(
   () => archives.value.find((item) => item.id === form.value.assetId) ?? null,
@@ -324,7 +393,16 @@ function closeImport(): void {
   importError.value = ''
   nameError.value = ''
   sourceError.value = ''
-  form.value = { name: '', source: 'dir', relPath: '', assetId: '', primary: 'rgb', secondary: '', classes: '' }
+  form.value = {
+    name: '',
+    source: 'zip',
+    relPath: '',
+    assetId: '',
+    primary: 'rgb',
+    secondary: '',
+    autoModality: true,
+    classes: '',
+  }
   advancedOpen.value = false
 }
 
@@ -339,11 +417,20 @@ function setSource(source: Source): void {
 async function loadArchives(): Promise<void> {
   try {
     const data = await api.listAssets(projectId.value, { kind: 'archive', limit: 50 })
-    archives.value = data.assets.map((asset) => ({
-      id: asset.id,
-      filename: asset.filename,
-      size: asset.size,
-    }))
+    // 同一个 ZIP 可能被重复上传（审计里 3 组同名同大小各 2 份），按内容只留一份。
+    const seen = new Set<string>()
+    archives.value = data.assets
+      .filter((asset) => {
+        const key = asset.sha256 || asset.id
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+      .map((asset) => ({
+        id: asset.id,
+        filename: asset.filename,
+        size: asset.size,
+      }))
   } catch {
     // 压缩包列表拉不到不影响目录导入；真正上传时再报错。
     archives.value = []
@@ -377,20 +464,31 @@ async function onZip(event: Event): Promise<void> {
   const file = input.files?.[0]
   if (!file) return
   uploading.value = true
+  uploadProgress.value = null
   importError.value = ''
   try {
-    const asset = await api.uploadAsset(projectId.value, file)
+    const asset = await api.uploadAsset(projectId.value, file, {
+      onProgress: (progress) => {
+        uploadProgress.value = progress
+      },
+    })
     if (asset.kind !== 'archive') {
       importError.value = `这个文件按内容被识别为 ${asset.kind}，不是数据集压缩包`
     } else {
       setSource('zip')
       form.value.assetId = asset.id
+      // 只从文件名补一个可编辑的默认名称；用户仍可在提交前改，绝不覆盖已填名称。
+      if (!form.value.name.trim()) {
+        form.value.name = file.name.replace(/\.zip$/i, '').slice(0, 80)
+      }
       await loadArchives()
+      await loadPreview(asset.id)
     }
   } catch (failure) {
     importError.value = errorMessage(failure)
   } finally {
     uploading.value = false
+    uploadProgress.value = null
     input.value = ''
   }
 }
@@ -414,26 +512,34 @@ async function submitImport(): Promise<void> {
     return
   }
 
-  // 参考模态=主模态；IR 参考可带 RGB 辅助（reflow 导出的既有布局），
-  // RGB 主模态仍只接受 ir/edge/depth 配图。切换模态残留的无效值在这里归一化。
-  const primary = form.value.primary
-  const secondary = form.value.secondary
-  const validSecondary =
-    primary === 'ir'
-      ? secondary === 'rgb'
-        ? 'rgb'
-        : ''
-      : secondary && secondary !== 'rgb'
-        ? secondary
-        : ''
-  const modalities =
-    primary === 'ir'
-      ? validSecondary
-        ? ['ir', 'rgb']
-        : ['ir']
-      : validSecondary
-        ? ['rgb', validSecondary]
-        : ['rgb']
+  // 默认“自动识别”：不传 modalities/secondary/reference，让后端按 data.yaml
+  // 的 modalities 声明决定主/辅模态；只有用户展开手动指定时才提交显式值。
+  let modalities: string[] | undefined
+  let validSecondary: string | null = null
+  let reference: 'rgb' | 'ir' | undefined
+  if (!form.value.autoModality) {
+    // 参考模态=主模态；IR 参考可带 RGB 辅助（reflow 导出的既有布局），
+    // RGB 主模态仍只接受 ir/edge/depth 配图。切换模态残留的无效值在这里归一化。
+    const primary = form.value.primary
+    const secondary = form.value.secondary
+    validSecondary =
+      primary === 'ir'
+        ? secondary === 'rgb'
+          ? 'rgb'
+          : null
+        : secondary && secondary !== 'rgb'
+          ? secondary
+          : null
+    modalities =
+      primary === 'ir'
+        ? validSecondary
+          ? ['ir', 'rgb']
+          : ['ir']
+        : validSecondary
+          ? ['rgb', validSecondary]
+          : ['rgb']
+    reference = primary
+  }
   const classes = form.value.classes
     .split(/[,，\s]+/)
     .map((item) => item.trim())
@@ -443,15 +549,22 @@ async function submitImport(): Promise<void> {
     name,
     rel_path: form.value.source === 'dir' ? form.value.relPath.trim() : undefined,
     asset_id: form.value.source === 'zip' ? form.value.assetId : undefined,
-    modalities,
-    secondary_modality: validSecondary || null,
-    reference_modality: primary,
+    ...(modalities ? { modalities, secondary_modality: validSecondary, reference_modality: reference } : {}),
     classes: classes.length ? classes : null,
   })
   importing.value = false
   if (ok) {
     importOpen.value = false
-    form.value = { name: '', source: 'dir', relPath: '', assetId: '', primary: 'rgb', secondary: '', classes: '' }
+    form.value = {
+      name: '',
+      source: 'zip',
+      relPath: '',
+      assetId: '',
+      primary: 'rgb',
+      secondary: '',
+      autoModality: true,
+      classes: '',
+    }
     advancedOpen.value = false
     await reloadDatasets()
     return
@@ -467,11 +580,13 @@ async function submitImport(): Promise<void> {
 async function openDetail(dataset: DatasetSummary): Promise<void> {
   activeId.value = dataset.id
   sampleSplit.value = ''
+  samplesError.value = ''
   await loadSamples()
 }
 
 async function loadSamples(): Promise<void> {
   if (!active.value) return
+  samplesLoading.value = true
   try {
     const data = await api.datasetSamples(
       projectId.value,
@@ -479,9 +594,15 @@ async function loadSamples(): Promise<void> {
       sampleSplit.value || undefined,
     )
     samples.value = data.samples
+    samplesError.value = ''
   } catch (failure) {
-    business.error = errorMessage(failure)
     samples.value = []
+    samplesError.value =
+      errorCode(failure) === 'DATASET_NOT_FOUND'
+        ? '这个数据集已移入回收站或已删除，无法查看样本；请先恢复数据集。'
+        : errorMessage(failure) || '样本加载失败，请稍后重试'
+  } finally {
+    samplesLoading.value = false
   }
 }
 
@@ -499,6 +620,9 @@ watch(sampleSplit, () => void loadSamples())
         </p>
       </div>
       <div class="header-actions">
+        <button v-if="showDeleted" class="small" type="button" @click="toggleDeleted">
+          返回正式数据集
+        </button>
         <button v-if="!showDeleted" class="primary small" type="button" @click="openImport">
           导入数据集
         </button>
@@ -596,7 +720,7 @@ watch(sampleSplit, () => void loadSamples())
           <span>ZIP 文件</span>
           <div class="zip-row">
             <label class="button ghost small">
-              {{ uploading ? '上传中…' : '选择 ZIP 上传' }}
+              {{ uploadLabel }}
               <input type="file" accept=".zip" hidden :disabled="uploading" @change="onZip" />
             </label>
             <span v-if="selectedArchive" class="hint">
@@ -612,34 +736,65 @@ watch(sampleSplit, () => void loadSamples())
           <span v-if="sourceError" class="form-error">{{ sourceError }}</span>
         </div>
 
+        <div v-if="previewing" class="hint">正在识别压缩包结构…</div>
+        <p v-else-if="previewError" class="form-error">{{ previewError }}</p>
+        <div v-else-if="preview" class="dataset-preview" role="status">
+          <p>
+            <b>已识别</b>
+            {{ preview.source === 'zip' ? 'ZIP 压缩包' : '目录' }} · 建议名称
+            <span class="mono">{{ preview.suggested_name }}</span>
+          </p>
+          <p class="hint">
+            模态 {{ preview.modalities.join(' + ') || '未识别' }} · 类别 {{ preview.class_count }}
+            <template v-if="preview.classes.length">（{{ preview.classes.slice(0, 6).join(' / ') }}{{ preview.classes.length > 6 ? ' …' : '' }}）</template>
+            · 划分 {{ preview.split_counts.train ?? 0 }}/{{ preview.split_counts.val ?? 0 }}/{{ preview.split_counts.test ?? 0 }}
+            · 共 {{ preview.sample_count }} 张
+          </p>
+          <p v-if="preview.warnings.length" class="hint">{{ preview.warnings.join('；') }}</p>
+        </div>
+
         <label class="field">
-          <span>主模态（原图本身是什么）</span>
-          <select v-model="form.primary" aria-label="主模态">
-            <option value="rgb">可见光 RGB</option>
-            <option value="ir">红外 IR（单模态，原图就是 IR）</option>
-          </select>
+          <span>输入结构</span>
+          <label class="auto-modality">
+            <input v-model="form.autoModality" type="checkbox" />
+            自动识别模态（推荐，按 data.yaml）
+          </label>
+          <span class="hint">
+            常规流程不用填：按压缩包或目录里的 data.yaml 判断 RGB、RGB+IR 或 IR+RGB；
+            无法判断时按 RGB 导入。只有识别不出来时才取消勾选并手动指定。
+          </span>
         </label>
 
-        <label v-if="form.primary === 'rgb'" class="field">
-          <span>配图模态（可选）</span>
-          <select v-model="form.secondary" aria-label="配图模态">
-            <option value="">不配图（仅 RGB）</option>
-            <option value="ir">RGB + 红外（需要配图）</option>
-            <option value="edge">RGB + 边缘（由 RGB 派生）</option>
-            <option value="depth">RGB + 深度（需要配图）</option>
-          </select>
-        </label>
-        <label v-else class="field">
-          <span>辅助图（可选）</span>
-          <select v-model="form.secondary" aria-label="辅助图">
-            <option value="">不配图（仅 IR 原图）</option>
-            <option value="rgb">IR 参考 + RGB 辅助（平台导出/再导入布局）</option>
-          </select>
-        </label>
-        <p v-if="form.primary === 'ir'" class="hint">
-          单 IR 只记录红外原图；若导入平台导出的“IR 参考 + RGB 辅助”数据集，主图在
-          images/、辅助图在 images_ir/，labels/ 与 labels_ir/ 各自对应本图坐标，两套都会被校验并登记。
-        </p>
+        <template v-if="!form.autoModality">
+          <label class="field">
+            <span>主模态（原图本身是什么）</span>
+            <select v-model="form.primary" aria-label="主模态">
+              <option value="rgb">可见光 RGB</option>
+              <option value="ir">红外 IR（单模态，原图就是 IR）</option>
+            </select>
+          </label>
+
+          <label v-if="form.primary === 'rgb'" class="field">
+            <span>配图模态（可选）</span>
+            <select v-model="form.secondary" aria-label="配图模态">
+              <option value="">不配图（仅 RGB）</option>
+              <option value="ir">RGB + 红外（需要配图）</option>
+              <option value="edge">RGB + 边缘（由 RGB 派生）</option>
+              <option value="depth">RGB + 深度（需要配图）</option>
+            </select>
+          </label>
+          <label v-else class="field">
+            <span>辅助图（可选）</span>
+            <select v-model="form.secondary" aria-label="辅助图">
+              <option value="">不配图（仅 IR 原图）</option>
+              <option value="rgb">IR 参考 + RGB 辅助（平台导出/再导入布局）</option>
+            </select>
+          </label>
+          <p v-if="form.primary === 'ir'" class="hint">
+            单 IR 只记录红外原图；若导入平台导出的“IR 参考 + RGB 辅助”数据集，主图在
+            images/、辅助图在 images_ir/，labels/ 与 labels_ir/ 各自对应本图坐标，两套都会被校验并登记。
+          </p>
+        </template>
       </div>
 
       <DirectoryBrowser
@@ -753,7 +908,6 @@ watch(sampleSplit, () => void loadSamples())
             已人工复核的样本可以更新原数据集的修订版，或另建一个数据集。原版本会保留，也不会自动开始训练。
           </p>
         </div>
-        <button class="ghost small" type="button" @click="goReflow">处理复核结果</button>
       </div>
 
       <details v-if="drafts.length" class="draft-fold">
@@ -921,6 +1075,8 @@ watch(sampleSplit, () => void loadSamples())
               </tr>
             </tbody>
           </table>
+          <p v-else-if="samplesError" class="empty-hint error-text" role="alert">{{ samplesError }}</p>
+          <p v-else-if="samplesLoading" class="empty-hint">正在加载样本…</p>
           <p v-else class="empty-hint">这个划分里没有样本。</p>
         </div>
       </div>

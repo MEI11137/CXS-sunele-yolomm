@@ -52,6 +52,7 @@ const plan = ref<ReflowPlan | null>(null)
 const draftId = ref('')
 const draftStatus = ref('')
 const report = ref<DatasetReport | null>(null)
+let reportEpoch = 0
 const error = ref('')
 const notice = ref('')
 const busy = ref('')
@@ -142,8 +143,21 @@ const planStale = computed(() => isPlanStale(previewedState.value, formSignature
 
 onMounted(async () => {
   await business.loadDatasets(projectId.value)
-  if (datasets.value.length) datasetId.value = datasets.value[0].id
+  const preferredDataset = String(route.query.dataset_id ?? '').trim()
+  datasetId.value =
+    datasets.value.find((item) => item.id === preferredDataset)?.id ?? datasets.value[0]?.id ?? ''
   await loadFeedback()
+  // 从复核页“去回流”进入：直接带上当前记录，减少跨页勾选。
+  const preferredRecord = String(route.query.record_id ?? '').trim()
+  if (preferredRecord) {
+    const match = feedback.value.find((item) => item.detection_id === preferredRecord)
+    if (match) {
+      chosen.value = { ...chosen.value, [match.detection_id]: true }
+      notice.value = '已带入当前复核记录。选择“回原修订”或“另建数据集”后直接预览即可。'
+    } else {
+      notice.value = '这条记录还没进入回流池；先确认复核结论，或在本页选择其他反馈。'
+    }
+  }
 })
 
 // 切模式时把动作归位到该模式允许的取值，否则会带着另一个模式的默认值去提交。
@@ -158,6 +172,10 @@ watch(mode, () => {
 watch(datasetId, () => {
   plan.value = null
   report.value = null
+  // 旧数据集报告迟到时不能再写进当前画布；代次一变，旧请求的回填全部作废。
+  reportEpoch += 1
+  // 旧请求还挂着时切数据集，应允许立刻检查新数据集；旧请求的 finally 由代次挡住。
+  if (busy.value === 'report') busy.value = ''
 })
 
 async function loadFeedback(): Promise<void> {
@@ -179,7 +197,7 @@ async function preview(): Promise<void> {
   try {
     const data = await api.saveReflowDraft(projectId.value, {
       draft_id: draftId.value || undefined,
-      name: name.value || `回流草稿 ${new Date().toLocaleDateString()}`,
+      name: name.value || `回流草稿 ${new Date().toLocaleDateString()} ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
       mode: mode.value,
       dataset_id: mode.value === 'revision' ? datasetId.value || null : null,
       selections: selections(),
@@ -243,14 +261,31 @@ async function apply(): Promise<void> {
 }
 
 async function checkIdentity(): Promise<void> {
-  if (!datasetId.value) return
+  // 新建模式不基于父数据集生成样本，此时“检查重复”不能偷偷检查一个页面上不可见的数据集。
+  if (mode.value !== 'revision') {
+    report.value = null
+    notice.value = '新建模式不基于父数据集，不执行重复/泄漏检查；如需检查请切换到修订模式。'
+    return
+  }
+  const requestedProject = projectId.value
+  const requestedDataset = datasetId.value
+  if (!requestedDataset) return
+  const epoch = ++reportEpoch
+  const stillCurrent = (): boolean =>
+    epoch === reportEpoch &&
+    projectId.value === requestedProject &&
+    datasetId.value === requestedDataset
   busy.value = 'report'
+  error.value = ''
   try {
-    report.value = await api.datasetReport(projectId.value, datasetId.value)
+    const data = await api.datasetReport(requestedProject, requestedDataset)
+    if (!stillCurrent()) return
+    report.value = data
   } catch (failure) {
+    if (!stillCurrent()) return
     error.value = errorMessage(failure)
   } finally {
-    busy.value = ''
+    if (epoch === reportEpoch) busy.value = ''
   }
 }
 
@@ -408,10 +443,14 @@ function goRecords(): void {
         </label>
       </div>
       <div class="inline-form">
-        <button class="ghost small" type="button" :disabled="!datasetId" @click="checkIdentity">
+        <button class="ghost small" type="button" :disabled="!datasetId || mode !== 'revision'" @click="checkIdentity">
           检查重复 / 跨划分泄漏
         </button>
-        <span v-if="report" class="hint">
+        <span class="hint">范围：所选数据集的全部样本（只读），与上方待整理反馈是否为空无关。</span>
+        <span v-if="report && report.sample_count === 0" class="form-error" role="alert">
+          该数据集暂无样本，未执行重复/泄漏/冲突检查；请先加入样本再检查。
+        </span>
+        <span v-else-if="report" class="hint">
           重复组 {{ report.duplicate_groups.length }} · 泄漏 {{ report.cross_split_leakage.length }} ·
           标注冲突 {{ report.annotation_conflicts.length }}
         </span>

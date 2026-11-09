@@ -522,7 +522,7 @@ function sizeText(size: number): string {
 .link .tag {
   margin-left: 6px;
 }
-.row-actions {
+.row-actions:not(td) {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;

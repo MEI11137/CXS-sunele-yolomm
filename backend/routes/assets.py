@@ -16,6 +16,7 @@ from backend.errors import ApiError, ok
 from backend.services import assets as asset_service
 from backend.services import projects as project_service
 from backend.services import storage
+from backend.services import uploads as upload_service
 
 bp = Blueprint("assets", __name__)
 
@@ -31,6 +32,15 @@ def _user() -> dict:
 
 def _project_id_project(conn, project_id: str):
     return project_service.get_owned(conn, project_id, int(_user()["id"]))
+
+
+def _limit(default: int = 50, maximum: int = 200) -> int:
+    raw = request.args.get("limit")
+    try:
+        value = int(raw if raw not in (None, "") else default)
+    except (TypeError, ValueError):
+        raise ApiError(400, "BAD_LIMIT", "limit 必须是整数") from None
+    return max(1, min(maximum, value))
 
 
 @bp.post("/projects/<project_id>/assets/upload")
@@ -65,6 +75,80 @@ def upload_asset(project_id: str):
     return ok({"asset": asset})
 
 
+# --------------------------------------------------------------------- 分块上传
+# 前置网关限制的是**单个请求体**，所以大文件必须切成小块逐块发送。
+# 会话与块索引都在私有库里；客户端只给文件名/大小/块序号，路径由服务端决定。
+
+
+@bp.post("/projects/<project_id>/uploads")
+@auth.login_required
+def init_upload(project_id: str):
+    payload = request.get_json(silent=True) or {}
+    conn = db.get_db()
+    _project_id_project(conn, project_id)
+    sha = payload.get("sha256")
+    upload = upload_service.init(
+        conn,
+        int(_user()["id"]),
+        project_id,
+        filename=str(payload.get("filename") or ""),
+        size=payload.get("size"),
+        sha256=(str(sha).strip() or None) if sha else None,
+        chunk_size=payload.get("chunk_size"),
+        session_id=(str(payload.get("session_id") or "").strip() or None),
+        role=(str(payload.get("role") or "").strip() or None),
+    )
+    return ok({"upload": upload})
+
+
+@bp.put("/projects/<project_id>/uploads/<upload_id>/chunks/<int:index>")
+@auth.login_required
+def put_upload_chunk(project_id: str, upload_id: str, index: int):
+    length = request.content_length
+    if length is None:
+        raise ApiError(411, "LENGTH_REQUIRED", "分块上传必须带 Content-Length")
+    if length > upload_service.CHUNK_SIZE:
+        raise ApiError(413, "CHUNK_TOO_LARGE", "单块超过上限，请减小分块大小")
+    conn = db.get_db()
+    _project_id_project(conn, project_id)
+    data = request.get_data(cache=False)
+    upload = upload_service.put_chunk(
+        conn,
+        int(_user()["id"]),
+        project_id,
+        upload_id,
+        index,
+        data,
+        sha256=request.headers.get("X-Chunk-Sha256"),
+    )
+    return ok({"upload": upload})
+
+
+@bp.get("/projects/<project_id>/uploads/<upload_id>")
+@auth.login_required
+def get_upload(project_id: str, upload_id: str):
+    conn = db.get_db()
+    upload = upload_service.status(conn, int(_user()["id"]), project_id, upload_id)
+    return ok({"upload": upload})
+
+
+@bp.post("/projects/<project_id>/uploads/<upload_id>/finish")
+@auth.login_required
+def finish_upload(project_id: str, upload_id: str):
+    conn = db.get_db()
+    _project_id_project(conn, project_id)
+    result = upload_service.finish(conn, int(_user()["id"]), project_id, upload_id)
+    return ok(result)
+
+
+@bp.post("/projects/<project_id>/uploads/<upload_id>/abort")
+@auth.login_required
+def abort_upload(project_id: str, upload_id: str):
+    conn = db.get_db()
+    _project_id_project(conn, project_id)
+    return ok(upload_service.abort(conn, int(_user()["id"]), project_id, upload_id))
+
+
 @bp.post("/projects/<project_id>/assets/register")
 @auth.login_required
 def register_asset(project_id: str):
@@ -87,13 +171,14 @@ def register_asset(project_id: str):
 @auth.login_required
 def list_assets(project_id: str):
     conn = db.get_db()
+    project_service.get_owned(conn, project_id, int(_user()["id"]))
     result = asset_service.list_for_project(
         conn,
         int(_user()["id"]),
         project_id,
         kind=(request.args.get("kind") or "").strip() or None,
         role=(request.args.get("role") or "").strip() or None,
-        limit=int(request.args.get("limit") or 50),
+        limit=_limit(50),
         before=(request.args.get("before") or "").strip() or None,
     )
     return ok(result)

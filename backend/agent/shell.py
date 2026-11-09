@@ -205,6 +205,21 @@ def _env() -> dict[str, str]:
     return {key: os.environ[key] for key in keep if key in os.environ}
 
 
+def _decode_output(data: bytes) -> str:
+    """PowerShell 输出解码：优先 UTF-8，Windows PowerShell 5.1 回退 GB18030。
+
+    包装脚本已要求 UTF-8，但 5.1 在 stdout 被重定向时经常按控制台代码页（简中
+    系统为 GBK）写字节。用 UTF-8 严格解码失败后回退 GBK，避免中文输出变成乱码；
+    两种都失败才做替换解码，保证诊断信息仍可读。
+    """
+    for encoding in ("utf-8", "gb18030"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
 def _run_process(argv: list[str], *, cwd: Path | None, timeout: float, env: dict[str, str]):
     creation = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     process = subprocess.Popen(  # noqa: S603 - 参数列表，shell=False
@@ -214,15 +229,16 @@ def _run_process(argv: list[str], *, cwd: Path | None, timeout: float, env: dict
         stderr=subprocess.PIPE,
         cwd=str(cwd) if cwd else None,
         env=env,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
         shell=False,
         creationflags=creation,
     )
     try:
         stdout, stderr = process.communicate(timeout=max(1.0, timeout))
-        return process.returncode, stdout or "", stderr or ""
+        return (
+            process.returncode,
+            _decode_output(stdout or b""),
+            _decode_output(stderr or b""),
+        )
     except subprocess.TimeoutExpired:
         _kill(process)
         raise ApiError(504, "SHELL_TIMEOUT", f"命令超过 {timeout:g} 秒未结束，已强制终止") from None
@@ -417,6 +433,9 @@ def run(root: Path, script: str, *, timeout: float = DEFAULT_TIMEOUT) -> dict:
     wrapped = (
         "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
         "$OutputEncoding = [Console]::OutputEncoding; "
+        # Windows PowerShell 5.1 的 Get-Content 默认按 ANSI 读 BOM-less 文件，
+        # 项目里的图片标注/说明都是 UTF-8；只在用户没显式指定编码时给 UTF-8 默认值。
+        "try { $PSDefaultParameterValues['Get-Content:Encoding'] = 'UTF8' } catch { }; "
         "try { $PSStyle.OutputRendering = 'PlainText' } catch { }; " + report["script"]
     )
     code, stdout, stderr = _run_process(

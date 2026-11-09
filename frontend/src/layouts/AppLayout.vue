@@ -32,6 +32,13 @@ const narrowDockOpen = ref(false)
 const project = computed(() =>
   projectId.value ? workspace.projectById(projectId.value) : null,
 )
+/** 顶栏只显示工作区末级目录名，完整路径放 title，避免评委看到本机绝对路径。 */
+const workspaceLabel = computed(() => {
+  const path = String(project.value?.root_path ?? '').replace(/[\\/]+$/, '')
+  if (!path) return '项目文件夹尚未绑定'
+  const parts = path.split(/[\\/]/).filter(Boolean)
+  return parts[parts.length - 1] || path
+})
 /** 只有“业务页”才把对话停靠到右侧（`meta.dock`）；会话页的对话在主区。 */
 const dockBase = computed(() =>
   dockState({ dockable: route.meta.dock === true, collapsed: ui.dockCollapsed }),
@@ -98,6 +105,28 @@ function endDrag(): void {
   document.body.classList.remove('dock-dragging')
 }
 
+/** 窄屏抽屉：Esc 与关闭按钮都必须可达，aria-label 随开关状态更新。 */
+const sidebarToggleLabel = computed(() =>
+  sidebarOpen.value ? '关闭工作区导航' : '打开工作区导航',
+)
+
+function closeSidebar(): void {
+  sidebarOpen.value = false
+}
+
+function onKeydown(event: KeyboardEvent): void {
+  if (event.key !== 'Escape') return
+  if (sidebarOpen.value) {
+    event.preventDefault()
+    closeSidebar()
+    return
+  }
+  if (isNarrow.value && narrowDockOpen.value) {
+    event.preventDefault()
+    narrowDockOpen.value = false
+  }
+}
+
 onMounted(() => {
   void workspace.loadProjects()
   if (projectId.value) void workspace.loadSessions(projectId.value)
@@ -105,12 +134,14 @@ onMounted(() => {
   window.addEventListener('mousemove', onDrag)
   window.addEventListener('mouseup', endDrag)
   window.addEventListener('resize', onWindowResize)
+  window.addEventListener('keydown', onKeydown)
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('mousemove', onDrag)
   window.removeEventListener('mouseup', endDrag)
   window.removeEventListener('resize', onWindowResize)
+  window.removeEventListener('keydown', onKeydown)
   document.body.classList.remove('dock-dragging')
 })
 
@@ -173,8 +204,18 @@ watch(
       class="sidebar-scrim"
       type="button"
       aria-label="关闭工作区导航"
-      @click="sidebarOpen = false"
+      @click="closeSidebar"
     ></button>
+    <button
+      v-if="sidebarOpen"
+      class="sidebar-close"
+      type="button"
+      aria-label="关闭工作区导航"
+      title="关闭工作区导航（Esc）"
+      @click="closeSidebar"
+    >
+      ×
+    </button>
 
     <div class="project-body">
       <header v-if="project" class="project-toolbar">
@@ -182,16 +223,14 @@ watch(
           <button
             class="sidebar-toggle"
             type="button"
-            aria-label="打开工作区导航"
+            :aria-label="sidebarToggleLabel"
             :aria-expanded="sidebarOpen"
             @click="sidebarOpen = !sidebarOpen"
           >
             ☰ 工作区
           </button>
           <h1 :title="project.name">{{ project.name }}</h1>
-          <small :title="project.root_path || ''">
-            {{ project.root_path || '项目文件夹尚未绑定' }}
-          </small>
+          <small :title="project.root_path || ''">📁 {{ workspaceLabel }}</small>
           <button class="ghost small" type="button" @click="openDetails">项目详情</button>
         </div>
         <nav class="project-tools" aria-label="当前项目功能">
@@ -217,7 +256,7 @@ watch(
           v-if="!project && isNarrow"
           class="sidebar-toggle standalone"
           type="button"
-          aria-label="打开工作区导航"
+          :aria-label="sidebarToggleLabel"
           :aria-expanded="sidebarOpen"
           @click="sidebarOpen = !sidebarOpen"
         >

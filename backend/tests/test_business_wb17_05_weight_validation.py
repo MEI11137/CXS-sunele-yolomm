@@ -16,6 +16,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from backend.tests.support import make_temp_dir
 from backend.tests.weights import NAMES, write_real_weight
 
 
@@ -25,7 +26,7 @@ class WeightValidationTest(unittest.TestCase):
         from backend import config
         from backend.vision import runtime as vision_runtime
 
-        cls.tmp = Path(tempfile.mkdtemp(prefix="hx17-weight-"))
+        cls.tmp = make_temp_dir("hx17-weight-")
         # 权重加载会读 YOLO/Matplotlib 配置：固定到临时目录，不往用户主目录写文件。
         vision_runtime.configure(
             config.load_settings(data_dir=cls.tmp / "private", serve_dist=False)

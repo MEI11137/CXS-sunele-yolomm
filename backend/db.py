@@ -929,6 +929,58 @@ ALTER TABLE dataset_samples ADD COLUMN labels_ir_rel TEXT;
 """
 
 
+SCHEMA_V22 = """
+-- 大文件分块上传：会话与块索引都在私有库里，工作区里的临时块只是字节，
+-- 不能作为授权依据（客户端也不能指定它们的位置）。
+CREATE TABLE upload_sessions (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  owner_id INTEGER NOT NULL,
+  -- 展示用文件名：已经过 storage.safe_name 收敛，不含路径
+  filename TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  chunk_size INTEGER NOT NULL,
+  chunk_count INTEGER NOT NULL,
+  received_bytes INTEGER NOT NULL DEFAULT 0,
+  -- 客户端声明的整文件 SHA256（可选）；服务端合并时仍会自己再算一遍
+  declared_sha256 TEXT,
+  status TEXT NOT NULL,
+  asset_id TEXT,
+  session_id TEXT,
+  -- 与 multipart 上传同一语义的资产角色（ir/rgb/edge/…），可空
+  role TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX idx_upload_sessions_scope
+  ON upload_sessions(owner_id, project_id, status);
+CREATE UNIQUE INDEX idx_upload_sessions_asset
+  ON upload_sessions(asset_id) WHERE asset_id IS NOT NULL;
+
+CREATE TABLE upload_chunks (
+  upload_id TEXT NOT NULL REFERENCES upload_sessions(id) ON DELETE CASCADE,
+  index_no INTEGER NOT NULL,
+  size INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  rel_path TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (upload_id, index_no)
+);
+"""
+
+
+SCHEMA_V23 = """
+-- 分块上传对齐“会话当时看到的那一个目录”：
+-- root_path 是 init 时解析出的项目根（realpath），之后每一步都必须与当前绑定一致。
+-- 项目改绑/换目录后旧会话直接失效，避免“按新根查旧 rel_path”。
+ALTER TABLE upload_sessions ADD COLUMN root_path TEXT NOT NULL DEFAULT '';
+-- 预分配的资产身份：合并前就确定，崩溃恢复时能认出“资产已经保存过”，
+-- 不会重试出一份重复资产。
+ALTER TABLE upload_sessions ADD COLUMN pending_asset_id TEXT;
+"""
+
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, SCHEMA_V1),
     (2, SCHEMA_V2),
@@ -958,6 +1010,8 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
     ),
     (20, SCHEMA_V20),
     (21, SCHEMA_V21),
+    (22, SCHEMA_V22),
+    (23, SCHEMA_V23),
 )
 
 

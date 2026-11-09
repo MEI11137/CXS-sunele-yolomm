@@ -106,6 +106,8 @@ router.beforeEach(async (to) => {
   const auth = useAuthStore()
   // 首次导航前确认登录态，避免先渲染业务页再跳登录。
   if (auth.state === 'unknown') await auth.bootstrap()
+  // 服务不可用不是“未登录”：保留当前目标路由，由 App 显示错误/重试页。
+  if (auth.state === 'error') return true
   if (!auth.isAuthenticated && to.name !== 'login') {
     return { name: 'login', query: { next: to.fullPath } }
   }

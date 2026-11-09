@@ -627,25 +627,88 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _class_index(
+    token,
+    classes: list[str],
+    *,
+    side: str,
+    native: list[dict] | None = None,
+    dataset_classes: list[str] | None = None,
+) -> int:
+    """把“索引或类别名”解析成目标类别索引。
+
+    用户/助手在对话里既可能给索引，也可能给类别名；显式给出名称同样需要用户确认，
+    不是猜，所以两种都接受。解析失败时把两份类别清单一起返回，便于追问。
+    """
+    text = str(token).strip()
+    problem = {
+        "native_classes": native or [],
+        "dataset_classes": dataset_classes or [],
+        "example": {"0": 0},
+        "hint": "键用权重类别索引或名称，值用数据集类别索引或名称；索引从 0 开始",
+    }
+    if text == "":
+        raise ApiError(400, "BAD_CLASS_MAP", f"{side}类别不能为空", details=problem)
+    try:
+        index = int(text)
+    except ValueError:
+        folded = [str(name).strip().casefold() for name in classes]
+        wanted = text.casefold()
+        try:
+            index = folded.index(wanted)
+        except ValueError:
+            raise ApiError(
+                400,
+                "BAD_CLASS_MAP",
+                f"{side}类别 {text!r} 不在类别表里",
+                details=problem,
+            ) from None
+    if not 0 <= index < len(classes):
+        raise ApiError(
+            400,
+            "BAD_CLASS_MAP",
+            f"{side}索引 {index} 越界（共 {len(classes)} 个类别）",
+            details=problem,
+        )
+    return index
+
+
 def _build_mapping(native: list[dict], dataset_classes: list[str], explicit: dict | None) -> dict[str, int]:
     """把权重类别索引映射到数据集类别索引；不靠翻译猜。"""
     if not dataset_classes:
         raise ApiError(409, "DATASET_NO_CLASSES", "绑定的数据集没有类别表")
+    native_names = [str(item.get("name") or "") for item in native]
     if explicit:
         mapping: dict[str, int] = {}
         for key, value in dict(explicit).items():
-            try:
-                source, target = int(key), int(value)
-            except (TypeError, ValueError):
-                raise ApiError(400, "BAD_CLASS_MAP", "类别映射必须是 {权重索引: 数据集索引}") from None
-            if not 0 <= source < len(native):
-                raise ApiError(400, "BAD_CLASS_MAP", f"权重索引 {source} 不存在")
-            if not 0 <= target < len(dataset_classes):
-                raise ApiError(400, "BAD_CLASS_MAP", f"数据集索引 {target} 不存在")
+            source = _class_index(
+                key,
+                native_names,
+                side="权重",
+                native=native,
+                dataset_classes=dataset_classes,
+            )
+            target = _class_index(
+                value,
+                dataset_classes,
+                side="数据集",
+                native=native,
+                dataset_classes=dataset_classes,
+            )
             mapping[str(source)] = target
         missing = [item["index"] for item in native if str(item["index"]) not in mapping]
         if missing:
-            raise ApiError(400, "CLASS_MAP_INCOMPLETE", f"这些权重类别还没有映射：{missing}")
+            raise ApiError(
+                400,
+                "CLASS_MAP_INCOMPLETE",
+                f"这些权重类别还没有映射：{missing}",
+                details={
+                    "native_classes": native,
+                    "dataset_classes": dataset_classes,
+                    "missing": missing,
+                    "hint": '补全后重试，例如 {"0": 0}',
+                },
+            )
         return mapping
 
     # 没有显式映射时，只有“同名同索引且数量一致”才敢自动对上。

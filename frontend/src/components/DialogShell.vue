@@ -1,6 +1,40 @@
 <script setup lang="ts">
-defineProps<{ title: string; open: boolean }>()
+import { onBeforeUnmount, watch } from 'vue'
+import { isTopDialog, registerDialog, unregisterDialog } from '@/components/dialogStack'
+
+const props = defineProps<{ title: string; open: boolean }>()
 const emit = defineEmits<{ (event: 'close'): void }>()
+
+let dialogId = 0
+
+function onKeydown(event: KeyboardEvent): void {
+  // 只在最上层响应：嵌套弹窗按 Esc 时先关小的，不连关外层。
+  if (event.key !== 'Escape' || !props.open || !isTopDialog(dialogId)) return
+  event.preventDefault()
+  event.stopPropagation()
+  emit('close')
+}
+
+watch(
+  () => props.open,
+  (open) => {
+    if (typeof window === 'undefined') return
+    if (open) {
+      dialogId = registerDialog()
+      window.addEventListener('keydown', onKeydown)
+    } else {
+      window.removeEventListener('keydown', onKeydown)
+      unregisterDialog(dialogId)
+    }
+  },
+  { immediate: true },
+)
+
+onBeforeUnmount(() => {
+  if (typeof window === 'undefined') return
+  window.removeEventListener('keydown', onKeydown)
+  unregisterDialog(dialogId)
+})
 </script>
 
 <template>
