@@ -27,7 +27,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
 SERVER_NAME = "hx17-tools"
-SERVER_VERSION = "1.7.0"
+SERVER_VERSION = "1.8.0"
 TOKEN_HEADER = "X-HX17-Tool-Token"
 GATEWAY = os.environ.get("HX17_GATEWAY_URL", "").rstrip("/")
 TOKEN = os.environ.get("HX17_TOOL_TOKEN", "")

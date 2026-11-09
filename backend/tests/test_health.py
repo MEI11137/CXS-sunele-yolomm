@@ -24,8 +24,8 @@ class PublicSurfaceTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         data = response.get_json()["data"]
         self.assertEqual(data["status"], "ok")
-        self.assertEqual(data["service"], "haixun-1.7-backend")
-        self.assertEqual(data["version"], "1.7.0")
+        self.assertEqual(data["service"], "haixun-1.8-backend")
+        self.assertEqual(data["version"], "1.8.0")
         self.assertEqual(data["stage"], "WB17-05")
         # 绝对路径不应出现在匿名可读的响应里。
         self.assertNotIn("data_dir", data)

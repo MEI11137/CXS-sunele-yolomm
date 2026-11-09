@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* 海巡智检 v1.7 · WorkBuddy 云端入口准备脚本
+/* 海巡智检 v1.8 · WorkBuddy 云端入口准备脚本
  *
  *   node deploy/workbuddy/prepare.mjs            # 默认读 <repo>/frontend/dist
  *   node deploy/workbuddy/prepare.mjs --dist X   # 指定别的构建产物目录

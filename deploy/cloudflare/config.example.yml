@@ -1,4 +1,4 @@
-# 海巡智检 v1.7 · 自有域名（Cloudflare Tunnel）入口模板
+# 海巡智检 v1.8 · 自有域名（Cloudflare Tunnel）入口模板
 #
 # 这不是已经生效的配置，也不是“已上线”的证明：
 # * 域名 haixunzhijian.top 的 NS 已在阿里云改成 aaron.ns.cloudflare.com / kia.ns.cloudflare.com，

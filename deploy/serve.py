@@ -1,4 +1,4 @@
-"""海巡智检 v1.7 同源启动器（Windows / Linux / macOS 通用）。
+"""海巡智检 v1.8 同源启动器（Windows / Linux / macOS 通用）。
 
 一个端口同时提供：
 
@@ -737,7 +737,7 @@ def cmd_start(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="海巡智检 v1.7 同源启动器（Waitress WSGI，单端口）"
+        description="海巡智检 v1.8 同源启动器（Waitress WSGI，单端口）"
     )
     parser.add_argument("command", nargs="?", default="start", choices=["start", "check", "prepare", "status", "stop"])
     parser.add_argument("--host", default="")

@@ -1,6 +1,6 @@
 # WorkBuddy 云端入口（网关 + 连接器）
 
-这个目录是 v1.7 的**一整套 WorkBuddy 发布材料**：云端静态网关 `server.js`、本机连接器 `connector.js`、
+这个目录是 v1.8 的**一整套 WorkBuddy 发布材料**：云端静态网关 `server.js`、本机连接器 `connector.js`、
 页面产物 `web/`（由 `prepare` 从 `frontend/dist` 生成）。它不包含也不需要后端源码、数据库、账号或模型凭据。
 
 ```
@@ -52,7 +52,7 @@ node deploy\workbuddy\connector.js --public "https://haixun-inspection.app.workb
 
 `启动WorkBuddy云端连接.cmd` 只是上面第 4 步的封装：它先跑 `preflight.mjs` 检查 Node / 令牌 / 本机服务，
 缺哪一样就报哪一样，检查通过才启动连接器；不会把令牌写进命令行或日志，也不会谎报“已上线”。
-`preflight.mjs` 还会核对健康响应确实是本产品（`data.service=haixun-1.7-backend`、`data.status=ok`、
+`preflight.mjs` 还会核对健康响应确实是本产品（`data.service=haixun-1.8-backend`、`data.status=ok`、
 有版本字段），**只接受本机 http 回环地址**——同端口上换成别的服务会直接报错，而不是当成成功。
 
 想换本机端口：`设定 HX17_UPSTREAM=http://127.0.0.1:8090` 或给启动器传参；想换入口链接：同理设 `HX17_PUBLIC`。

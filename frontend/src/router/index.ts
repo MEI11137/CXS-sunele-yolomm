@@ -117,7 +117,7 @@ router.beforeEach(async (to) => {
 })
 
 router.afterEach((to) => {
-  document.title = `${String(to.meta.title ?? '项目')} · 海巡智检 v1.7`
+  document.title = `${String(to.meta.title ?? '项目')} · 海巡智检 v1.8`
 })
 
 export default router

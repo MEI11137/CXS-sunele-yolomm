@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { errorMessage } from '@/api/http'
 import { useAuthStore } from '@/stores/auth'
 import { useConnectionStore } from '@/stores/connection'
@@ -7,12 +8,13 @@ import { useRuntimeStore } from '@/stores/runtime'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { useUiStore } from '@/stores/ui'
 import DocumentsPanel from '@/components/DocumentsPanel.vue'
-import McpPanel from '@/components/McpPanel.vue'
 import type { ProviderPreset } from '@/types'
 
 /**
- * 设置页：四分组（模型连接 / 项目资料与手册 / 工具连接 / 账号与外观），
+ * 设置页：三分组（模型连接 / 项目资料与手册 / 账号与外观），
  * 默认只展开一组。切换用 v-show：组件常驻，未保存的草稿不因切组丢失。
+ * v1.8 起外部 MCP 工具面板暂不对外开放（组件保留，后端扩展保留），
+ * 因此设置页不再出现“工具连接”入口；旧深链接落到设置页时按默认分组展示。
  *
  * 模型连接默认是**简洁摘要**（真实模型 ID + 能力验证状态 + 修改连接）；
  * 修改才进入编辑，可取消（恢复为已保存值）；Key 永不回显，失败保留输入。
@@ -24,11 +26,12 @@ const connection = useConnectionStore()
 const runtime = useRuntimeStore()
 const workspace = useWorkspaceStore()
 const ui = useUiStore()
+const route = useRoute()
+const router = useRouter()
 
 const GROUPS = [
   { key: 'connection', label: '模型连接' },
   { key: 'documents', label: '项目资料与手册' },
-  { key: 'tools', label: '工具连接' },
   { key: 'account', label: '账号与外观' },
 ] as const
 type GroupKey = (typeof GROUPS)[number]['key']
@@ -52,12 +55,17 @@ const FEATURE_LABELS: Record<string, string> = {
   training: '模型训练',
   documents: '项目资料',
   manuals: '手册',
-  external_mcp: '外部 MCP',
   agent: '助手对话',
   detection: '图片检测',
   review: '人工复核',
   reflow: '数据回流',
 }
+
+/** v1.8：外部 MCP 尚未完成真实调用验收，界面不展示该能力项。 */
+const HIDDEN_FEATURE_KEYS = new Set(['external_mcp'])
+const visibleFeatures = computed(() =>
+  Object.entries(runtime.meta?.features ?? {}).filter(([key]) => !HIDDEN_FEATURE_KEYS.has(key)),
+)
 
 const selectedProvider = computed<ProviderPreset | null>(
   () => connection.providers.find((item) => item.id === form.provider) ?? null,
@@ -185,6 +193,18 @@ async function changePassword(): Promise<void> {
 }
 
 onMounted(async () => {
+  // v1.8：旧版“工具连接/外部 MCP”深链接已下线，落到设置页时回退到默认分组并清理残留参数。
+  const legacyTools =
+    String(route.query.group ?? '') === 'tools' ||
+    String(route.query.section ?? '') === 'tools' ||
+    route.hash === '#tools'
+  if (legacyTools) {
+    activeGroup.value = 'connection'
+    const query = { ...route.query }
+    delete query.group
+    delete query.section
+    void router.replace({ name: 'settings', query, hash: '' })
+  }
   await connection.loadProviders()
   await connection.load()
   syncForm()
@@ -200,7 +220,7 @@ onMounted(async () => {
     <header class="page-header">
       <div>
         <h1>设置</h1>
-        <p class="subtitle">模型连接、项目资料与手册、工具连接、账号安全与外观偏好</p>
+        <p class="subtitle">模型连接、项目资料与手册、账号安全与外观偏好</p>
       </div>
     </header>
 
@@ -358,11 +378,6 @@ onMounted(async () => {
       <DocumentsPanel :projects="workspace.projects" :current-project-id="workspace.currentProjectId" />
     </div>
 
-    <!-- ---------------------------------------------------------------- 工具连接 -->
-    <div v-show="activeGroup === 'tools'" class="settings-panel">
-      <McpPanel :projects="workspace.projects" :current-project-id="workspace.currentProjectId" />
-    </div>
-
     <!-- ---------------------------------------------------------------- 账号与外观 -->
     <section v-show="activeGroup === 'account'" class="card">
       <h2>账号安全</h2>
@@ -416,7 +431,7 @@ onMounted(async () => {
           <div><dt>登录方式</dt><dd>HttpOnly Cookie（服务端可吊销）</dd></div>
         </dl>
         <ul class="feature-list">
-          <li v-for="[key, enabled] in Object.entries(runtime.meta?.features ?? {})" :key="key">
+          <li v-for="[key, enabled] in visibleFeatures" :key="key">
             <span>{{ FEATURE_LABELS[key] ?? key }}</span>
             <span class="mono hint">{{ key }}</span>
             <span class="tag" :class="enabled ? 'tag-on' : 'tag-off'">{{ enabled ? '已实现' : '未实现' }}</span>

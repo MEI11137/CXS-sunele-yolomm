@@ -124,7 +124,7 @@ async function writeFakeDist(distDir, options = {}) {
 
 async function main() {
   const work = await fs.mkdtemp(path.join(os.tmpdir(), 'hx17-wb-'))
-  const spaced = path.join(work, '海巡 智检 v1.7 测试')
+  const spaced = path.join(work, '海巡 智检 v1.8 测试')
   const token = crypto.randomBytes(24).toString('hex')
   let gateway = null
   let connector = null
@@ -334,10 +334,10 @@ async function main() {
     // ---------------------------------------------------------------- preflight：不认错服务
     await check('preflight 拒绝同端口上的无关服务（不是只看 HTTP 200）', async () => {
       const cases = [
-        { payload: { code: 0, data: { service: 'unrelated-service', status: 'ok', version: '9.9.9' } }, expect: /不是 haixun-1\.7-backend/ },
-        { payload: { code: 0, data: { service: 'haixun-1.7-backend', status: 'degraded', version: '1.7.0' } }, expect: /data\.status/ },
-        { payload: { code: 0, data: { service: 'haixun-1.7-backend', status: 'ok' } }, expect: /data\.version/ },
-        { payload: { code: 500, data: { service: 'haixun-1.7-backend', status: 'ok', version: '1.7.0' } }, expect: /code=500/ },
+        { payload: { code: 0, data: { service: 'unrelated-service', status: 'ok', version: '9.9.9' } }, expect: /不是 haixun-1\.8-backend/ },
+        { payload: { code: 0, data: { service: 'haixun-1.8-backend', status: 'degraded', version: '1.8.0' } }, expect: /data\.status/ },
+        { payload: { code: 0, data: { service: 'haixun-1.8-backend', status: 'ok' } }, expect: /data\.version/ },
+        { payload: { code: 500, data: { service: 'haixun-1.8-backend', status: 'ok', version: '1.8.0' } }, expect: /code=500/ },
       ]
       for (const item of cases) {
         const fake = await startFakeHealth(item.payload)
@@ -353,11 +353,11 @@ async function main() {
     })
 
     await check('preflight 接受符合契约的健康响应（防止“永远失败”）', async () => {
-      const fake = await startFakeHealth({ code: 0, data: { service: 'haixun-1.7-backend', status: 'ok', version: '1.7.0' } })
+      const fake = await startFakeHealth({ code: 0, data: { service: 'haixun-1.8-backend', status: 'ok', version: '1.8.0' } })
       try {
         const result = await runPreflight(['--upstream', `http://127.0.0.1:${fake.port}`])
         assert(result.code === 0, `期望通过，实际退出码 ${result.code}：${result.stderr.trim()}`)
-        assert(result.stdout.includes('haixun-1.7-backend 1.7.0'), '没有打印识别到的服务与版本')
+        assert(result.stdout.includes('haixun-1.8-backend 1.8.0'), '没有打印识别到的服务与版本')
       } finally {
         fake.server.close()
       }
@@ -418,7 +418,7 @@ async function main() {
         // 403 = 明确识别为管理路由；400 BAD_URL = 地址有歧义，网关直接拒绝解析。
         // 两者都表示“没有进隧道、没有到后端”，不能要求实现为同一个状态码。
         assert(res.status === 403 || res.status === 400, `${pathname} 返回 ${res.status}`)
-        assert(!res.text.includes('haixun-1.7-backend'), `${pathname} 疑似被转发到了后端`)
+        assert(!res.text.includes('haixun-1.8-backend'), `${pathname} 疑似被转发到了后端`)
         seen.push(`${pathname} → ${res.status}`)
       }
       return seen.join('，')

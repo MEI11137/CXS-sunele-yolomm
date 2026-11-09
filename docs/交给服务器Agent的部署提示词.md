@@ -4,7 +4,7 @@
 
 ---
 
-请在这台学校的 Windows 电脑部署海巡智检 v1.7，让现有 WorkBuddy 固定入口和我购买的自有域名最终访问这台服务器的同一套真实前后端。你负责实际配置、排错与验收，不要只输出一份计划。
+请在这台学校的 Windows 电脑部署海巡智检 v1.8（发布分支 `workbuddy/haixun-v1.8.0`，标签 `v1.8.0`），让现有 WorkBuddy 固定入口和我购买的自有域名最终访问这台服务器的同一套真实前后端。你负责实际配置、排错与验收，不要只输出一份计划。
 
 首先完整阅读随附的《WorkBuddy固定网址与自有域名_另一台Windows部署指南.md》，以本机实际源码和环境为准。真实域名是 haixunzhijian.top，拟用 demo.haixunzhijian.top。执行时复核审核、DNS 和 Cloudflare Zone 状态，缺少的步骤如实列出，不假装已经上线。
 
@@ -14,9 +14,9 @@
 
 - 保留当前发布地址：`https://haixun-inspection.app.workbuddy.host/?sharecode=YHJNHOFRKT`。
 - 当前实现：WorkBuddy 云端托管现有前端和同源网关，本机 `connector.js` 主动连云端，再访问 `http://127.0.0.1:8080`。服务器不必登录 WorkBuddy；更新线上页面时才需要原发布账号更新原应用。
-- 候选源码仓库：`https://github.com/MEI11137/CXS-sunele-yolomm.git`，分支 `workbuddy/haixun-v1.7.0`。先实际验证分支和记录 SHA；若网络失败或缺少未发布修订，明确报告，不能擅自用旧版替代后声称最新版已部署。
+- 候选源码仓库：`https://github.com/MEI11137/CXS-sunele-yolomm.git`，发布分支 `workbuddy/haixun-v1.8.0`，标签 `v1.8.0`。先实际验证分支/标签和记录 SHA（`git rev-parse HEAD`、`git describe --tags --exact-match`）；若网络失败或缺少未发布修订，明确报告，不能擅自用旧版替代后声称最新版已部署。v1.8 隐藏了未完成验收的外部 MCP 设置界面，不要自行恢复或宣称外部 MCP 可用。
 - 网关与连接器**已经整合进主仓库**：`deploy/workbuddy/server.js`、`deploy/workbuddy/connector.js`、`deploy/workbuddy/prepare.mjs`、`deploy/workbuddy/preflight.mjs`，启动器是根目录 `启动WorkBuddy云端连接.cmd`。`git clone` 之后这些都应当存在，先核对 SHA 与文件齐备，再继续。
-- 仍然**不会**由 Git 提供两样东西，这是有意设计：① 与云端配套的 `.tunnel-token`（私密传到 `deploy/workbuddy/.tunnel-token`，不重生成、不上传）；② `web/`（在 `frontend` 里 `npm ci && npm run build`，再 `node deploy\workbuddy\prepare.mjs` 生成）。只跑后端 + 连接器时不需要 `web/`。
+- 仍然**不会**由 Git 提供两样东西，这是有意设计：① 与云端配套的 `.tunnel-token`（私密传到 `deploy/workbuddy/.tunnel-token`，不重生成、不上传）；② `web/`（在 `frontend` 里依次执行 `npm ci`、`npm run build`；Windows PowerShell 5.1 不支持 `&&`，请分两行，再 `node deploy\workbuddy\prepare.mjs` 生成）。只跑后端 + 连接器时不需要 `web/`。
 - 自有域名入口默认通过正式 Cloudflare Tunnel 直接访问本机同源前后端 `/` 与 `/api`；不要 CNAME 到 WorkBuddy 站点，不要求用户再买一套服务器，不用临时 trycloudflare 地址作为正式交付。
 
 ## 先盘点，再配置

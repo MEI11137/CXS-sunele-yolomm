@@ -4,7 +4,7 @@
  *   node deploy/workbuddy/preflight.mjs [--upstream http://127.0.0.1:8080]
  *
  * 只认本机 HTTP 上游，并且必须真的是本产品：HTTP 200 + code=0 + data.status=ok
- * + data.service=haixun-1.7-backend + 有版本字段。别的服务在同一端口也返回 200 时，
+ * + data.service=haixun-1.8-backend + 有版本字段。别的服务在同一端口也返回 200 时，
  * 这里必须拒绝——否则连接器会把业务请求转发给一个无关服务。
  *
  * 退出码：0 通过 / 2 Node 版本不够 / 3 缺隧道令牌 / 4 上游不可用或不是本产品 / 5 目录不完整
@@ -15,7 +15,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
-const EXPECTED_SERVICE = 'haixun-1.7-backend'
+const EXPECTED_SERVICE = 'haixun-1.8-backend'
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1', '[::1]'])
 
 function argOf(name) {

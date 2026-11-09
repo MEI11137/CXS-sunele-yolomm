@@ -1,8 +1,8 @@
 {
   "name": "haixun-inspection-workbuddy-gateway",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "private": true,
-  "description": "海巡智检 v1.7 在 WorkBuddy 平台发布的同源入口：静态前端 + /api 反向隧道到本机后端",
+  "description": "海巡智检 v1.8 在 WorkBuddy 平台发布的同源入口：静态前端 + /api 反向隧道到本机后端",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

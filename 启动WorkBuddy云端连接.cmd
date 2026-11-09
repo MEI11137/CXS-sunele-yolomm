@@ -1,7 +1,7 @@
 @echo off
 chcp 936 >nul
 setlocal EnableExtensions
-title 海巡智检 v1.7 - WorkBuddy 云端连接
+title 海巡智检 v1.8 - WorkBuddy 云端连接
 
 rem ---------------------------------------------------------------------------
 rem 本文件只启动「本机连接器」，把云端入口的 /api 请求转给本机后端。

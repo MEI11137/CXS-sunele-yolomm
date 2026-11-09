@@ -171,7 +171,7 @@ def load_settings(
         # 本机 http 联调默认关闭；放到 HTTPS 入口后面时用 HX17_COOKIE_SECURE=1 打开。
         cookie_secure = _env_flag("HX17_COOKIE_SECURE")
     return Settings(
-        service="haixun-1.7-backend",
+        service="haixun-1.8-backend",
         version=version(),
         stage=STAGE,
         data_dir=resolved,

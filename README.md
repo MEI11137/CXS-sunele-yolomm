@@ -1,8 +1,12 @@
-# 海巡智检 v1.7
+# 海巡智检 v1.8
 
-光伏（RGB+IR）巡检与数据质量闭环系统。当前版本 **1.7.0**，功能阶段 **WB17-06（收尾）**：
+光伏（RGB+IR）巡检与数据质量闭环系统。当前版本 **1.8.0**，功能阶段 **WB17-06（收尾）**：
 从检测到复核、反馈、回流、训练、发布的业务闭环，以及“网页 + 助手共用同一套服务”的
-Agent 能力都已经实现并验收；对外演示用单端口同源部署（Waitress WSGI）。
+主要业务闭环已实测；范围与局限见 [v1.8 发布验收摘要](docs/v1.8发布验收摘要.md)。对外演示用单端口同源部署（Waitress WSGI）。
+
+> v1.8 相对 v1.7 只做发布整合：**外部 MCP 工具的真实调用尚未完成验收，v1.8 隐藏了它的
+> 设置入口**（组件与后端扩展代码保留），并把版本、目录、文档与固定入口统一到 1.8.0。
+> 内部 Agent 依赖的 hx 业务工具网关与 OpenCode 连接不受影响。
 
 > 来源说明（如实）：本工程是从空白工程重新开发的 v1.7。v1.6 / v1.6.1 仅作为**只读功能
 > 参考**（成熟服务与视觉交互有来源地适配），不复制其源码目录冒充新开发；开发过程按
@@ -19,7 +23,7 @@ Agent 能力都已经实现并验收；对外演示用单端口同源部署（Wa
 | 图片巡检 | 选已发布模型 → 上传/选择图片 → 真实 vendor ultralytics 推理 → 生成记录 |
 | 识别记录 | 筛选/分页、批量核查（AI，用本人连接）、人工状态与反馈状态、加入反馈池、软删除/恢复、CSV 导出（限 page/selected） |
 | 回流 | 从反馈池把人工确认样本回流成数据集修订版或新数据集；草稿可保存/恢复 |
-| 设置 | 个人模型连接（加密存 Key、能力检查）、项目资料与手册（版本化、软删恢复）、外部 MCP 工具（逐项授权）、账号与外观 |
+| 设置 | 个人模型连接（加密存 Key、能力检查）、项目资料与手册（版本化、软删恢复）、账号与外观；外部 MCP 面板在 v1.8 暂不显示 |
 | 回收站 | 项目/会话/数据集/记录/手册的软删与恢复，原文件一概不动 |
 
 人工边界（不会交给 Agent）：最终人工结论、个人凭据/API Key、目录授权、新增 MCP 工具授权、
@@ -27,7 +31,7 @@ Agent 能力都已经实现并验收；对外演示用单端口同源部署（Wa
 
 ## Agent 工具与页面同源
 
-助手工具（`hx_*`，共 70 个）与页面走**同一份服务层**，没有第二套实现；查询口径一致
+助手工具（`hx_*`，当前注册表共 71 个，含 `hx_project_bind`）与页面走**同一份服务层**，没有第二套实现；查询口径一致
 （反馈池“待整理”、记录字段、复核状态等）。工具清单与权限见
 `backend/agent/tools.py`；动作映射的开发记录见收尾批次日志（下文索引）。
 
@@ -45,7 +49,7 @@ backend/
   services/         业务服务（含 datasets/models/detection/review/records/reflow/training/…）
   vision/           vendor ultralytics 受控入口 + 受限权重反序列化（torch>=2.6 API）
   vendor/           ultralytics 8.3.163（派生，AGPL-3.0，见目录内 LICENSE）
-  tests/            540+ 项 unittest 用例（机器上有 pytest 也能跑；真实网关/文件/轮次/训练编排/权重校验/部署接口…）
+  tests/            659 项 unittest 用例（本机受测口径：657 通过、2 跳过；真实网关/文件/轮次/训练编排/权重校验/部署接口…；详见 [v1.8 发布验收摘要](docs/v1.8发布验收摘要.md)）
 frontend/           Vue 3 + TypeScript + Pinia + Vite（npm run build 后由后端同源托管）
 deploy/serve.py     单端口启动器：Waitress WSGI + frontend/dist + 运行记录/停止核验
 deploy/workbuddy/   WorkBuddy 云端入口：server.js（网关）+ connector.js（本机连接器）
@@ -110,6 +114,12 @@ node deploy\workbuddy\connector.js --public "https://haixun-inspection.app.workb
   现在这台正在被用户使用，**不要重启或替换它在跑的连接器**。
 - 发布更新要在 WorkBuddy 里打开**原来那个应用**并核对应用 ID / 名称 / 归属账号；目录相同不代表平台自动
   认成同一个应用，管理发布仍需原账号（服务器跑连接器不需要登录）。
+- 固定入口（保持原应用/URL/sharecode 不变）：
+  <https://haixun-inspection.app.workbuddy.host/?sharecode=YHJNHOFRKT>
+- 源码仓库：`https://github.com/MEI11137/CXS-sunele-yolomm.git`，发布分支
+  `workbuddy/haixun-v1.8.0`，标签 `v1.8.0`。首次拉取：
+  `git clone --single-branch --branch workbuddy/haixun-v1.8.0 https://github.com/MEI11137/CXS-sunele-yolomm.git`
+  拉取后执行 `git rev-parse HEAD` 记录实际提交，不要用旧快照替代。
 - 详情（发布材料、限制、安全边界）见 `deploy/workbuddy/README.md`。
 
 ## 首次初始化（没有默认账号）
@@ -225,10 +235,18 @@ Remove-Item Env:\HX17_RUN_REAL_TRAINING_TEST
 
 ## 已知未测 / 限制（如实）
 
+- **外部 MCP**：v1.8 只隐藏界面，未完成真实外部 MCP 服务的连接/调用验收；组件与后端扩展保留，
+  不宣称“外部 MCP 可用”。
+- **D4**：已确认记录直接“去回流”会进入空池，需先在反馈池加入反馈；**D7**：平台数据集从根目录
+  （data.yaml + raw）导入会返回 409，需要选择 raw 子目录。
+- **训练取消**：全量负载下取消训练偶发不生效，需按运行记录核对；不通过删测试掩盖。
 - 付费模型质量、真实 GPU 长训练未测（零付费、无 GPU 训练）；训练闭环用注入 worker 与
   一次真实 CPU 微训练验证编排，不宣称模型效果。
 - AI 核查的模型回复质量依赖用户自己的连接；上游是本机协议桩时只验证协议与落库。
-- Cloudflare/公网入口需要用户自己的域名与账号，本项目不代买、不改 DNS。
+- 全站审计仍有未逐项覆盖的控件/接口（原 556 行入口清单中的 UNTESTED 项）；B 组“批次筛选”
+  因无真实 flow_id 未测。不要把“主要链路实测”理解为全部界面/模型效果都有保证。
+- Cloudflare/公网入口需要用户自己的域名与账号，本项目不代买、不改 DNS；自有域名
+  haixunzhijian.top 未验证接通，本版本不把它写成已上线。
 - 部署证据与逐页独立核验（root 产出）见 `docs/workbuddy-development/WB17-06-最终验收.md`。
 
 ## 开发日志索引

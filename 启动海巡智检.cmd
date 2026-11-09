@@ -1,7 +1,7 @@
 @echo off
 chcp 936 >nul
 setlocal EnableExtensions
-title 海巡智检 v1.7
+title 海巡智检 v1.8
 cd /d "%~dp0"
 
 rem 解释器来源：HX17_PYTHON > 项目内 .venv > PATH 里的 python。

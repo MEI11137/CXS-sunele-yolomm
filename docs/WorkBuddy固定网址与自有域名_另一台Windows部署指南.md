@@ -1,6 +1,6 @@
-# 海巡智检 v1.7：另一台 Windows 服务器部署指南
+# 海巡智检 v1.8：另一台 Windows 服务器部署指南
 
-更新日期：2026-11-08。读者：负责学校另一台 Windows 电脑配置的 Agent 和项目所有者。
+更新日期：2026-11-09。读者：负责学校另一台 Windows 电脑配置的 Agent 和项目所有者。本指南以发布分支 `workbuddy/haixun-v1.8.0`、标签 `v1.8.0` 为准；v1.8 相对 v1.7 只做发布整合（隐藏未验收的外部 MCP 界面、版本与文档统一），业务能力与验收范围见仓库 README。
 
 本指南包含两条可并行使用的公网入口：**已发布的 WorkBuddy 固定链接**，以及**用户购买的自有域名**。两条入口最终访问同一台服务器、同一份数据库与工作区。真实域名已确定为 `haixunzhijian.top`，拟用 `demo.haixunzhijian.top` 作为项目入口；审核及 DNS 接入状态须在执行时复核。真实域名专用模板已整合进仓库 `deploy/cloudflare/config.example.yml`（下文 `demo.example.com` 只在说明形状时出现，实际以该模板为准）。
 
@@ -12,9 +12,8 @@
 
 <https://haixun-inspection.app.workbuddy.host/?sharecode=YHJNHOFRKT>
 
-- 已通过 WorkBuddy 原生发布 HTTP 服务，托管的是现有 v1.7 Vue 前端构建产物，以及同源 API 网关。
-- 本机普通账号、公网登录、项目读写、授权目录绑定、数据集页面、真实模型回复与刷新保留均已验收。**这些是开发机上的结果，不代替新服务器验收。**
-- 开发机在 `127.0.0.1:8080` 做过完整验收；**2026-11-08 上午那次检查时该端口确实未运行，这是历史记录**。同一天下午 Codex 已恢复真实 Waitress 服务（仍是同一 data-dir `var/demo-20261107/server`、V21，没有换成测试桩），本文写作时 `/api/health` 返回 `haixun-1.7-backend 1.7.0`。但**这些仍然只是开发机结果，不代替新服务器验收**。服务器电脑允许用其他端口，连接器必须同步修改 `--upstream`。
+- 已通过 WorkBuddy 原生发布 HTTP 服务，托管的是现有 v1.8 Vue 前端构建产物，以及同源 API 网关。
+- 本次候选在开发机 `127.0.0.1:8080`（data-dir `var/demo-20261107/server`）验收，`/api/health` 应为 `haixun-1.8-backend 1.8.0`；**这些只是开发机结果，不代替新服务器验收**。服务器电脑允许用其他端口，连接器必须同步修改 `--upstream`。
 - 服务器电脑不必安装或登录 WorkBuddy。只有管理、更新云端这个应用时，需要原发布账号及原应用权限。
 - 迁移后继续使用同一云端应用，不重新创建应用、不重新申请链接。**目录同名不代表平台会自动关联到原应用**：更新前必须在 WorkBuddy 里核对**应用 ID、名称与归属账号**，确认要更新的是原来那个应用，禁止顺手新建一个“看起来一样”的替代应用。
 - 首次访问保留完整 `?sharecode=...` 参数。使用不带分享参数的裸深链接，可能被平台拦截。
@@ -47,7 +46,7 @@
 
 | 材料 | 获取位置/方式 | 处理要求 |
 |---|---|---|
-| v1.7 主项目源码 | 仓库 `https://github.com/MEI11137/CXS-sunele-yolomm.git`，候选分支 `workbuddy/haixun-v1.7.0` | 根目录应有 `backend/`、`frontend/`、`deploy/`、`VERSION`；不要误部署旧 v1.6 子目录 |
+| v1.8 主项目源码 | 仓库 `https://github.com/MEI11137/CXS-sunele-yolomm.git`，发布分支 `workbuddy/haixun-v1.8.0`，标签 `v1.8.0` | 根目录应有 `backend/`、`frontend/`、`deploy/`、`VERSION`（1.8.0）；不要误部署旧 v1.6/v1.7 子目录 |
 | WorkBuddy 本机连接器 | **就在主仓库里**：`deploy/workbuddy/connector.js` | 与网关同源同版本；不要用教学问答页面的 SDK 代替，也不要在仓库外另存一份再各自修改 |
 | 连接启动器 | 主仓库根目录 `启动WorkBuddy云端连接.cmd` | 相对本项目定位，默认指向固定分享链接与本机 8080；换端口用 `HX17_UPSTREAM` 或第一个参数 |
 | 云端网关与页面 | 主仓库 `deploy/workbuddy/`（`server.js`、`package.json`、`web/`） | `web/` 由 `node deploy\workbuddy\prepare.mjs` 从 `frontend/dist` 生成，不随 Git 提供 |
@@ -60,11 +59,11 @@
 
 仍然**不会**由 Git 提供两样东西，且这是有意的：
 1. `.tunnel-token` —— 与云端配套的私有凭据，必须**单独私密传输**到 `deploy/workbuddy/.tunnel-token`（不重生成、不贴聊天、不入库）；
-2. `web/` —— 前端构建产物，`git clone` 后先在 `frontend` 里 `npm ci && npm run build`，再执行 `node deploy\workbuddy\prepare.mjs` 生成。
+2. `web/` —— 前端构建产物，`git clone` 后先在 `frontend` 里依次执行 `npm ci`、`npm run build`（Windows PowerShell 5.1 不支持 `&&`，请分两行执行），再执行 `node deploy\workbuddy\prepare.mjs` 生成。
 
 只跑后端 + 连接器时**不需要** `web/`；只有要重新发布 WorkBuddy 云端应用时才需要它。
 
-编写本指南时本地主项目 HEAD 为 `f3efce2b25d1ca080bccf11c38ca4f81e094e60d` —— 这是**历史记录，不是最新提交**。本轮之后的修订（含 IR 导出再导入修正与完整 WorkBuddy 网关/连接器）由 Codex 负责通过本机现有代理提交并推送到同一分支；**本文不记录那次提交的 SHA**，因为它写于提交之前，写死一个“未来提交”的哈希只会误导。部署时必须在 `git clone` / `git pull` 之后自己执行 `git rev-parse HEAD`，记录实际拉到的提交并与 Codex 报告的提交比对；拉取失败就如实报告，不能用旧版替代后声称已部署最新版。
+编写本指南时本地主项目 HEAD 曾为 `f3efce2b25d1ca080bccf11c38ca4f81e094e60d`（v1.7 历史，非当前发布）；v1.8 发布以 `workbuddy/haixun-v1.8.0` 分支和 `v1.8.0` 标签为准，其基线是先前的已测修补提交 `5ca77c4`。**不要在文档里写死一个未来提交的哈希**：部署时必须先 `git fetch`，在 `git clone` / `git pull --ff-only` 之后自己执行 `git rev-parse HEAD` 与 `git describe --tags --exact-match`，记录实际拉到的提交和标签；拉取失败就如实报告，不能用旧版替代后声称已部署最新版。
 
 ### 不要互相混用的凭据
 
@@ -96,8 +95,8 @@
 下列 D 盘路径是示例，Agent 按服务器实际情况选定并统一替换：
 
 ```powershell
-$hxCodeRoot = 'D:\Apps\海巡智检v1.7'
-$hxPrivateRoot = 'D:\HaixunPrivate\v1.7'
+$hxCodeRoot = 'D:\Apps\海巡智检v1.8'
+$hxPrivateRoot = 'D:\HaixunPrivate\v1.8'
 $hxWorkRoot = 'D:\HaixunWorkspace'
 $hxConnectorRoot = 'D:\Apps\海巡智检云端连接'
 ```
@@ -110,9 +109,9 @@ $hxConnectorRoot = 'D:\Apps\海巡智检云端连接'
 ### 首次通过 Git 拉取
 
 ```powershell
-git ls-remote --heads https://github.com/MEI11137/CXS-sunele-yolomm.git workbuddy/haixun-v1.7.0
+git ls-remote --heads https://github.com/MEI11137/CXS-sunele-yolomm.git workbuddy/haixun-v1.8.0
 # 只有网络请求成功且输出目标分支后继续；空输出或网络失败不等于已经取得代码。
-git clone --single-branch --branch workbuddy/haixun-v1.7.0 https://github.com/MEI11137/CXS-sunele-yolomm.git "$hxCodeRoot"
+git clone --single-branch --branch workbuddy/haixun-v1.8.0 https://github.com/MEI11137/CXS-sunele-yolomm.git "$hxCodeRoot"
 if ($LASTEXITCODE -ne 0) { throw '源码拉取失败，请先解决网络或分支问题' }
 git -C "$hxCodeRoot" rev-parse HEAD
 ```
@@ -218,7 +217,7 @@ Invoke-RestMethod 'http://127.0.0.1:8080/api/health'
 Invoke-RestMethod 'http://127.0.0.1:8080/api/meta'
 ```
 
-期望健康信息为 v1.7 对应服务，`serve_dist=true`，`initialized=true`。后端仍只绑定回环地址，公网由已配置入口进入。启用 Secure Cookie 后，通过公网 HTTPS 登录；本机 HTTP 健康检查不受影响，不应因为本机 HTTP 登录问题就关闭公网保护。
+期望健康信息为 `haixun-1.8-backend`、版本 `1.8.0`，`serve_dist=true`，`initialized=true`。后端仍只绑定回环地址，公网由已配置入口进入。启用 Secure Cookie 后，通过公网 HTTPS 登录；本机 HTTP 健康检查不受影响，不应因为本机 HTTP 登录问题就关闭公网保护。
 
 ## 8. 每个网站账号配置自己的模型 API
 
@@ -255,7 +254,7 @@ Invoke-RestMethod 'http://127.0.0.1:8080/api/meta'
 窗口 B 的命令：
 
 ```powershell
-$hxRoot = 'D:\Apps\haixun-v1.7'   # 实际 clone 位置，含中文/空格也可以
+$hxRoot = 'D:\Apps\haixun-v1.8'   # 实际 clone 位置，含中文/空格也可以
 Set-Location -LiteralPath $hxRoot
 if (!(Test-Path -LiteralPath '.\deploy\workbuddy\connector.js')) { throw '缺少连接器' }
 if (!(Test-Path -LiteralPath '.\deploy\workbuddy\.tunnel-token')) { throw '缺少私密传输的配套令牌' }
@@ -451,14 +450,16 @@ Windows 服务的运行用户与交互用户不同，Cloudflare 凭据路径、O
 
 ### 更新
 
-备份本机数据库/密钥与业务工作区 → 等待真实任务结束 → 正常停止本实例 → 更新经过审查的代码 → 用本机环境重新构建 → 使用原数据目录启动 → 验收。业务源码/前端变更如果需要同步到 WorkBuddy，还必须通过原账号**更新原云端应用**，本机 `npm run build` 不会自动更新线上。
+**已有机器从 v1.7 升级到 v1.8 的顺序不能颠倒**：先备份本机数据库/密钥与业务工作区 → 等待真实任务结束 → **用当前仍为 v1.7 的代码和原数据目录正常停止旧后端与旧连接器** → 切换到 `workbuddy/haixun-v1.8.0` → 用本机环境重新构建 → 使用原数据目录启动 → 验收。原因是服务标识已从 `haixun-1.7-backend` 改为 `haixun-1.8-backend`：如果先用 v1.8 覆盖代码，再用新版 `--stop`，它会去找 1.8 的服务记录，无法可靠停止仍在运行的 1.7 后端。
 
-停止后端时，显式传入同一私有数据目录：
+切换前确认旧实例已正常停止（代码仍是 v1.7 时执行）：
 
 ```powershell
 & $hxPython deploy\serve.py --status --data-dir "$hxPrivateRoot"
 & $hxPython deploy\serve.py --stop --data-dir "$hxPrivateRoot"
 ```
+
+确认后端无监听、旧连接器已退出后，再 `git fetch`、`git switch workbuddy/haixun-v1.8.0`，重新执行 `npm ci`、`npm run build` 与 `node deploy\workbuddy\prepare.mjs`。业务源码/前端变更如果需要同步到 WorkBuddy，还必须通过原账号**更新原云端应用**，本机 `npm run build` 不会自动更新线上。
 
 有活动任务或状态未知时正常停止会拒绝。不要默认 `--force`，不要按 `python.exe`/`node.exe` 名字批量杀进程。
 
