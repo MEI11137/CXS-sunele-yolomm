@@ -58,7 +58,10 @@ deploy/cloudflare/  自有域名 Tunnel 配置模板（真实域名、占位 UUI
 测试工作区/          数据集/权重/输出骨架：给评委账号授权的业务目录（真实内容不入库）
 启动海巡智检.cmd / 停止海巡智检.cmd / 准备运行环境.cmd    Windows 双击入口
 启动WorkBuddy云端连接.cmd                              云端入口的本机连接器（先跑 preflight 再连）
-docs/               开发日志与验收记录
+docs/               开发日志与验收记录；参赛作品大纲见 `docs/参赛材料/`
+                    （[docx](docs/参赛材料/海巡智检_参赛作品大纲_v1.8.docx) /
+                     [pdf](docs/参赛材料/海巡智检_参赛作品大纲_v1.8.pdf) /
+                     [md](docs/参赛材料/海巡智检_参赛作品大纲_v1.8.md)）
 scripts/            smoke/contract/engine 协议检查、deploy_smoke.py（部署启停冒烟）
 ```
 
