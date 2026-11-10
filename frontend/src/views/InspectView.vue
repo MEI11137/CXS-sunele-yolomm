@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import * as api from '@/api/business'
 import { errorMessage } from '@/api/http'
+import ZoomableImage from '@/components/ZoomableImage.vue'
 import { inspectFieldHint, inspectSecondaryLabel, recordStatusLabel } from '@/lib/business'
 import { useBusinessStore } from '@/stores/business'
 import type { AssetSummary, DetectionRecord, ModelSummary } from '@/types'
@@ -306,9 +307,13 @@ function openRecords(): void {
           <span class="mono">{{ box.bbox.map((value) => Math.round(value)).join(',') }}</span>
         </li>
       </ul>
-      <figure v-if="record.result_url" class="result-figure">
-        <img :src="record.result_url" alt="检测结果" />
-      </figure>
+      <!-- 结果图放进固定框内查看：适应 / 滚轮缩放 / 拖动平移，避免 4000×3000 原图撑出卡片 -->
+      <ZoomableImage
+        v-if="record.result_url"
+        :key="record.id"
+        :src="record.result_url"
+        alt="检测结果"
+      />
       <div class="card-actions">
         <button class="ghost small" type="button" @click="openRecords">去识别记录核查</button>
       </div>

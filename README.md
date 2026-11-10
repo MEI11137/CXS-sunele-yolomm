@@ -62,6 +62,7 @@ docs/               开发日志与验收记录；参赛作品大纲见 `docs/�
                     （[docx](docs/参赛材料/海巡智检_参赛作品大纲_v1.8.docx) /
                      [pdf](docs/参赛材料/海巡智检_参赛作品大纲_v1.8.pdf) /
                      [md](docs/参赛材料/海巡智检_参赛作品大纲_v1.8.md)）
+                    跨机补丁的合并与发布记录见 [2026-11-10 跨机补丁发布结果](docs/20261110跨机补丁发布结果.md)
 scripts/            smoke/contract/engine 协议检查、deploy_smoke.py（部署启停冒烟）
 ```
 

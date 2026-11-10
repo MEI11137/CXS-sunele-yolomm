@@ -346,7 +346,7 @@ def probe(
         {
             "model": model,
             "messages": [{"role": "user", "content": "ping"}],
-            "max_tokens": 1,
+            "max_tokens": 128,
             "temperature": 0,
             "stream": False,
         },
@@ -403,7 +403,7 @@ def probe(
                     ],
                 }
             ],
-            "max_tokens": 8,
+            "max_tokens": 1024,
             "temperature": 0,
             "stream": False,
         },
@@ -444,7 +444,7 @@ def probe(
                 }
             ],
             "tool_choice": "auto",
-            "max_tokens": 16,
+            "max_tokens": 512,
             "temperature": 0,
             "stream": False,
         },
