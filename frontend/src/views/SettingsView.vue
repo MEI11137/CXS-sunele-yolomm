@@ -8,6 +8,7 @@ import { useRuntimeStore } from '@/stores/runtime'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { useUiStore } from '@/stores/ui'
 import DocumentsPanel from '@/components/DocumentsPanel.vue'
+import ChatFontSizeField from '@/components/ChatFontSizeField.vue'
 import type { ProviderPreset } from '@/types'
 
 /**
@@ -422,6 +423,8 @@ onMounted(async () => {
         </button>
       </div>
       <p class="hint">偏好只保存在这台电脑的浏览器里，不影响账号与服务器数据。</p>
+
+      <ChatFontSizeField />
 
       <details class="about-details">
         <summary>关于本系统</summary>

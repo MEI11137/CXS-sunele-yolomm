@@ -71,6 +71,10 @@
   --assistant-w: 336px;
   --content-pad: 24px;
 
+  /* 会话字号（12–24px，默认 14）：只作用于对话正文与输入区。
+     由 stores/ui.ts 写入 documentElement 的行内变量，设置页「会话字号」控制。 */
+  --chat-font-size: 14px;
+
   /* —— v1.7 旧变量名 → 基准层（一次性映射，组件不必逐个改） —— */
   --panel-soft: var(--panel-secondary);
   --border-strong: var(--border-control);
@@ -1612,7 +1616,12 @@ body.dock-dragging {
   white-space: pre-wrap;
 }
 
-/* Markdown 正文（已用 DOMPurify 净化后才渲染） */
+/* Markdown 正文（已用 DOMPurify 净化后才渲染）
+ *
+ * 这里保持**全局默认外观**（标题 14px、表格 12px、代码沿用全局 code/pre 的 12px），
+ * 资料/手册等其它 markdown 内容不受会话字号影响。
+ * 会话正文的覆盖只写在下面「仅会话正文」一节，作用域是 .message-text.markdown-body。
+ */
 
 .markdown-body > :first-child {
   margin-top: 0;
@@ -1682,6 +1691,30 @@ body.dock-dragging {
 .markdown-body td {
   border: 1px solid var(--border);
   padding: 4px 8px;
+}
+
+/* 仅会话正文：标题/表格/代码跟随「会话字号」。
+ * 只挂在 .message-text.markdown-body 上，资料/手册等其它 markdown 仍用上面的固定值。
+ * 表格与代码原本是 12px，按 12/14 比例缩放（默认 14 时仍是 12px）；
+ * 用 px 变量相乘，不叠 em，避免嵌套二次缩小。
+ * max-width/min-width 也只给会话正文：助手正文是 flex 子项，长代码行会把它撑到栏宽数倍
+ * 再被父级裁掉，这里收在栏内让代码块自己横向滚动。 */
+.message-text.markdown-body {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.message-text.markdown-body h1,
+.message-text.markdown-body h2,
+.message-text.markdown-body h3,
+.message-text.markdown-body h4 {
+  font-size: var(--chat-font-size);
+}
+
+.message-text.markdown-body table,
+.message-text.markdown-body code,
+.message-text.markdown-body pre {
+  font-size: calc(var(--chat-font-size) * 12 / 14);
 }
 
 /* 输入框上方的固定动作区 */
@@ -1783,7 +1816,7 @@ body.dock-dragging {
 
 .message-text {
   margin: 0;
-  font-size: 14px;
+  font-size: var(--chat-font-size);
   line-height: 1.8;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
@@ -1927,7 +1960,7 @@ body.dock-dragging {
   background: transparent;
   color: var(--text);
   font: inherit;
-  font-size: 14px;
+  font-size: var(--chat-font-size);
   line-height: 1.6;
   padding: 4px 6px 6px;
 }
@@ -2194,6 +2227,54 @@ body.dock-dragging {
 .theme-row {
   display: flex;
   gap: 8px;
+}
+
+/* 设置页「会话字号」：原生 select + 恢复默认 + 即时预览。
+   预览直接用 --chat-font-size，所见即对话正文/输入区的实际字号。 */
+.chat-font-block {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.chat-font-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.chat-font-row .field {
+  width: 120px;
+}
+
+.chat-font-row .ghost.small {
+  height: 30px;
+}
+
+.chat-font-hint {
+  flex: 1;
+  min-width: 180px;
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.chat-font-preview {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-secondary);
+  color: var(--text);
+  font-size: var(--chat-font-size);
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+
+.chat-font-preview .preview-muted {
+  color: var(--text-secondary);
+  font-size: calc(var(--chat-font-size) * 12 / 14);
 }
 
 /* ---------------- 响应式 ---------------- */
